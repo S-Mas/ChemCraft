@@ -596,4 +596,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
+
+    #[test]
+    fn mcp_draw_from_smiles_1000_atoms_avoids_quadratic_exponential_dos()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_mcp_1000_atom_dos_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+
+        // 1,000-atom poly-chiral/diene branched cyclic SMILES (must finish in < 2s)
+        let mut big_smi = String::from("N[C@@H](C(=O)O)");
+        for _ in 0..80 {
+            big_smi.push_str("/C=C/C[C@@H](c1ccccc1)");
+        }
+        let sb = PathSandbox::new(None, None)?;
+        let req = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})
+                .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"draw_from_smiles","arguments":{"smiles":big_smi}}
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let t0 = std::time::Instant::now();
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(req.as_bytes()), &mut out_buf, &sb, None)?;
+        let elapsed = t0.elapsed();
+        let lines: Vec<serde_json::Value> = String::from_utf8(out_buf)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["result"]["isError"], false);
+        assert!(
+            elapsed.as_secs_f64() < 2.5,
+            "1000-atom MCP draw_from_smiles took too long: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
 }

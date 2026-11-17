@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::f64::consts::PI;
 
-use mol_graph::{BondOrder, BondStereo, MolAtom, MolError, MolGraph};
+use mol_graph::{
+    BondCisTrans, BondOrder, BondStereo, MolAtom, MolError, MolGraph, highest_cip_end_nbr,
+};
 
 /// Standard 2D chemistry coordinate bond length.
 pub const STANDARD_BOND_LEN: f64 = 1.50;
@@ -115,91 +117,33 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
             .filter(|r| !r.is_empty() && r.iter().all(|v| comp_set.contains(v)))
             .collect();
 
-        // Order rings by BFS overlap so fused ring chains build outward cleanly (6-6-6-5 steroid, etc.)
+        // Place the primary ring cluster first (rings sharing vertices); pendant rings are grown attached to their linker!
+        let mut ring_placed = vec![false; comp_rings.len()];
         if !comp_rings.is_empty() {
-            let mut ring_placed = vec![false; comp_rings.len()];
-            // Start with first largest ring (e.g. 6-membered)
             let first_ri = (0..comp_rings.len())
                 .max_by_key(|&i| comp_rings[i].len())
                 .unwrap_or(0);
             place_regular_ring(comp_rings[first_ri], [cursor_x, 0.0], 0.0, &mut coords);
             ring_placed[first_ri] = true;
+            expand_connected_rings(mol, &comp_rings, &mut ring_placed, &mut coords, cursor_x);
 
-            loop {
-                let mut progressed = false;
-                for (ri, ring) in comp_rings.iter().enumerate() {
-                    if ring_placed[ri] {
-                        continue;
-                    }
-                    let placed_verts: Vec<(usize, usize)> = ring
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, &v)| coords[v].is_some())
-                        .map(|(k, &v)| (k, v))
-                        .collect();
-                    if placed_verts.is_empty() {
-                        continue;
-                    }
-                    if placed_verts.len() >= 2 {
-                        // Try consecutive ring edge (fused ring!)
-                        if let Some((k1, k2)) = find_consecutive_placed(ring, &coords) {
-                            place_fused_ring(ring, k1, k2, &mut coords);
-                        } else {
-                            // Bridged / already mostly placed: place remaining vertices outward
-                            place_remaining_ring_verts(ring, &mut coords);
-                        }
-                    } else {
-                        // Spiro junction (1 shared vertex)
-                        let (k0, v0) = placed_verts[0];
-                        let p0 = coords[v0].unwrap_or([cursor_x, 0.0]);
-                        let out_dir = avg_away_dir(mol, v0, &coords);
-                        let radius = STANDARD_BOND_LEN / (2.0 * (PI / ring.len() as f64).sin());
-                        let center = [p0[0] + out_dir[0] * radius, p0[1] + out_dir[1] * radius];
-                        let base_angle = (p0[1] - center[1]).atan2(p0[0] - center[0]);
-                        let step = 2.0 * PI / ring.len() as f64;
-                        for (idx, &v) in ring.iter().enumerate() {
-                            if coords[v].is_none() {
-                                let delta = (idx as isize - k0 as isize) as f64;
-                                let ang = base_angle + delta * step;
-                                coords[v] = Some([
-                                    center[0] + radius * ang.cos(),
-                                    center[1] + radius * ang.sin(),
-                                ]);
-                            }
-                        }
-                    }
-                    ring_placed[ri] = true;
-                    progressed = true;
-                }
-                if !progressed {
-                    // Any disconnected bridged ring subset
-                    if let Some(next_ri) = ring_placed.iter().position(|&p| !p) {
-                        place_regular_ring(
-                            comp_rings[next_ri],
-                            [cursor_x + STANDARD_BOND_LEN * 3.0, 0.0],
-                            0.0,
-                            &mut coords,
-                        );
-                        ring_placed[next_ri] = true;
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            // If fused ring placement produced crossings or bridged overlap, run Tutte planar cage solver
-            let ring_atoms: BTreeSet<usize> =
-                comp_rings.iter().flat_map(|r| r.iter().copied()).collect();
+            // Only invoke Tutte cage solver on small standalone bridged polyhedra (<= 14 ring atoms, no side chains/drugs)
+            let ring_atoms: BTreeSet<usize> = comp_rings
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| ring_placed[i])
+                .flat_map(|(_, r)| r.iter().copied())
+                .collect();
             let ring_atom_list: Vec<usize> = ring_atoms.iter().copied().collect();
-            let base_crossings = count_subset_crossings(mol, &ring_atoms, &coords);
-            let is_bridged = (0..comp_rings.len()).any(|i| {
-                let si: BTreeSet<usize> = comp_rings[i].iter().copied().collect();
-                comp_rings
-                    .iter()
-                    .skip(i + 1)
-                    .any(|rj| rj.iter().filter(|v| si.contains(v)).count() >= 3)
-            });
-            if (base_crossings > 0 || is_bridged)
+            let base_crossings = if ring_atom_list.len() == comp.len() && ring_atom_list.len() <= 14
+            {
+                count_subset_crossings(mol, &ring_atoms, &coords)
+            } else {
+                0
+            };
+            if ring_atom_list.len() == comp.len()
+                && ring_atom_list.len() <= 14
+                && base_crossings > 0
                 && let Some((cage_coords, cage_crossings)) =
                     solve_bridged_tutte_cage(mol, &comp_rings, &ring_atom_list, cursor_x)
                 && cage_crossings < base_crossings
@@ -214,7 +158,7 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
             coords[root] = Some([cursor_x, 0.0]);
         }
 
-        // BFS place acyclic substituents / chains from placed vertices
+        // BFS place chains & pendant ring clusters outward along each attaching bond
         let mut q = VecDeque::new();
         for &v in &comp {
             if coords[v].is_some() {
@@ -236,6 +180,64 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
             if unplaced.is_empty() {
                 continue;
             }
+
+            let dbl_parent = placed_nbrs.iter().copied().find_map(|pn| {
+                mol.adj[u].iter().find(|&&(nb, bid)| {
+                    nb == pn
+                        && mol.bonds[bid].order == BondOrder::Double
+                        && matches!(mol.bonds[bid].cis_trans, BondCisTrans::E | BondCisTrans::Z)
+                })
+            });
+
+            if let Some(&(v_dbl, dbl_bid)) = dbl_parent {
+                let pv = coords[v_dbl].unwrap_or([0.0, 0.0]);
+                let dx = pu[0] - pv[0];
+                let dy = pu[1] - pv[1];
+                let alpha = dy.atan2(dx);
+                let len = dx.hypot(dy).max(1e-6);
+                let nx = -dy / len;
+                let ny = dx / len;
+                let hi_other = highest_cip_end_nbr(mol, v_dbl, u);
+                let hi_self = highest_cip_end_nbr(mol, u, v_dbl);
+                let other_side = hi_other
+                    .and_then(|ho| coords[ho])
+                    .map_or(1.0, |pho| (pho[0] - pv[0]) * nx + (pho[1] - pv[1]) * ny);
+                let want_self_hi_sign = if mol.bonds[dbl_bid].cis_trans == BondCisTrans::Z {
+                    if other_side >= 0.0 { 1.0 } else { -1.0 }
+                } else if other_side >= 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                for (i, v) in unplaced.into_iter().enumerate() {
+                    let is_hi = hi_self == Some(v) || (hi_self.is_none() && i == 0);
+                    let target_sign = if is_hi {
+                        want_self_hi_sign
+                    } else {
+                        -want_self_hi_sign
+                    };
+                    let ang = if target_sign > 0.0 {
+                        alpha + PI / 3.0
+                    } else {
+                        alpha - PI / 3.0
+                    };
+                    coords[v] = Some([
+                        pu[0] + STANDARD_BOND_LEN * ang.cos(),
+                        pu[1] + STANDARD_BOND_LEN * ang.sin(),
+                    ]);
+                    q.push_back(v);
+                    expand_ring_cluster_if_needed(
+                        mol,
+                        &comp_rings,
+                        &mut ring_placed,
+                        &mut coords,
+                        cursor_x,
+                        &mut q,
+                    );
+                }
+                continue;
+            }
+
             let base_ang = if placed_nbrs.is_empty() {
                 PI / 6.0
             } else {
@@ -254,8 +256,18 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
 
             let k = unplaced.len();
             for (i, v) in unplaced.into_iter().enumerate() {
+                if coords[v].is_some() {
+                    continue;
+                }
                 let offset = if k == 1 {
-                    0.0
+                    let is_dbl_adj = mol.adj[v]
+                        .iter()
+                        .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Double);
+                    if is_dbl_adj && placed_nbrs.len() == 1 {
+                        PI / 6.0
+                    } else {
+                        0.0
+                    }
                 } else {
                     let spread = if k == 2 { PI * 2.0 / 3.0 } else { PI * 0.55 };
                     (i as f64 - (k as f64 - 1.0) * 0.5) * spread
@@ -266,6 +278,14 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
                     pu[1] + STANDARD_BOND_LEN * ang.sin(),
                 ]);
                 q.push_back(v);
+                expand_ring_cluster_if_needed(
+                    mol,
+                    &comp_rings,
+                    &mut ring_placed,
+                    &mut coords,
+                    cursor_x,
+                    &mut q,
+                );
             }
         }
 
@@ -302,7 +322,12 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
         .map(|a| a.coords_2d.unwrap_or([0.0, 0.0]))
         .collect();
 
-    for _ in 0..iterations {
+    let iters = if n > 200 {
+        iterations.min(8)
+    } else {
+        iterations
+    };
+    for _ in 0..iters {
         let mut disp = vec![[0.0_f64; 2]; n];
 
         // 1. Bond length spring to STANDARD_BOND_LEN
@@ -342,23 +367,25 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
             }
         }
 
-        // 3. Soft non-bonded clash avoidance
-        let min_sep = STANDARD_BOND_LEN * 0.85;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let connected = mol.adj[i].iter().any(|&(v, _)| v == j);
-                if connected {
-                    continue;
-                }
-                let dx = pos[j][0] - pos[i][0];
-                let dy = pos[j][1] - pos[i][1];
-                let d = dx.hypot(dy).max(1e-4);
-                if d < min_sep {
-                    let push = (min_sep - d) / d * 0.25;
-                    disp[i][0] -= dx * push;
-                    disp[i][1] -= dy * push;
-                    disp[j][0] += dx * push;
-                    disp[j][1] += dy * push;
+        // 3. Soft non-bonded clash avoidance (bounded to <= 400 atoms to guarantee interactive speed)
+        if n <= 400 {
+            let min_sep = STANDARD_BOND_LEN * 0.85;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let connected = mol.adj[i].iter().any(|&(v, _)| v == j);
+                    if connected {
+                        continue;
+                    }
+                    let dx = pos[j][0] - pos[i][0];
+                    let dy = pos[j][1] - pos[i][1];
+                    let d = dx.hypot(dy).max(1e-4);
+                    if d < min_sep {
+                        let push = (min_sep - d) / d * 0.25;
+                        disp[i][0] -= dx * push;
+                        disp[i][1] -= dy * push;
+                        disp[j][0] += dx * push;
+                        disp[j][1] += dy * push;
+                    }
                 }
             }
         }
@@ -391,6 +418,80 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
 
 type AtomCoordList = Vec<(usize, [f64; 2])>;
 
+fn expand_connected_rings(
+    mol: &MolGraph,
+    comp_rings: &[&Vec<usize>],
+    ring_placed: &mut [bool],
+    coords: &mut [Option<[f64; 2]>],
+    cursor_x: f64,
+) -> Vec<usize> {
+    let mut newly_placed = Vec::new();
+    loop {
+        let mut progressed = false;
+        for (ri, ring) in comp_rings.iter().enumerate() {
+            if ring_placed[ri] {
+                continue;
+            }
+            let placed_verts: Vec<(usize, usize)> = ring
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| coords[v].is_some())
+                .map(|(k, &v)| (k, v))
+                .collect();
+            if placed_verts.is_empty() {
+                continue;
+            }
+            if placed_verts.len() >= 2 {
+                if let Some((k1, k2)) = find_consecutive_placed(ring, coords) {
+                    place_fused_ring(ring, k1, k2, coords);
+                } else {
+                    place_remaining_ring_verts(ring, coords);
+                }
+            } else {
+                let (k0, v0) = placed_verts[0];
+                let p0 = coords[v0].unwrap_or([cursor_x, 0.0]);
+                let out_dir = avg_away_dir(mol, v0, coords);
+                let radius = STANDARD_BOND_LEN / (2.0 * (PI / ring.len() as f64).sin());
+                let center = [p0[0] + out_dir[0] * radius, p0[1] + out_dir[1] * radius];
+                let base_angle = (p0[1] - center[1]).atan2(p0[0] - center[0]);
+                let step = 2.0 * PI / ring.len() as f64;
+                for (idx, &v) in ring.iter().enumerate() {
+                    if coords[v].is_none() {
+                        let delta = (idx as isize - k0 as isize) as f64;
+                        let ang = base_angle + delta * step;
+                        coords[v] = Some([
+                            center[0] + radius * ang.cos(),
+                            center[1] + radius * ang.sin(),
+                        ]);
+                    }
+                }
+            }
+            for &v in *ring {
+                newly_placed.push(v);
+            }
+            ring_placed[ri] = true;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    newly_placed
+}
+
+fn expand_ring_cluster_if_needed(
+    mol: &MolGraph,
+    comp_rings: &[&Vec<usize>],
+    ring_placed: &mut [bool],
+    coords: &mut [Option<[f64; 2]>],
+    cursor_x: f64,
+    q: &mut VecDeque<usize>,
+) {
+    for v in expand_connected_rings(mol, comp_rings, ring_placed, coords, cursor_x) {
+        q.push_back(v);
+    }
+}
+
 fn solve_bridged_tutte_cage(
     mol: &MolGraph,
     comp_rings: &[&Vec<usize>],
@@ -398,7 +499,7 @@ fn solve_bridged_tutte_cage(
     cursor_x: f64,
 ) -> Option<(AtomCoordList, usize)> {
     let core_set: BTreeSet<usize> = ring_atoms.iter().copied().collect();
-    if core_set.len() < 4 {
+    if !(4..=14).contains(&core_set.len()) {
         return None;
     }
 
@@ -456,19 +557,57 @@ fn solve_bridged_tutte_cage(
             }
             trial = next;
         }
+        // Expand unpinned interior vertices gently to balance polyhedral edge proportions
+        for &u in ring_atoms {
+            if !pinned[u] {
+                trial[u] = [
+                    cursor_x + (trial[u][0] - cursor_x) * 1.35,
+                    trial[u][1] * 1.35,
+                ];
+            }
+        }
 
+        // Strict geometric invariants: zero bond collapse, bounded length ratio, minimum atom spacing
+        let (min_bl, max_bl) = core_bond_len_bounds(mol, &core_set, &trial);
+        if min_bl < STANDARD_BOND_LEN * 0.35 || max_bl / min_bl.max(1e-6) > 3.8 {
+            continue;
+        }
         let crossings = count_subset_crossings_slice(mol, &core_set, &trial);
         let min_dist = min_pairwise_dist(ring_atoms, &trial);
+        if min_dist < STANDARD_BOND_LEN * 0.35 {
+            continue;
+        }
         let better = match &best {
             None => true,
             Some((bc, bd, _)) => crossings < *bc || (crossings == *bc && min_dist > *bd + 1e-4),
         };
-        if better && min_dist > 1e-3 {
+        if better {
             let mapped = ring_atoms.iter().map(|&v| (v, trial[v])).collect();
             best = Some((crossings, min_dist, mapped));
         }
     }
     best.map(|(c, _, m)| (m, c))
+}
+
+fn core_bond_len_bounds(
+    mol: &MolGraph,
+    core_set: &BTreeSet<usize>,
+    pos: &[[f64; 2]],
+) -> (f64, f64) {
+    let mut min_l = f64::INFINITY;
+    let mut max_l = 0.0_f64;
+    for b in &mol.bonds {
+        if core_set.contains(&b.u) && core_set.contains(&b.v) {
+            let d = (pos[b.u][0] - pos[b.v][0]).hypot(pos[b.u][1] - pos[b.v][1]);
+            min_l = min_l.min(d);
+            max_l = max_l.max(d);
+        }
+    }
+    if min_l.is_finite() {
+        (min_l, max_l)
+    } else {
+        (0.0, f64::INFINITY)
+    }
 }
 
 fn ring_edge_set(mol: &MolGraph, ring: &[usize]) -> BTreeSet<usize> {
@@ -582,12 +721,26 @@ fn segments_strictly_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2
     let orient = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| -> f64 {
         (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
     };
+    let on_seg = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| -> bool {
+        q[0] <= p[0].max(r[0]) + 1e-5
+            && q[0] + 1e-5 >= p[0].min(r[0])
+            && q[1] <= p[1].max(r[1]) + 1e-5
+            && q[1] + 1e-5 >= p[1].min(r[1])
+    };
     let o1 = orient(a, b, c);
     let o2 = orient(a, b, d);
     let o3 = orient(c, d, a);
     let o4 = orient(c, d, b);
     let eps = 1e-7;
-    (o1 * o2 < -eps) && (o3 * o4 < -eps)
+    if (o1 * o2 < -eps) && (o3 * o4 < -eps) {
+        return true;
+    }
+    // Catch near-collinear overlapping segments (tolerance scales with bond length)
+    let col_eps = 1e-4;
+    (o1.abs() < col_eps && on_seg(a, c, b))
+        || (o2.abs() < col_eps && on_seg(a, d, b))
+        || (o3.abs() < col_eps && on_seg(c, a, d))
+        || (o4.abs() < col_eps && on_seg(c, b, d))
 }
 
 /// Interactive ChemDraw/VectorCraft template stamper with snap-to-atom and fused-bond snapping.

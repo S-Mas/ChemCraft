@@ -491,20 +491,32 @@ impl MolGraph {
             .map(|r| r.iter().copied().collect())
             .collect();
 
-        for i in 0..self.rings.len() {
-            if !(5..=6).contains(&self.rings[i].len()) {
+        // Build fused 2-ring envelopes strictly via shared bond incidence (O(R) instead of O(R^2))
+        let mut edge_to_rings: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ri, r) in self.rings.iter().enumerate() {
+            if !(5..=6).contains(&r.len()) {
                 continue;
             }
-            let si: BTreeSet<usize> = self.rings[i].iter().copied().collect();
-            for ring_j in self.rings.iter().skip(i + 1) {
-                if !(5..=6).contains(&ring_j.len()) {
-                    continue;
+            for w in 0..r.len() {
+                let u = r[w];
+                let v = r[(w + 1) % r.len()];
+                if let Some(&(_, bid)) = self.adj[u].iter().find(|&&(nb, _)| nb == v) {
+                    edge_to_rings.entry(bid).or_default().push(ri);
                 }
-                let sj: BTreeSet<usize> = ring_j.iter().copied().collect();
-                if si.intersection(&sj).count() >= 2 {
-                    let union: BTreeSet<usize> = si.union(&sj).copied().collect();
-                    if union.len() <= 12 {
-                        envelopes.push(union);
+            }
+        }
+        let mut seen_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for rlist in edge_to_rings.values() {
+            for a_i in 0..rlist.len() {
+                for b_i in (a_i + 1)..rlist.len() {
+                    let i = rlist[a_i].min(rlist[b_i]);
+                    let j = rlist[a_i].max(rlist[b_i]);
+                    if seen_pairs.insert((i, j)) {
+                        let mut union: BTreeSet<usize> = self.rings[i].iter().copied().collect();
+                        union.extend(self.rings[j].iter().copied());
+                        if union.len() <= 12 {
+                            envelopes.push(union);
+                        }
                     }
                 }
             }
@@ -788,7 +800,7 @@ impl MolGraph {
     }
 
     /// Effective 4-neighbor tetrahedral sequence `[n0, n1, n2, n3]` matching `ChiralTag`.
-    fn effective_chiral_seq(&self, idx: usize) -> Option<Vec<usize>> {
+    pub(crate) fn effective_chiral_seq(&self, idx: usize) -> Option<Vec<usize>> {
         let a = self.atoms.get(idx)?;
         if !a.chiral_seq.is_empty() && a.chiral_seq.len() == 4 {
             // Verify every neighbor in adj[idx] is present once
@@ -849,7 +861,7 @@ impl MolGraph {
             self.atoms[idx].cip_label = if rs_sign > 0 { Some('R') } else { Some('S') };
         }
 
-        // E/Z double-bond stereochemistry using full CIP ligand ranking
+        // E/Z double-bond stereochemistry using full CIP ligand ranking (SMILES / or 2D CTAB geometry)
         for bid in 0..self.bonds.len() {
             if self.bonds[bid].order != BondOrder::Double {
                 self.bonds[bid].cis_trans = BondCisTrans::None;
@@ -866,6 +878,9 @@ impl MolGraph {
                     } else {
                         BondCisTrans::E
                     }
+                }
+                _ if !self.bonds[bid].in_ring && self.bonds[bid].stereo != BondStereo::Wavy => {
+                    geometric_ez_from_2d(self, u, v)
                 }
                 _ => BondCisTrans::None,
             };
@@ -1085,7 +1100,12 @@ impl MolGraph {
                                 BondOrder::Triple => 3,
                                 BondOrder::Aromatic => 4,
                             };
-                            (ranks[nbr] << 3) | bo
+                            let ez = match self.bonds[bid].cis_trans {
+                                BondCisTrans::E => 1u64,
+                                BondCisTrans::Z => 2,
+                                BondCisTrans::None => 0,
+                            };
+                            (ranks[nbr] << 5) | (bo << 2) | ez
                         })
                         .collect();
                     nbrs.sort_unstable();
@@ -1202,9 +1222,9 @@ impl MolGraph {
             ez_tag: None,
         }];
 
-        // Track entry substituent & direction per E/Z double bond during emission:
-        // map: bond_id -> (entry_substituent_atom_id, away_from_bond)
-        let mut ez_entry: HashMap<usize, (usize, bool)> = HashMap::new();
+        // Track entry substituent & incoming vertical side per E/Z double bond during emission:
+        // map: bond_id -> (entry_substituent_atom_id, entry_side_relative_to_double_atom)
+        let mut ez_entry: HashMap<usize, (usize, i32)> = HashMap::new();
 
         while let Some(op) = emit.pop() {
             match op {
@@ -1323,34 +1343,35 @@ impl MolGraph {
                                 BondCisTrans::E | BondCisTrans::Z
                             )
                             && idx == 0
+                            && let Some((entry_sub, entry_side)) = ez_entry.get(&p_bid).copied()
                         {
-                            if let Some((entry_sub, away)) = ez_entry.get(&p_bid).copied() {
-                                let want_z = self.bonds[p_bid].cis_trans == BondCisTrans::Z;
-                                let hi_p = highest_cip_double_bond_nbr(self, p, u).map(|(n, _)| n);
-                                let hi_u = highest_cip_double_bond_nbr(self, u, p).map(|(n, _)| n);
-                                let entry_is_hi = hi_p == Some(entry_sub);
-                                let exit_is_hi = hi_u == Some(v);
-                                let entry_side = if away { 1 } else { -1 };
-                                let hi_entry_side =
-                                    if entry_is_hi { entry_side } else { -entry_side };
-                                let hi_exit_side = if want_z {
-                                    hi_entry_side
-                                } else {
-                                    -hi_entry_side
-                                };
-                                let exit_side = if exit_is_hi {
-                                    hi_exit_side
-                                } else {
-                                    -hi_exit_side
-                                };
-                                ez_c = Some(if exit_side > 0 { '/' } else { '\\' });
-                            }
+                            let want_z = self.bonds[p_bid].cis_trans == BondCisTrans::Z;
+                            let hi_p = highest_cip_end_nbr(self, p, u);
+                            let hi_u = highest_cip_end_nbr(self, u, p);
+                            let entry_is_hi = hi_p == Some(entry_sub);
+                            let exit_is_hi = hi_u == Some(v);
+                            let hi_entry_side = if entry_is_hi { entry_side } else { -entry_side };
+                            let hi_exit_side = if want_z {
+                                hi_entry_side
+                            } else {
+                                -hi_entry_side
+                            };
+                            let exit_side = if exit_is_hi {
+                                hi_exit_side
+                            } else {
+                                -hi_exit_side
+                            };
+                            ez_c = Some(if exit_side > 0 { '/' } else { '\\' });
                         } else if let Some((si, d_bid)) = root_ez_pair
                             && idx == si
                         {
                             ez_c = Some('/');
-                            ez_entry.insert(d_bid, (v, true));
-                        } else if idx == 0
+                            ez_entry.insert(d_bid, (v, 1));
+                        }
+
+                        // Independently check if advancing along `u -> v` enters a subsequent
+                        // conjugated E/Z double bond on `v` (handles polyenes such as hexa-2,4-diene!).
+                        if idx == 0
                             && let Some(&(_, cbid)) = self.adj[v].iter().find(|&&(nb, cbid)| {
                                 nb != u
                                     && matches!(
@@ -1358,9 +1379,13 @@ impl MolGraph {
                                         BondCisTrans::E | BondCisTrans::Z
                                     )
                             })
+                            && !ez_entry.contains_key(&cbid)
                         {
-                            ez_c = Some('/');
-                            ez_entry.insert(cbid, (u, false));
+                            let ch = ez_c.unwrap_or('/');
+                            ez_c = Some(ch);
+                            // Bond `u -> v` labeled `/` puts `u` DOWN (-1) relative to `v`; `\` puts `u` UP (+1)
+                            let entry_side_into_v = if ch == '/' { -1 } else { 1 };
+                            ez_entry.insert(cbid, (u, entry_side_into_v));
                         }
                         emit.push(Op::Visit {
                             u: v,
@@ -1531,16 +1556,16 @@ fn cip_bfs_spheres(
         return spheres;
     }
 
-    // Frontier entries: (current_atom, ancestor_set_including_current)
-    let mut frontier: Vec<(usize, Vec<usize>)> = vec![(root, vec![anchor, root])];
+    // Linear-time visited-deduplicated breadth-first spheres (`O(N + M)`, immune to cyclic DoS)
+    let n = mol.atoms.len();
+    let mut visited = vec![false; n];
+    visited[anchor] = true;
+    visited[root] = true;
+    let mut frontier: Vec<(usize, usize)> = vec![(root, anchor)];
     for _depth in 1..max_depth {
-        let mut next_frontier: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut next_frontier: Vec<(usize, usize)> = Vec::new();
         let mut bag: Vec<(u16, u16)> = Vec::new();
-        for (cur, ancestors) in frontier {
-            let parent = ancestors
-                .len()
-                .checked_sub(2)
-                .map_or(anchor, |pi| ancestors[pi]);
+        for (cur, parent) in frontier {
             for &(nbr, bid) in &mol.adj[cur] {
                 if nbr == parent {
                     continue;
@@ -1550,10 +1575,9 @@ fn cip_bfs_spheres(
                 for _ in 0..w {
                     bag.push(key);
                 }
-                if !ancestors.contains(&nbr) {
-                    let mut next_anc = ancestors.clone();
-                    next_anc.push(nbr);
-                    next_frontier.push((nbr, next_anc));
+                if !visited[nbr] {
+                    visited[nbr] = true;
+                    next_frontier.push((nbr, cur));
                 }
             }
             for _ in 0..mol.atoms[cur].total_h() {
@@ -1572,6 +1596,63 @@ fn cip_bfs_spheres(
         frontier = next_frontier;
     }
     spheres
+}
+
+pub fn highest_cip_end_nbr(mol: &MolGraph, atom: usize, other_end: usize) -> Option<usize> {
+    let mut subs: Vec<usize> = mol.adj[atom]
+        .iter()
+        .map(|&(nb, _)| nb)
+        .filter(|&nb| nb != other_end)
+        .collect();
+    if subs.is_empty() {
+        return None;
+    }
+    if subs.len() == 1 {
+        return Some(subs[0]);
+    }
+    if subs.len() == 2 {
+        return match cip_compare_branches(mol, atom, subs[0], subs[1]) {
+            std::cmp::Ordering::Greater => Some(subs[0]),
+            std::cmp::Ordering::Less => Some(subs[1]),
+            std::cmp::Ordering::Equal => None,
+        };
+    }
+    subs.sort_by(|&a, &b| cip_compare_branches(mol, atom, b, a));
+    (cip_compare_branches(mol, atom, subs[0], subs[1]) != std::cmp::Ordering::Equal)
+        .then_some(subs[0])
+}
+
+fn geometric_ez_from_2d(mol: &MolGraph, u: usize, v: usize) -> BondCisTrans {
+    let (Some(pu), Some(pv)) = (mol.atoms[u].coords_2d, mol.atoms[v].coords_2d) else {
+        return BondCisTrans::None;
+    };
+    let dx = pv[0] - pu[0];
+    let dy = pv[1] - pu[1];
+    let len = dx.hypot(dy);
+    if len < 1e-4 {
+        return BondCisTrans::None;
+    }
+    let nx = -dy / len;
+    let ny = dx / len;
+    let Some(hi_u) = highest_cip_end_nbr(mol, u, v) else {
+        return BondCisTrans::None;
+    };
+    let Some(hi_v) = highest_cip_end_nbr(mol, v, u) else {
+        return BondCisTrans::None;
+    };
+    let (Some(phu), Some(phv)) = (mol.atoms[hi_u].coords_2d, mol.atoms[hi_v].coords_2d) else {
+        return BondCisTrans::None;
+    };
+    let su = (phu[0] - pu[0]) * nx + (phu[1] - pu[1]) * ny;
+    let sv = (phv[0] - pv[0]) * nx + (phv[1] - pv[1]) * ny;
+    if su.abs() < 1e-3 || sv.abs() < 1e-3 {
+        return BondCisTrans::None;
+    }
+    if (su > 0.0) == (sv > 0.0) {
+        BondCisTrans::Z
+    } else {
+        BondCisTrans::E
+    }
 }
 
 fn highest_cip_double_bond_nbr(
@@ -1621,7 +1702,7 @@ fn highest_cip_double_bond_nbr(
     (d0 != 0).then_some((n0, d0))
 }
 
-fn perm_parity(p: &[usize; 4]) -> i32 {
+pub(crate) fn perm_parity(p: &[usize; 4]) -> i32 {
     let mut inv = 0usize;
     for i in 0..4 {
         for j in (i + 1)..4 {

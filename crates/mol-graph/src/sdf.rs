@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
+use std::f64::consts::PI;
 use std::fmt::Write;
 
 use crate::error::MolError;
-use crate::mol::{BondOrder, BondStereo, MolAtom, MolGraph};
+use crate::mol::{
+    BondCisTrans, BondOrder, BondStereo, ChiralTag, MolAtom, MolGraph, highest_cip_end_nbr,
+};
 use crate::smiles::DEFAULT_MAX_ATOMS;
 
 /// Parse multi-record SDF text (supports both CTAB **V2000** and **V3000** blocks plus SD tags).
@@ -196,7 +200,7 @@ fn parse_v2000_block(lines: &[&str], title: &str) -> Result<MolGraph, MolError> 
         let stereo = match s_raw {
             1 => BondStereo::Up,
             6 => BondStereo::Down,
-            4 => BondStereo::Wavy,
+            3 | 4 => BondStereo::Wavy,
             _ => BondStereo::None,
         };
         mol.add_bond(u_raw - 1, v_raw - 1, order, stereo)?;
@@ -316,10 +320,105 @@ fn finish_sdf_mol(mut mol: MolGraph) -> Result<MolGraph, MolError> {
     if mol.atoms.is_empty() {
         return Err(MolError::EmptyInput);
     }
+    perceive_sdf_wedges(&mut mol);
     mol.suppress_explicit_hydrogens();
     mol.desalt();
     mol.perceive()?;
     Ok(mol)
+}
+
+fn det3_vol(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+    a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+}
+
+fn stereo_signed_vol_for_seq(u_pos: [f64; 2], nbr_xy: &[[f64; 2]; 4], z: &[f64; 4]) -> f64 {
+    let p0 = [nbr_xy[0][0] - u_pos[0], nbr_xy[0][1] - u_pos[1], z[0]];
+    let p1 = [nbr_xy[1][0] - u_pos[0], nbr_xy[1][1] - u_pos[1], z[1]];
+    let p2 = [nbr_xy[2][0] - u_pos[0], nbr_xy[2][1] - u_pos[1], z[2]];
+    let p3 = [nbr_xy[3][0] - u_pos[0], nbr_xy[3][1] - u_pos[1], z[3]];
+    let v1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+    let v2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+    let v3 = [p3[0] - p0[0], p3[1] - p0[1], p3[2] - p0[2]];
+    det3_vol(v1, v2, v3)
+}
+
+fn away_2d_dir(u: usize, mol: &MolGraph, coords: &[[f64; 2]]) -> [f64; 2] {
+    let pu = coords[u];
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    for &(nbr, _) in &mol.adj[u] {
+        let pn = coords[nbr];
+        let dx = pn[0] - pu[0];
+        let dy = pn[1] - pu[1];
+        let d = dx.hypot(dy).max(1e-6);
+        sx += dx / d;
+        sy += dy / d;
+    }
+    let len = sx.hypot(sy);
+    if len < 1e-4 {
+        [pu[0] + 1.0, pu[1]]
+    } else {
+        [pu[0] - 1.2 * sx / len, pu[1] - 1.2 * sy / len]
+    }
+}
+
+/// Reconstruct tetrahedral SMILES parity (`ChiralTag` + `chiral_seq`) from 2D CTAB coordinates
+/// and Up/Down stereo wedges (`b.u` is the narrow end at the chiral center).
+fn perceive_sdf_wedges(mol: &mut MolGraph) {
+    let coords: Vec<[f64; 2]> = mol
+        .atoms
+        .iter()
+        .map(|a| a.coords_2d.unwrap_or([0.0, 0.0]))
+        .collect();
+    for u in 0..mol.atoms.len() {
+        let mut wedged: Vec<(usize, f64)> = Vec::new();
+        for &(nbr, bid) in &mol.adj[u] {
+            let b = &mol.bonds[bid];
+            if b.u == u && matches!(b.stereo, BondStereo::Up | BondStereo::Down) {
+                let zv = if b.stereo == BondStereo::Up {
+                    1.0
+                } else {
+                    -1.0
+                };
+                wedged.push((nbr, zv));
+            }
+        }
+        if wedged.is_empty() {
+            continue;
+        }
+        let mut seq: Vec<usize> = mol.adj[u].iter().map(|&(nb, _)| nb).collect();
+        if seq.len() == 3 {
+            seq.push(usize::MAX);
+        }
+        if seq.len() != 4 {
+            continue;
+        }
+        let mut xy = [[0.0; 2]; 4];
+        let mut zs = [0.0; 4];
+        for (i, &nid) in seq.iter().enumerate() {
+            if nid == usize::MAX {
+                xy[i] = away_2d_dir(u, mol, &coords);
+            } else {
+                xy[i] = coords[nid];
+                if let Some(&(_, zv)) = wedged.iter().find(|&&(wn, _)| wn == nid) {
+                    zs[i] = zv;
+                }
+            }
+        }
+        let vol = stereo_signed_vol_for_seq(coords[u], &xy, &zs);
+        if vol.abs() > 1e-5 {
+            mol.atoms[u].chiral = if vol > 0.0 {
+                ChiralTag::Clockwise
+            } else {
+                ChiralTag::CounterClockwise
+            };
+            if seq[3] == usize::MAX {
+                mol.atoms[u].chiral_h_slot = Some(3);
+            }
+            mol.atoms[u].chiral_seq = seq;
+        }
+    }
 }
 
 fn parse_props_and_sd_tags(mol: &mut MolGraph, lines: &[&str], start_idx: usize, title: &str) {
@@ -405,11 +504,11 @@ fn v2000_bond_order(t: u8) -> BondOrder {
 }
 
 /// Collect explicit H atoms needed to disambiguate aromatic `[nH]` nitrogens in SDF CTABs.
-fn aromatic_nh_hydrogens(mol: &MolGraph) -> Vec<(usize, [f64; 2])> {
+fn aromatic_nh_hydrogens(mol: &MolGraph, coords: &[[f64; 2]]) -> Vec<(usize, [f64; 2])> {
     let mut extras = Vec::new();
     for a in &mol.atoms {
         if a.aromatic && a.symbol == "N" && a.total_h() > 0 {
-            let [x, y] = a.coords_2d.unwrap_or([0.0, 0.0]);
+            let [x, y] = coords[a.id];
             for k in 0..a.total_h() {
                 extras.push((a.id, [x + 0.8 * f64::from(k + 1), y + 0.4]));
             }
@@ -418,11 +517,349 @@ fn aromatic_nh_hydrogens(mol: &MolGraph) -> Vec<(usize, [f64; 2])> {
     extras
 }
 
+/// Generate lightweight trigonal 2D coordinates in pure `mol-graph` when exporting SDF from
+/// coordinate-less SMILES so E/Z double-bond geometry and chiral wedges encode faithfully.
+fn ensure_export_2d_coords(mol: &MolGraph) -> Vec<[f64; 2]> {
+    if mol.atoms.iter().all(|a| a.coords_2d.is_some()) {
+        return mol
+            .atoms
+            .iter()
+            .map(|a| a.coords_2d.unwrap_or([0.0, 0.0]))
+            .collect();
+    }
+    let n = mol.atoms.len();
+    let bond_len = 1.5_f64;
+    let mut pos: Vec<Option<[f64; 2]>> = vec![None; n];
+    let mut cursor_x = 0.0_f64;
+
+    // 1. Place rings first (monocyclic regular + fused shared-edge rings)
+    if !mol.rings.is_empty() {
+        let mut ring_done = vec![false; mol.rings.len()];
+        loop {
+            let mut progressed = false;
+            for (ri, r) in mol.rings.iter().enumerate() {
+                if ring_done[ri] || r.is_empty() {
+                    continue;
+                }
+                let placed: Vec<usize> = r.iter().copied().filter(|&v| pos[v].is_some()).collect();
+                if placed.is_empty() {
+                    if ring_done.iter().all(|&d| !d)
+                        || mol
+                            .rings
+                            .iter()
+                            .enumerate()
+                            .all(|(rj, _)| ring_done[rj] || rj >= ri)
+                    {
+                        let k = r.len() as f64;
+                        let rad = bond_len / (2.0 * (PI / k).sin());
+                        for (i, &v) in r.iter().enumerate() {
+                            let ang = 2.0 * PI * (i as f64) / k;
+                            pos[v] = Some([cursor_x + rad * ang.cos(), rad * ang.sin()]);
+                        }
+                        ring_done[ri] = true;
+                        progressed = true;
+                    }
+                    continue;
+                }
+                if let Some((k1, k2)) = (0..r.len()).find_map(|i| {
+                    let j = (i + 1) % r.len();
+                    (pos[r[i]].is_some() && pos[r[j]].is_some()).then_some((i, j))
+                }) {
+                    let p1 = pos[r[k1]].unwrap_or([0.0, 0.0]);
+                    let p2 = pos[r[k2]].unwrap_or([bond_len, 0.0]);
+                    let mid = [(p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5];
+                    let dx = p2[0] - p1[0];
+                    let dy = p2[1] - p1[1];
+                    let elen = dx.hypot(dy).max(1e-6);
+                    let n1 = [-dy / elen, dx / elen];
+                    let n2 = [dy / elen, -dx / elen];
+                    let mut sx = 0.0;
+                    let mut sy = 0.0;
+                    let mut cnt = 0.0;
+                    for p in pos.iter().flatten() {
+                        sx += p[0];
+                        sy += p[1];
+                        cnt += 1.0;
+                    }
+                    let c = if cnt > 2.0 { [sx / cnt, sy / cnt] } else { mid };
+                    let normal = if (mid[0] + n1[0] - c[0]).hypot(mid[1] + n1[1] - c[1])
+                        >= (mid[0] + n2[0] - c[0]).hypot(mid[1] + n2[1] - c[1])
+                    {
+                        n1
+                    } else {
+                        n2
+                    };
+                    let sides = r.len() as f64;
+                    let rad = elen / (2.0 * (PI / sides).sin());
+                    let apo = (rad * rad - (elen * 0.5).powi(2)).max(0.0).sqrt();
+                    let center = [mid[0] + normal[0] * apo, mid[1] + normal[1] * apo];
+                    let a1 = (p1[1] - center[1]).atan2(p1[0] - center[0]);
+                    let a2 = (p2[1] - center[1]).atan2(p2[0] - center[0]);
+                    let mut diff = a2 - a1;
+                    while diff > PI {
+                        diff -= 2.0 * PI;
+                    }
+                    while diff < -PI {
+                        diff += 2.0 * PI;
+                    }
+                    let step = if diff < 0.0 {
+                        -2.0 * PI / sides
+                    } else {
+                        2.0 * PI / sides
+                    };
+                    for (idx, &v) in r.iter().enumerate() {
+                        if pos[v].is_none() {
+                            let d =
+                                (idx as isize - k1 as isize).rem_euclid(r.len() as isize) as f64;
+                            let ang = a1 + d * step;
+                            pos[v] =
+                                Some([center[0] + rad * ang.cos(), center[1] + rad * ang.sin()]);
+                        }
+                    }
+                    ring_done[ri] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                if let Some(ri) = ring_done.iter().position(|&d| !d) {
+                    let r = &mol.rings[ri];
+                    let k = r.len().max(3) as f64;
+                    let rad = bond_len / (2.0 * (PI / k).sin());
+                    let max_x = pos.iter().flatten().map(|p| p[0]).fold(cursor_x, f64::max);
+                    let cx = max_x + bond_len * 2.5;
+                    for (i, &v) in r.iter().enumerate() {
+                        if pos[v].is_none() {
+                            let ang = 2.0 * PI * (i as f64) / k;
+                            pos[v] = Some([cx + rad * ang.cos(), rad * ang.sin()]);
+                        }
+                    }
+                    ring_done[ri] = true;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. BFS place acyclic components & substituents respecting E/Z double bonds!
+    for s in 0..n {
+        let mut q = VecDeque::new();
+        if pos[s].is_none() {
+            let max_x = pos.iter().flatten().map(|p| p[0]).fold(cursor_x, f64::max);
+            cursor_x = if pos.iter().any(Option::is_some) {
+                max_x + bond_len * 2.2
+            } else {
+                0.0
+            };
+            pos[s] = Some([cursor_x, 0.0]);
+            q.push_back(s);
+        } else {
+            // Drain neighbors of already placed ring atoms too
+            for (v, pv) in pos.iter().enumerate() {
+                if pv.is_some() {
+                    q.push_back(v);
+                }
+            }
+        }
+        while let Some(u) = q.pop_front() {
+            let pu = pos[u].unwrap_or([0.0, 0.0]);
+            let placed_nbrs: Vec<usize> = mol.adj[u]
+                .iter()
+                .map(|&(v, _)| v)
+                .filter(|&v| pos[v].is_some())
+                .collect();
+            let unplaced: Vec<(usize, usize)> = mol.adj[u]
+                .iter()
+                .copied()
+                .filter(|&(v, _)| pos[v].is_none())
+                .collect();
+            if unplaced.is_empty() {
+                continue;
+            }
+
+            // Check if `u` is one end of an acyclic E/Z double bond with its other end ALREADY placed (`parent = v_dbl`)
+            let dbl_parent = placed_nbrs.iter().copied().find_map(|pn| {
+                mol.adj[u].iter().find(|&&(nb, bid)| {
+                    nb == pn
+                        && mol.bonds[bid].order == BondOrder::Double
+                        && matches!(mol.bonds[bid].cis_trans, BondCisTrans::E | BondCisTrans::Z)
+                })
+            });
+
+            if let Some(&(v_dbl, dbl_bid)) = dbl_parent {
+                let pv = pos[v_dbl].unwrap_or([0.0, 0.0]);
+                let dx = pu[0] - pv[0];
+                let dy = pu[1] - pv[1];
+                let alpha = dy.atan2(dx);
+                let len = dx.hypot(dy).max(1e-6);
+                let nx = -dy / len;
+                let ny = dx / len;
+                let hi_other = highest_cip_end_nbr(mol, v_dbl, u);
+                let hi_self = highest_cip_end_nbr(mol, u, v_dbl);
+                let other_side = hi_other
+                    .and_then(|ho| pos[ho])
+                    .map_or(1.0, |pho| (pho[0] - pv[0]) * nx + (pho[1] - pv[1]) * ny);
+                let want_self_hi_sign = if mol.bonds[dbl_bid].cis_trans == BondCisTrans::Z {
+                    if other_side >= 0.0 { 1.0 } else { -1.0 }
+                } else if other_side >= 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                for (i, (w, _)) in unplaced.into_iter().enumerate() {
+                    let is_hi = hi_self == Some(w) || (hi_self.is_none() && i == 0);
+                    let target_sign = if is_hi {
+                        want_self_hi_sign
+                    } else {
+                        -want_self_hi_sign
+                    };
+                    // `alpha + PI/3` points in +n direction (`dot = +sin(PI/3)`), `alpha - PI/3` points in -n
+                    let ang = if target_sign > 0.0 {
+                        alpha + PI / 3.0
+                    } else {
+                        alpha - PI / 3.0
+                    };
+                    pos[w] = Some([pu[0] + bond_len * ang.cos(), pu[1] + bond_len * ang.sin()]);
+                    q.push_back(w);
+                }
+                continue;
+            }
+
+            let base_ang = if placed_nbrs.is_empty() {
+                PI / 6.0
+            } else {
+                let mut sx = 0.0;
+                let mut sy = 0.0;
+                for &pn in &placed_nbrs {
+                    let pp = pos[pn].unwrap_or(pu);
+                    let dx = pp[0] - pu[0];
+                    let dy = pp[1] - pu[1];
+                    let d = dx.hypot(dy).max(1e-6);
+                    sx += dx / d;
+                    sy += dy / d;
+                }
+                (-sy).atan2(-sx)
+            };
+            let k = unplaced.len();
+            for (i, (v, _)) in unplaced.into_iter().enumerate() {
+                let offset = if k == 1 {
+                    // Tilt slightly on entering/exiting double bonds so E/Z vector never stays collinear
+                    let is_dbl_adj = mol.adj[v]
+                        .iter()
+                        .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Double);
+                    if is_dbl_adj && placed_nbrs.len() == 1 {
+                        PI / 6.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    let spread = if k == 2 { PI * 2.0 / 3.0 } else { PI * 0.55 };
+                    (i as f64 - (k as f64 - 1.0) * 0.5) * spread
+                };
+                let ang = base_ang + offset;
+                pos[v] = Some([pu[0] + bond_len * ang.cos(), pu[1] + bond_len * ang.sin()]);
+                q.push_back(v);
+            }
+        }
+    }
+
+    pos.into_iter().map(|p| p.unwrap_or([0.0, 0.0])).collect()
+}
+
+/// Compute per-bond oriented endpoints `(u_out, v_out, stereo_out)` carrying CTAB stereo wedges
+/// for every tetrahedral stereocenter in `mol`.
+fn sdf_bond_records(
+    mol: &MolGraph,
+    coords: &[[f64; 2]],
+) -> Vec<(usize, usize, BondOrder, BondStereo)> {
+    let mut records: Vec<(usize, usize, BondOrder, BondStereo)> = mol
+        .bonds
+        .iter()
+        .map(|b| (b.u, b.v, b.order, b.stereo))
+        .collect();
+
+    for u in 0..mol.atoms.len() {
+        let a = &mol.atoms[u];
+        if !matches!(a.chiral, ChiralTag::Clockwise | ChiralTag::CounterClockwise) {
+            continue;
+        }
+        // Keep existing explicit wedge if already present with narrow tip at `u`
+        if records
+            .iter()
+            .any(|&(bu, _, _, st)| bu == u && matches!(st, BondStereo::Up | BondStereo::Down))
+        {
+            continue;
+        }
+        let Some(seq) = mol.effective_chiral_seq(u) else {
+            continue;
+        };
+        let orig_sign: i32 = if a.chiral == ChiralTag::Clockwise {
+            1
+        } else {
+            -1
+        };
+        // Pick a non-H neighbor `w` to carry the wedge so |det3| is non-degenerate
+        let mut candidates: Vec<usize> = seq
+            .iter()
+            .copied()
+            .filter(|&nid| nid != usize::MAX)
+            .collect();
+        // Prefer degree-1 or non-ring neighbor for clean 2D depiction
+        candidates.sort_by_key(|&w| {
+            let in_ring = mol.adj[u]
+                .iter()
+                .find(|&&(nb, _)| nb == w)
+                .is_some_and(|&(_, bid)| mol.bonds[bid].in_ring);
+            let used_as_wedge = records.iter().any(|&(bu, bv, _, st)| {
+                ((bu == u && bv == w) || (bv == u && bu == w))
+                    && matches!(st, BondStereo::Up | BondStereo::Down)
+            });
+            (used_as_wedge, in_ring, mol.adj[w].len())
+        });
+
+        let mut chosen: Option<(usize, BondStereo)> = None;
+        for w in candidates {
+            let mut xy = [[0.0; 2]; 4];
+            let mut zs_up = [0.0; 4];
+            for (i, &nid) in seq.iter().enumerate() {
+                if nid == usize::MAX {
+                    xy[i] = away_2d_dir(u, mol, coords);
+                } else {
+                    xy[i] = coords[nid];
+                    if nid == w {
+                        zs_up[i] = 1.0;
+                    }
+                }
+            }
+            let vol_up = stereo_signed_vol_for_seq(coords[u], &xy, &zs_up);
+            if vol_up.abs() > 1e-5 {
+                let st = if (vol_up > 0.0) == (orig_sign > 0) {
+                    BondStereo::Up
+                } else {
+                    BondStereo::Down
+                };
+                chosen = Some((w, st));
+                break;
+            }
+        }
+        if let Some((w, st)) = chosen
+            && let Some(rec) = records
+                .iter_mut()
+                .find(|(bu, bv, _, _)| (*bu == u && *bv == w) || (*bu == w && *bv == u))
+        {
+            *rec = (u, w, rec.2, st);
+        }
+    }
+    records
+}
+
 /// Write a list of `MolGraph` structures as an SDF V2000 multi-record file.
 pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
     let mut out = String::new();
     for mol in mols {
-        let extra_hs = aromatic_nh_hydrogens(mol);
+        let coords = ensure_export_2d_coords(mol);
+        let bond_recs = sdf_bond_records(mol, &coords);
+        let extra_hs = aromatic_nh_hydrogens(mol, &coords);
         let name = mol.name.as_deref().unwrap_or("ChemCraft");
         let _ = writeln!(out, "{name}");
         let _ = writeln!(out, "  ChemCraft-V2000");
@@ -431,10 +868,10 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
             out,
             "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000",
             mol.atoms.len() + extra_hs.len(),
-            mol.bonds.len() + extra_hs.len()
+            bond_recs.len() + extra_hs.len()
         );
-        for a in &mol.atoms {
-            let [x, y] = a.coords_2d.unwrap_or([0.0, 0.0]);
+        for (idx, a) in mol.atoms.iter().enumerate() {
+            let [x, y] = coords[idx];
             let _ = writeln!(
                 out,
                 "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
@@ -448,21 +885,21 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
                 hx, hy, 0.0, "H"
             );
         }
-        for b in &mol.bonds {
-            let t = match b.order {
+        for (bu, bv, order, stereo) in bond_recs {
+            let t = match order {
                 BondOrder::Single => 1,
                 BondOrder::Double => 2,
                 BondOrder::Triple => 3,
                 BondOrder::Aromatic => 4,
                 BondOrder::Dative => 9,
             };
-            let s = match b.stereo {
+            let s = match stereo {
                 BondStereo::Up => 1,
                 BondStereo::Down => 6,
                 BondStereo::Wavy => 4,
                 _ => 0,
             };
-            let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", b.u + 1, b.v + 1, t, s);
+            let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", bu + 1, bv + 1, t, s);
         }
         for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
             let h_id = mol.atoms.len() + h_i + 1;
@@ -493,7 +930,9 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
 /// Write a `MolGraph` as a CTAB V3000 block.
 pub fn write_sdf_v3000(mol: &MolGraph) -> String {
     let mut out = String::new();
-    let extra_hs = aromatic_nh_hydrogens(mol);
+    let coords = ensure_export_2d_coords(mol);
+    let bond_recs = sdf_bond_records(mol, &coords);
+    let extra_hs = aromatic_nh_hydrogens(mol, &coords);
     let name = mol.name.as_deref().unwrap_or("ChemCraft");
     let _ = writeln!(out, "{name}");
     let _ = writeln!(out, "  ChemCraft-V3000");
@@ -504,11 +943,11 @@ pub fn write_sdf_v3000(mol: &MolGraph) -> String {
         out,
         "M  V30 COUNTS {} {} 0 0 0",
         mol.atoms.len() + extra_hs.len(),
-        mol.bonds.len() + extra_hs.len()
+        bond_recs.len() + extra_hs.len()
     );
     let _ = writeln!(out, "M  V30 BEGIN ATOM");
-    for a in &mol.atoms {
-        let [x, y] = a.coords_2d.unwrap_or([0.0, 0.0]);
+    for (idx, a) in mol.atoms.iter().enumerate() {
+        let [x, y] = coords[idx];
         if a.formal_charge != 0 {
             let _ = writeln!(
                 out,
@@ -541,29 +980,21 @@ pub fn write_sdf_v3000(mol: &MolGraph) -> String {
     }
     let _ = writeln!(out, "M  V30 END ATOM");
     let _ = writeln!(out, "M  V30 BEGIN BOND");
-    for (idx, b) in mol.bonds.iter().enumerate() {
-        let t = match b.order {
+    for (idx, (bu, bv, order, stereo)) in bond_recs.into_iter().enumerate() {
+        let t = match order {
             BondOrder::Single => 1,
             BondOrder::Double => 2,
             BondOrder::Triple => 3,
             BondOrder::Aromatic => 4,
             BondOrder::Dative => 9,
         };
-        let cfg = match b.stereo {
+        let cfg = match stereo {
             BondStereo::Up => " CFG=1",
             BondStereo::Down => " CFG=3",
             BondStereo::Wavy => " CFG=2",
             _ => "",
         };
-        let _ = writeln!(
-            out,
-            "M  V30 {} {} {} {}{}",
-            idx + 1,
-            t,
-            b.u + 1,
-            b.v + 1,
-            cfg
-        );
+        let _ = writeln!(out, "M  V30 {} {} {} {}{}", idx + 1, t, bu + 1, bv + 1, cfg);
     }
     for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
         let _ = writeln!(

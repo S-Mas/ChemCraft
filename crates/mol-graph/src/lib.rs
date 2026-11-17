@@ -18,7 +18,9 @@ pub use dwar::{
 };
 pub use element::{ElementMeta, element_by_number, element_by_symbol, max_neutral_valence};
 pub use error::MolError;
-pub use mol::{BondCisTrans, BondOrder, BondStereo, ChiralTag, MolAtom, MolBond, MolGraph};
+pub use mol::{
+    BondCisTrans, BondOrder, BondStereo, ChiralTag, MolAtom, MolBond, MolGraph, highest_cip_end_nbr,
+};
 pub use mutate::{
     SubstituentKind, attach_fragment_at, mutate_molecule, replace_carboxyl_with_tetrazole,
 };
@@ -207,6 +209,57 @@ mod tests {
         assert_eq!(reloaded.mol.structural_key(), pen_mol.structural_key());
         let dwar2 = write_dwar(&[(&reloaded.mol, &reloaded.columns)]);
         assert_eq!(dwar1, dwar2);
+
+        // Conjugated polyenes: hexa-2,4-diene -> 3 unique isomers; unsymmetric hepta-2,4-diene -> 4 unique isomers!
+        let hex_keys: std::collections::BTreeSet<String> = [
+            "C/C=C/C=C/C",
+            "C/C=C/C=C\\C",
+            "C/C=C\\C=C/C",
+            "C/C=C\\C=C\\C",
+        ]
+        .iter()
+        .map(|s| {
+            let m = parse_smiles(s)?;
+            let c1 = m.canonical_smiles();
+            let m2 = parse_smiles(&c1)?;
+            assert_eq!(
+                c1,
+                m2.canonical_smiles(),
+                "hexa-2,4-diene not idempotent for {s}"
+            );
+            Ok(m.structural_key())
+        })
+        .collect::<Result<_, MolError>>()?;
+        assert_eq!(
+            hex_keys.len(),
+            3,
+            "hexa-2,4-diene must produce 3 unique keys (EE, EZ=ZE, ZZ)"
+        );
+
+        let hep_keys: std::collections::BTreeSet<String> = [
+            "C/C=C/C=C/CC",
+            "C/C=C/C=C\\CC",
+            "C/C=C\\C=C/CC",
+            "C/C=C\\C=C\\CC",
+        ]
+        .iter()
+        .map(|s| {
+            let m = parse_smiles(s)?;
+            let c1 = m.canonical_smiles();
+            let m2 = parse_smiles(&c1)?;
+            assert_eq!(
+                c1,
+                m2.canonical_smiles(),
+                "hepta-2,4-diene not idempotent for {s}"
+            );
+            Ok(m.structural_key())
+        })
+        .collect::<Result<_, MolError>>()?;
+        assert_eq!(
+            hep_keys.len(),
+            4,
+            "hepta-2,4-diene must preserve all 4 E/Z isomers"
+        );
         Ok(())
     }
 
@@ -309,6 +362,40 @@ $$$$
             .next()
             .ok_or(MolError::EmptyInput)??;
         assert_eq!(ext_u.formula(), "C4H4N2O2");
+
+        // Full R/S + E/Z SDF V2000 & V3000 interchange preservation
+        for smi in [
+            "N[C@@H](C)C(=O)O",
+            "N[C@H](C)C(=O)O",
+            "N[C@@H](CS)C(=O)O",
+            "CC1(C)S[C@@H]2[C@H](NC(=O)Cc3ccccc3)C(=O)N2[C@H]1C(=O)O",
+            "F/C=C/Cl",
+            "F/C=C\\Cl",
+            "C/C=C/C=C\\CC",
+        ] {
+            let orig = parse_smiles(smi)?;
+            let expected_key = orig.structural_key();
+            let sdf2 = write_sdf_v2000(&[&orig]);
+            let back2 = parse_sdf(&sdf2)
+                .into_iter()
+                .next()
+                .ok_or(MolError::EmptyInput)??;
+            assert_eq!(
+                back2.structural_key(),
+                expected_key,
+                "SDF V2000 lost stereo for {smi}"
+            );
+            let sdf3 = write_sdf_v3000(&orig);
+            let back3 = parse_sdf(&sdf3)
+                .into_iter()
+                .next()
+                .ok_or(MolError::EmptyInput)??;
+            assert_eq!(
+                back3.structural_key(),
+                expected_key,
+                "SDF V3000 lost stereo for {smi}"
+            );
+        }
 
         let dwar = write_dwar(&[(&caffeine, &caffeine.properties)]);
         let rec = parse_dwar(&dwar)?

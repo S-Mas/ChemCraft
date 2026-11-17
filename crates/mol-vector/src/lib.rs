@@ -237,4 +237,64 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn twenty_drugs_layout_bond_lengths_and_spacing_remain_uniform() -> Result<(), MolError> {
+        let drugs = [
+            ("Morphine", "CN1CCC23c4c5ccc(O)c4OC2C(O)C=CC3C1C5"),
+            ("Diazepam", "CN1C(=O)CN=C(c2ccccc2)c2cc(Cl)ccc21"),
+            (
+                "Taxol",
+                "CC(=O)OC1C(=O)C2(C)C(O)CC3OCC3(OC(C)=O)C2C(OC(=O)c2ccccc2)C2(O)CC(OC(=O)C(O)C(NC(=O)c3ccccc3)c3ccccc3)C(C)=C1C2(C)C",
+            ),
+            ("Artemisinin", "CC1CCC2C(C)C(=O)OC3OC4(C)CCC1C23OO4"),
+            ("Testosterone", "CC12CCC3C(C1CCC2O)CCC4=CC(=O)CCC34C"),
+            ("Caffeine", "Cn1cnc2c1c(=O)n(C)c(=O)n2C"),
+            (
+                "Sildenafil",
+                "CCCc1nn(C)c2c(=O)[nH]c(-c3cc(S(=O)(=O)N4CCN(C)CC4)ccc3OCC)nc12",
+            ),
+            ("Aspirin", "CC(=O)Oc1ccccc1C(=O)O"),
+            ("Ibuprofen", "CC(C)Cc1ccc(C(C)C(=O)O)cc1"),
+            ("Warfarin", "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O"),
+            ("Omeprazole", "COc1ccc2[nH]c(S(=O)Cc3ncc(C)c(OC)c3C)nc2c1"),
+            (
+                "Ciprofloxacin",
+                "O=C(O)c1cn(C2CC2)c2cc(N3CCNCC3)c(F)cc2c1=O",
+            ),
+            (
+                "Penicillin_G",
+                "CC1(C)S[C@@H]2[C@H](NC(=O)Cc3ccccc3)C(=O)N2[C@H]1C(=O)O",
+            ),
+            ("Tamoxifen", "CC/C(=C(/c1ccccc1)c1ccc(OCCN(C)C)cc1)c1ccccc1"),
+            (
+                "Atorvastatin",
+                "CC(C)c1c(C(=O)Nc2ccccc2)c(-c2ccccc2)c(-c2ccc(F)cc2)n1CCC(O)CC(O)CC(=O)O",
+            ),
+            ("Metformin", "CN(C)C(=N)NC(=N)N"),
+            ("Fluoxetine", "CNCCC(Oc1ccc(C(F)(F)F)cc1)c1ccccc1"),
+            ("Paracetamol", "CC(=O)Nc1ccc(O)cc1"),
+            ("Adamantane", "C1C2CC3CC1CC(C2)C3"),
+            ("Cubane", "C12C3C4C1C5C2C3C45"),
+        ];
+        for (name, smi) in drugs {
+            let mut mol = parse_smiles(smi)?;
+            generate_2d_coords(&mut mol);
+            let mut min_len = f64::INFINITY;
+            let mut max_len = 0.0_f64;
+            for b in &mol.bonds {
+                let pu = mol.atoms[b.u].coords_2d.unwrap_or([0.0, 0.0]);
+                let pv = mol.atoms[b.v].coords_2d.unwrap_or([0.0, 0.0]);
+                let d = (pu[0] - pv[0]).hypot(pu[1] - pv[1]);
+                min_len = min_len.min(d);
+                max_len = max_len.max(d);
+            }
+            let ratio = max_len / min_len.max(1e-6);
+            assert!(
+                min_len >= STANDARD_BOND_LEN * 0.45 && ratio <= 3.5,
+                "{name} bond length collapsed/stretched: min={min_len:.3}, max={max_len:.3}, ratio={ratio:.2}"
+            );
+        }
+        Ok(())
+    }
 }
