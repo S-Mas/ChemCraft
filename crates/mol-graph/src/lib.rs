@@ -260,6 +260,49 @@ mod tests {
             4,
             "hepta-2,4-diene must preserve all 4 E/Z isomers"
         );
+
+        // Trisubstituted conjugated polyenes (Tretinoin, Isotretinoin, 11-cis-Retinal, Lycopene)
+        // must preserve EVERY stereogenic double bond across canonical SMILES emission!
+        let count_ez = |m: &MolGraph| -> usize {
+            m.bonds
+                .iter()
+                .filter(|b| matches!(b.cis_trans, BondCisTrans::E | BondCisTrans::Z))
+                .count()
+        };
+        let tretinoin = "CC1=C(C(CCC1)(C)C)/C=C/C(=C/C=C/C(=C/C(=O)O)/C)/C";
+        let isotretinoin = "CC1=C(C(CCC1)(C)C)/C=C/C(=C/C=C/C(=C\\C(=O)O)/C)/C";
+        let retinal_11cis = "CC1=C(C(CCC1)(C)C)/C=C/C(=C/C=C\\C(=C/C=O)/C)/C";
+        let lycopene = "CC(=CCC/C(=C/C=C/C(=C/C=C/C(=C/C=C/C=C(\\C)/C=C/C=C(/C)/C=C/C=C(/C)\\CC/C=C(/C)\\C)/C)/C)/C)C";
+        for (name, smi) in [
+            ("Tretinoin", tretinoin),
+            ("Isotretinoin", isotretinoin),
+            ("11-cis-Retinal", retinal_11cis),
+            ("Lycopene", lycopene),
+        ] {
+            let m1 = parse_smiles(smi)?;
+            let n1 = count_ez(&m1);
+            let can = m1.canonical_smiles();
+            let m2 = parse_smiles(&can)?;
+            let n2 = count_ez(&m2);
+            assert_eq!(
+                n1, n2,
+                "{name} lost E/Z geometry in canonical SMILES: {can}"
+            );
+            assert_eq!(
+                can,
+                m2.canonical_smiles(),
+                "{name} canonical SMILES not idempotent"
+            );
+            assert_eq!(
+                m1.structural_key(),
+                m2.structural_key(),
+                "{name} key changed"
+            );
+        }
+        assert_ne!(
+            parse_smiles(tretinoin)?.structural_key(),
+            parse_smiles(isotretinoin)?.structural_key()
+        );
         Ok(())
     }
 

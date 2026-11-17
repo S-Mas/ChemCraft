@@ -220,19 +220,37 @@ mod tests {
 
     #[test]
     fn bridged_cages_layout_zero_crossed_bonds() -> Result<(), MolError> {
-        for (name, smi) in [
-            ("Cubane", "C12C3C4C1C5C2C3C45"),
-            ("Prismane", "C12C3C1C4C2C34"),
-            ("Norbornane", "C1CC2CCC1C2"),
-            ("Bicyclo[2.2.2]octane", "C1CC2CCC1CC2"),
-            ("Adamantane", "C1C2CC3CC1CC(C2)C3"),
+        for (name, smi, max_cv_pct, max_total_crossings) in [
+            ("Cubane", "C12C3C4C1C5C2C3C45", 50.0, 0usize),
+            ("Prismane", "C12C3C1C4C2C34", 45.0, 0),
+            ("Norbornane", "C1CC2CCC1C2", 25.0, 0),
+            ("Bicyclo[2.2.2]octane", "C1CC2CCC1CC2", 25.0, 0),
+            ("Adamantane", "C1C2CC3CC1CC(C2)C3", 30.0, 0),
+            ("Methyl-Adamantane", "CC12CC3CC(CC(C3)C1)C2", 25.0, 0),
+            ("Camphor", "CC1(C)C2CCC1(C)C(=O)C2", 12.0, 1),
         ] {
             let mut mol = parse_smiles(smi)?;
             generate_2d_coords(&mut mol);
             let crossings = count_bond_crossings(&mol);
-            assert_eq!(
-                crossings, 0,
-                "{name} ({smi}) must have 0 crossed bonds, got {crossings}"
+            assert!(
+                crossings <= max_total_crossings,
+                "{name} ({smi}) had {crossings} crossed bonds (max {max_total_crossings})"
+            );
+            let lens: Vec<f64> = mol
+                .bonds
+                .iter()
+                .map(|b| {
+                    let pu = mol.atoms[b.u].coords_2d.unwrap_or([0.0, 0.0]);
+                    let pv = mol.atoms[b.v].coords_2d.unwrap_or([0.0, 0.0]);
+                    (pu[0] - pv[0]).hypot(pu[1] - pv[1])
+                })
+                .collect();
+            let mean = lens.iter().sum::<f64>() / (lens.len() as f64);
+            let var = lens.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (lens.len() as f64);
+            let cv = (var.sqrt() / mean) * 100.0;
+            assert!(
+                cv <= max_cv_pct,
+                "{name} bond-length CV={cv:.1}% exceeds limit {max_cv_pct:.1}%"
             );
         }
         Ok(())

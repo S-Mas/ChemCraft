@@ -1330,20 +1330,64 @@ impl MolGraph {
                     } else {
                         None
                     };
+                    let p_ez_info = (p != usize::MAX)
+                        .then(|| {
+                            self.adj[u]
+                                .iter()
+                                .find(|&&(nb, _)| nb == p)
+                                .map(|&(_, p_bid)| p_bid)
+                        })
+                        .flatten()
+                        .filter(|&p_bid| {
+                            matches!(
+                                self.bonds[p_bid].cis_trans,
+                                BondCisTrans::E | BondCisTrans::Z
+                            )
+                        })
+                        .and_then(|p_bid| {
+                            ez_entry
+                                .get(&p_bid)
+                                .copied()
+                                .map(|(entry_sub, entry_side)| (p_bid, entry_sub, entry_side))
+                        });
+
+                    let next_dbls: Vec<Option<usize>> = children
+                        .iter()
+                        .map(|&(v, _)| {
+                            self.adj[v]
+                                .iter()
+                                .find(|&&(nb, cbid)| {
+                                    nb != u
+                                        && matches!(
+                                            self.bonds[cbid].cis_trans,
+                                            BondCisTrans::E | BondCisTrans::Z
+                                        )
+                                        && !ez_entry.contains_key(&cbid)
+                                })
+                                .map(|&(_, cbid)| cbid)
+                        })
+                        .collect();
+
+                    // Prefer exiting `p_bid` along a child that simultaneously enters the next
+                    // conjugated E/Z bond so trisubstituted branched alkenes never drop slashes.
+                    let preferred_exit_idx = if p_ez_info.is_some() {
+                        next_dbls
+                            .iter()
+                            .position(Option::is_some)
+                            .or((nc > 0).then_some(0))
+                    } else {
+                        None
+                    };
+
                     for (idx, (v, bid)) in children.into_iter().enumerate().rev() {
                         let last = idx + 1 == nc;
                         if !last {
                             emit.push(Op::Ch(')'));
                         }
                         let mut ez_c: Option<char> = None;
-                        if p != usize::MAX
-                            && let Some(&(_, p_bid)) = self.adj[u].iter().find(|&&(nb, _)| nb == p)
-                            && matches!(
-                                self.bonds[p_bid].cis_trans,
-                                BondCisTrans::E | BondCisTrans::Z
-                            )
-                            && idx == 0
-                            && let Some((entry_sub, entry_side)) = ez_entry.get(&p_bid).copied()
+                        let next_dbl = next_dbls[idx];
+                        if let Some((p_bid, entry_sub, entry_side)) = p_ez_info
+                            && (preferred_exit_idx == Some(idx) || next_dbl.is_some())
                         {
                             let want_z = self.bonds[p_bid].cis_trans == BondCisTrans::Z;
                             let hi_p = highest_cip_end_nbr(self, p, u);
@@ -1369,16 +1413,7 @@ impl MolGraph {
                             ez_entry.insert(d_bid, (v, 1));
                         }
 
-                        // Independently check if advancing along `u -> v` enters a subsequent
-                        // conjugated E/Z double bond on `v` (handles polyenes such as hexa-2,4-diene!).
-                        if idx == 0
-                            && let Some(&(_, cbid)) = self.adj[v].iter().find(|&&(nb, cbid)| {
-                                nb != u
-                                    && matches!(
-                                        self.bonds[cbid].cis_trans,
-                                        BondCisTrans::E | BondCisTrans::Z
-                                    )
-                            })
+                        if let Some(cbid) = next_dbl
                             && !ez_entry.contains_key(&cbid)
                         {
                             let ch = ez_c.unwrap_or('/');

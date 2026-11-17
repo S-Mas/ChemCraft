@@ -127,7 +127,8 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
             ring_placed[first_ri] = true;
             expand_connected_rings(mol, &comp_rings, &mut ring_placed, &mut coords, cursor_x);
 
-            // Only invoke Tutte cage solver on small standalone bridged polyhedra (<= 14 ring atoms, no side chains/drugs)
+            // Run Tutte planar cage solver on compact bridged cages (<= 10 ring atoms, all rings in 1 block:
+            // covers Cubane, Prismane, Norbornane, Camphor, Adamantane, Methyl-Adamantane; excludes Morphine/Artemisinin/Drugs).
             let ring_atoms: BTreeSet<usize> = comp_rings
                 .iter()
                 .enumerate()
@@ -135,14 +136,23 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
                 .flat_map(|(_, r)| r.iter().copied())
                 .collect();
             let ring_atom_list: Vec<usize> = ring_atoms.iter().copied().collect();
-            let base_crossings = if ring_atom_list.len() == comp.len() && ring_atom_list.len() <= 14
-            {
+            let all_rings_in_block = ring_placed.iter().all(|&p| p);
+            let is_bridged = (0..comp_rings.len()).any(|i| {
+                let si: BTreeSet<usize> = comp_rings[i].iter().copied().collect();
+                comp_rings
+                    .iter()
+                    .skip(i + 1)
+                    .any(|rj| rj.iter().filter(|v| si.contains(v)).count() >= 3)
+            });
+            let eligible_cage = all_rings_in_block
+                && ((ring_atom_list.len() == comp.len() && ring_atom_list.len() <= 14)
+                    || (is_bridged && ring_atom_list.len() <= 10));
+            let base_crossings = if eligible_cage {
                 count_subset_crossings(mol, &ring_atoms, &coords)
             } else {
                 0
             };
-            if ring_atom_list.len() == comp.len()
-                && ring_atom_list.len() <= 14
+            if eligible_cage
                 && base_crossings > 0
                 && let Some((cage_coords, cage_crossings)) =
                     solve_bridged_tutte_cage(mol, &comp_rings, &ring_atom_list, cursor_x)
@@ -390,8 +400,8 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
             }
         }
 
-        let prev_crossings = if n <= 64 {
-            count_all_crossings(mol, &pos)
+        let prev_ring_crossings = if n <= 64 {
+            count_ring_crossings(mol, &pos)
         } else {
             0
         };
@@ -404,7 +414,7 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
                 p[1] += sy;
             }
         }
-        if n > 64 || count_all_crossings(mol, &next_pos) <= prev_crossings {
+        if n > 64 || count_ring_crossings(mol, &next_pos) <= prev_ring_crossings {
             pos = next_pos;
         } else {
             break;
@@ -525,7 +535,7 @@ fn solve_bridged_tutte_cage(
     let mut best: Option<(usize, f64, AtomCoordList)> = None;
     for cyc in &cycles {
         let k = cyc.len();
-        let radius = STANDARD_BOND_LEN * ((k as f64) / (2.0 * PI)).max(1.0) * 1.45;
+        let radius = STANDARD_BOND_LEN * ((k as f64) / (2.0 * PI)).max(1.0) * 1.18;
         let start_ang = PI / (k as f64);
         let mut trial: Vec<[f64; 2]> = vec![[cursor_x, 0.0]; mol.atoms.len()];
         let mut pinned = vec![false; mol.atoms.len()];
@@ -557,12 +567,12 @@ fn solve_bridged_tutte_cage(
             }
             trial = next;
         }
-        // Expand unpinned interior vertices gently to balance polyhedral edge proportions
+        // Expand unpinned interior vertices mildly to balance polyhedral bond length CV
         for &u in ring_atoms {
             if !pinned[u] {
                 trial[u] = [
-                    cursor_x + (trial[u][0] - cursor_x) * 1.35,
-                    trial[u][1] * 1.35,
+                    cursor_x + (trial[u][0] - cursor_x) * 1.24,
+                    trial[u][1] * 1.24,
                 ];
             }
         }
@@ -684,6 +694,16 @@ pub fn count_bond_crossings(mol: &MolGraph) -> usize {
 
 fn count_all_crossings(mol: &MolGraph, pos: &[[f64; 2]]) -> usize {
     let edges: Vec<(usize, usize)> = mol.bonds.iter().map(|b| (b.u, b.v)).collect();
+    count_edge_crossings(&edges, pos)
+}
+
+fn count_ring_crossings(mol: &MolGraph, pos: &[[f64; 2]]) -> usize {
+    let edges: Vec<(usize, usize)> = mol
+        .bonds
+        .iter()
+        .filter(|b| b.in_ring)
+        .map(|b| (b.u, b.v))
+        .collect();
     count_edge_crossings(&edges, pos)
 }
 
