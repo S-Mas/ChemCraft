@@ -81,6 +81,9 @@ pub struct MolAtom {
     pub chiral: ChiralTag,
     /// Neighbor slot index (inside `adj[id]` parse order) where bracket H appeared for `@`/`@@`.
     pub chiral_h_slot: Option<usize>,
+    /// Exact OpenSMILES / 3D-derived 4-ligand neighbor sequence (`usize::MAX` marks bracket/suppressed H).
+    #[serde(default)]
+    pub chiral_seq: Vec<usize>,
     pub cip_label: Option<char>,
     pub in_ring: bool,
     pub ring_sizes: Vec<usize>,
@@ -104,6 +107,7 @@ impl MolAtom {
             implicit_h: 0,
             chiral: ChiralTag::None,
             chiral_h_slot: None,
+            chiral_seq: Vec::new(),
             cip_label: None,
             in_ring: false,
             ring_sizes: Vec::new(),
@@ -293,6 +297,15 @@ impl MolGraph {
                 if self.atoms[h_idx].coords_2d.is_some() && self.atoms[*p].coords_2d.is_none() {
                     self.atoms[*p].coords_2d = self.atoms[h_idx].coords_2d;
                 }
+                let pa = &mut self.atoms[*p];
+                for (slot_i, nid) in pa.chiral_seq.iter_mut().enumerate() {
+                    if *nid == h_idx {
+                        *nid = usize::MAX;
+                        if pa.chiral_h_slot.is_none() {
+                            pa.chiral_h_slot = Some(slot_i);
+                        }
+                    }
+                }
             }
         }
         let mut new_idx: Vec<Option<usize>> = vec![None; self.atoms.len()];
@@ -305,6 +318,19 @@ impl MolGraph {
             atom.id = id;
             new_idx[old] = Some(id);
             new_atoms.push(atom);
+        }
+        for atom in &mut new_atoms {
+            atom.chiral_seq = atom
+                .chiral_seq
+                .iter()
+                .filter_map(|&nid| {
+                    if nid == usize::MAX {
+                        Some(usize::MAX)
+                    } else {
+                        new_idx.get(nid).copied().flatten()
+                    }
+                })
+                .collect();
         }
         let mut new_bonds = Vec::new();
         let mut new_adj = vec![Vec::new(); new_atoms.len()];
@@ -447,7 +473,10 @@ impl MolGraph {
             }
         }
 
-        // Preserve pyrrole/indole NH before aromatic retyping
+        // 1b. Infer unambiguous aromatic NH protons (e.g. pyrrole, indole, uracil from type-4 SDFs)
+        self.infer_unambiguous_aromatic_nh();
+
+        // Preserve pyrrole/indole/uracil NH before aromatic retyping
         let initial_nh: Vec<bool> = self
             .atoms
             .iter()
@@ -529,6 +558,88 @@ impl MolGraph {
         }
     }
 
+    /// Resolve unambiguous aromatic `[nH]` vs pyridine `=n-` hydrogens from Hückel `4n + 2`
+    /// electron counts when reading pre-aromatized rings (such as bond-type-4 SDF files without explicit H).
+    fn infer_unambiguous_aromatic_nh(&mut self) {
+        let rings = self.rings.clone();
+        for ring in rings {
+            if !(5..=7).contains(&ring.len()) {
+                continue;
+            }
+            let ring_set: BTreeSet<usize> = ring.iter().copied().collect();
+            let all_arom = ring.iter().all(|&u| self.atoms[u].aromatic)
+                && self.bonds.iter().all(|b| {
+                    !(ring_set.contains(&b.u) && ring_set.contains(&b.v))
+                        || b.order == BondOrder::Aromatic
+                });
+            if !all_arom {
+                continue;
+            }
+
+            let mut fixed_pi = 0usize;
+            let mut unknown_n: Vec<usize> = Vec::new();
+            let mut valid = true;
+            for &u in &ring {
+                let a = &self.atoms[u];
+                let has_exo_double = self.adj[u].iter().any(|&(v, bid)| {
+                    !ring_set.contains(&v)
+                        && matches!(self.bonds[bid].order, BondOrder::Double | BondOrder::Triple)
+                });
+                match a.symbol.as_str() {
+                    "C" => {
+                        if !has_exo_double {
+                            fixed_pi += 1;
+                        }
+                    }
+                    "O" | "S" => {
+                        if !has_exo_double && self.adj[u].len() == 2 {
+                            fixed_pi += 2;
+                        } else {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    "N" => {
+                        if a.formal_charge > 0 {
+                            fixed_pi += 1;
+                        } else if a.explicit_h > 0 || self.adj[u].len() > 2 || a.formal_charge < 0 {
+                            fixed_pi += 2;
+                        } else {
+                            unknown_n.push(u);
+                        }
+                    }
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid || unknown_n.is_empty() || unknown_n.len() > 4 {
+                continue;
+            }
+
+            let k = unknown_n.len();
+            let mut huckel_masks: Vec<usize> = Vec::new();
+            for mask in 0..(1usize << k) {
+                let mut total = fixed_pi;
+                for i in 0..k {
+                    total += if (mask & (1 << i)) != 0 { 2 } else { 1 };
+                }
+                if total >= 2 && (total - 2).is_multiple_of(4) {
+                    huckel_masks.push(mask);
+                }
+            }
+            if huckel_masks.len() == 1 {
+                let mask = huckel_masks[0];
+                for (i, &u) in unknown_n.iter().enumerate() {
+                    if (mask & (1 << i)) != 0 {
+                        self.atoms[u].explicit_h = 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn system_pi_electrons(&self, sys: &BTreeSet<usize>) -> Option<usize> {
         let mut total_pi = 0usize;
         for &u in sys {
@@ -547,11 +658,13 @@ impl MolGraph {
 
             match a.symbol.as_str() {
                 "C" => {
-                    if a.aromatic || has_sys_double {
+                    if has_exo_double {
+                        total_pi += 0;
+                    } else if a.aromatic || has_sys_double {
                         total_pi += 1;
                     } else if a.formal_charge == -1 {
                         total_pi += 2;
-                    } else if a.formal_charge == 1 || has_exo_double {
+                    } else if a.formal_charge == 1 {
                         total_pi += 0;
                     } else {
                         return None;
@@ -674,80 +787,69 @@ impl MolGraph {
         non_arom_units + (arom_bonds as f64) * 1.5
     }
 
-    /// Assign real Cahn-Ingold-Prelog `(R)/(S)` and `(E)/(Z)` stereochemical labels.
+    /// Effective 4-neighbor tetrahedral sequence `[n0, n1, n2, n3]` matching `ChiralTag`.
+    fn effective_chiral_seq(&self, idx: usize) -> Option<Vec<usize>> {
+        let a = self.atoms.get(idx)?;
+        if !a.chiral_seq.is_empty() && a.chiral_seq.len() == 4 {
+            // Verify every neighbor in adj[idx] is present once
+            let ok = self.adj[idx]
+                .iter()
+                .all(|&(nbr, _)| a.chiral_seq.contains(&nbr));
+            if ok {
+                return Some(a.chiral_seq.clone());
+            }
+        }
+        let mut seq: Vec<usize> = self.adj[idx].iter().map(|&(nbr, _)| nbr).collect();
+        if let Some(h_slot) = a.chiral_h_slot {
+            let ins = h_slot.min(seq.len());
+            seq.insert(ins, usize::MAX);
+        } else if a.total_h() == 1 && seq.len() == 3 {
+            seq.insert(1.min(seq.len()), usize::MAX);
+        }
+        (seq.len() == 4).then_some(seq)
+    }
+
+    /// Assign real multi-sphere Cahn-Ingold-Prelog `(R)/(S)` and `(E)/(Z)` stereochemical labels.
     fn perceive_stereo_descriptors(&mut self) {
-        let cip_ranks = compute_cip_priorities(self);
-
         for idx in 0..self.atoms.len() {
-            let a = &self.atoms[idx];
-            if !matches!(a.chiral, ChiralTag::Clockwise | ChiralTag::CounterClockwise) {
+            let chiral = self.atoms[idx].chiral;
+            if !matches!(chiral, ChiralTag::Clockwise | ChiralTag::CounterClockwise) {
                 self.atoms[idx].cip_label = None;
                 continue;
             }
-            // Collect neighbor sequence in SMILES parse order `[n0, (optional H), n1, n2, n3]`
-            let mut seq: Vec<usize> = self.adj[idx].iter().map(|&(nbr, _)| nbr).collect();
-            if let Some(h_slot) = a.chiral_h_slot {
-                let ins = h_slot.min(seq.len());
-                seq.insert(ins, usize::MAX); // usize::MAX marks implicit/explicit H (lowest CIP priority)
-            }
-            if seq.len() != 4 {
+            let Some(seq) = self.effective_chiral_seq(idx) else {
                 self.atoms[idx].cip_label = None;
                 continue;
-            }
-
-            // Sort a copy by DESCENDING CIP priority (lowest priority H = (0, MAX) goes last!)
-            let prio_key = |node: usize| -> (u64, usize) {
-                if node == usize::MAX {
-                    (0, usize::MAX)
-                } else {
-                    (cip_ranks[node], usize::MAX - node)
-                }
             };
-            let mut cip_sorted = seq.clone();
-            cip_sorted.sort_by_key(|&a| std::cmp::Reverse(prio_key(a)));
 
-            // Check that all 4 groups are distinct priorities (or distinct by CIP)
-            let p0 = prio_key(cip_sorted[0]).0;
-            let p1 = prio_key(cip_sorted[1]).0;
-            let p2 = prio_key(cip_sorted[2]).0;
-            let p3 = prio_key(cip_sorted[3]).0;
-            if p0 == p1 || p1 == p2 || p2 == p3 {
+            let mut cip_sorted = seq.clone();
+            cip_sorted.sort_by(|&a, &b| cip_compare_branches(self, idx, b, a));
+
+            let has_tie = cip_sorted
+                .windows(2)
+                .any(|w| cip_compare_branches(self, idx, w[0], w[1]) == std::cmp::Ordering::Equal);
+            if has_tie {
                 self.atoms[idx].cip_label = None;
                 continue;
             }
 
-            // Permutation parity between SMILES parse order `seq` and CIP descending `cip_sorted`:
-            // In SMILES looking down `seq[0] -> center`:
-            //   `@`  (CounterClockwise) corresponds to `S` when parse order matches CIP `[1, 2, 3, 4]`?
-            // Let's verify rigorously via 3D determinant:
-            //   Place center = (0,0,0), seq[0] = (0,0,+1) [viewer looks from seq[0] -> center],
-            //   and for `@@` (Clockwise looking down seq[0]->center), place (seq[1], seq[2], seq[3])
-            //   clockwise around -Z: seq[1]=(0, 1, -0.35), seq[2]=(+0.866, -0.5, -0.35), seq[3]=(-0.866, -0.5, -0.35).
-            //   Then look down (center -> cip_sorted[3] [lowest]) and check if cip_sorted[0] -> [1] -> [2] is CW (R) or CCW (S)!
             let mut pos_map = [0usize; 4];
             for (k, &s_val) in seq.iter().enumerate() {
                 if let Some(ci) = cip_sorted.iter().position(|&c| c == s_val) {
                     pos_map[k] = ci;
                 }
             }
-            let parity = perm_parity(&pos_map); // +1 even, -1 odd
-            let smiles_sign: i32 = match a.chiral {
+            let parity = perm_parity(&pos_map);
+            let smiles_sign: i32 = match chiral {
                 ChiralTag::Clockwise => 1,         // @@
                 ChiralTag::CounterClockwise => -1, // @
                 _ => 0,
             };
-            // Verify: L-alanine N[C@@H](C)C(=O)O:
-            // seq = [N, H, CH3, COOH], cip_sorted = [N, COOH, CH3, H] -> pos_map = [0, 3, 2, 1] (1 swap -> parity = -1).
-            // For smiles_sign = +1 (@@): smiles_sign * parity = -1 -> S!
-            // Check another SMILES for L-alanine: C[C@H](N)C(=O)O:
-            // seq = [CH3, H, N, COOH], cip_sorted = [N, COOH, CH3, H] -> pos_map = [2, 3, 0, 1] (2 swaps -> parity = +1).
-            // For smiles_sign = -1 (@): smiles_sign * parity = -1 -> S!
-            // Both give 'S' for L-alanine and 'R' for D-alanine (`N[C@H](C)C(=O)O` -> +1 -> R)!
             let rs_sign = smiles_sign * parity;
             self.atoms[idx].cip_label = if rs_sign > 0 { Some('R') } else { Some('S') };
         }
 
-        // E/Z double-bond stereochemistry
+        // E/Z double-bond stereochemistry using full CIP ligand ranking
         for bid in 0..self.bonds.len() {
             if self.bonds[bid].order != BondOrder::Double {
                 self.bonds[bid].cis_trans = BondCisTrans::None;
@@ -755,8 +857,8 @@ impl MolGraph {
             }
             let u = self.bonds[bid].u;
             let v = self.bonds[bid].v;
-            let side_u = highest_cip_double_bond_side(self, u, v, &cip_ranks);
-            let side_v = highest_cip_double_bond_side(self, v, u, &cip_ranks);
+            let side_u = highest_cip_double_bond_nbr(self, u, v).map(|(_, s)| s);
+            let side_v = highest_cip_double_bond_nbr(self, v, u).map(|(_, s)| s);
             self.bonds[bid].cis_trans = match (side_u, side_v) {
                 (Some(su), Some(sv)) => {
                     if su == sv {
@@ -897,6 +999,19 @@ impl MolGraph {
                 new_atoms.push(atom);
             }
         }
+        for atom in &mut new_atoms {
+            atom.chiral_seq = atom
+                .chiral_seq
+                .iter()
+                .filter_map(|&nid| {
+                    if nid == usize::MAX {
+                        Some(usize::MAX)
+                    } else {
+                        remap.get(nid).copied().flatten()
+                    }
+                })
+                .collect();
+        }
         let mut new_bonds = Vec::new();
         let mut new_adj = vec![Vec::new(); new_atoms.len()];
         for mut b in self.bonds.drain(..) {
@@ -953,12 +1068,8 @@ impl MolGraph {
                 let h = u64::from(a.total_h());
                 let ch = (i64::from(a.formal_charge) + 16) as u64;
                 let arom = u64::from(a.aromatic);
-                let cip = match a.cip_label {
-                    Some('R') => 1u64,
-                    Some('S') => 2u64,
-                    _ => 0u64,
-                };
-                (z << 28) | (deg << 20) | (h << 14) | (ch << 8) | (arom << 2) | cip
+                let has_chiral = u64::from(a.cip_label.is_some());
+                (z << 28) | (deg << 20) | (h << 14) | (ch << 8) | (arom << 2) | has_chiral
             })
             .collect();
 
@@ -1091,18 +1202,9 @@ impl MolGraph {
             ez_tag: None,
         }];
 
-        // Track canonical E/Z side per double bond during emission
-        let mut ez_tags: HashMap<usize, (char, char)> = HashMap::new();
-        for b in &self.bonds {
-            if b.cis_trans != BondCisTrans::None {
-                let (c1, c2) = if b.cis_trans == BondCisTrans::E {
-                    ('/', '/')
-                } else {
-                    ('/', '\\')
-                };
-                ez_tags.insert(b.id, (c1, c2));
-            }
-        }
+        // Track entry substituent & direction per E/Z double bond during emission:
+        // map: bond_id -> (entry_substituent_atom_id, away_from_bond)
+        let mut ez_entry: HashMap<usize, (usize, bool)> = HashMap::new();
 
         while let Some(op) = emit.pop() {
             match op {
@@ -1134,7 +1236,7 @@ impl MolGraph {
                         }
                     }
 
-                    // Determine canonical children + chiral marker derived deterministically from CIP label
+                    // Determine canonical children and exact SMILES text neighbor order `emit_seq`
                     let mut children: Vec<(usize, usize)> = self.adj[u]
                         .iter()
                         .copied()
@@ -1142,7 +1244,28 @@ impl MolGraph {
                         .collect();
                     children.sort_by_key(|&(v, _)| (ranks[v], v));
 
-                    out.push_str(&self.format_atom_smiles(u, p, &children));
+                    let mut emit_seq: Vec<usize> = Vec::with_capacity(4);
+                    if p != usize::MAX {
+                        emit_seq.push(p);
+                    }
+                    if self.atoms[u].total_h() == 1 {
+                        emit_seq.push(usize::MAX);
+                    }
+                    for &(bid, other, _) in &atom_closures[u] {
+                        if active.contains_key(&bid) {
+                            emit_seq.push(other);
+                        }
+                    }
+                    for &(bid, other, _) in &atom_closures[u] {
+                        if !active.contains_key(&bid) {
+                            emit_seq.push(other);
+                        }
+                    }
+                    for &(v, _) in &children {
+                        emit_seq.push(v);
+                    }
+
+                    out.push_str(&self.format_atom_smiles(u, &emit_seq));
 
                     let mut to_open = Vec::new();
                     for &(bid, _, border) in &atom_closures[u] {
@@ -1170,26 +1293,74 @@ impl MolGraph {
                     }
 
                     let nc = children.len();
+                    let root_ez_pair = if p == usize::MAX {
+                        let dbl = children.iter().position(|&(_, cbid)| {
+                            matches!(
+                                self.bonds[cbid].cis_trans,
+                                BondCisTrans::E | BondCisTrans::Z
+                            )
+                        });
+                        dbl.and_then(|di| {
+                            children
+                                .iter()
+                                .enumerate()
+                                .position(|(ci, _)| ci != di)
+                                .map(|si| (si, children[di].1))
+                        })
+                    } else {
+                        None
+                    };
                     for (idx, (v, bid)) in children.into_iter().enumerate().rev() {
                         let last = idx + 1 == nc;
                         if !last {
                             emit.push(Op::Ch(')'));
                         }
-                        // Check if parent `p` -> `u` was double bond (emit exit `/`/`\`) or `u` -> `v` leads into double bond (emit entry `/`)
                         let mut ez_c: Option<char> = None;
                         if p != usize::MAX
                             && let Some(&(_, p_bid)) = self.adj[u].iter().find(|&&(nb, _)| nb == p)
-                            && let Some(&(_, c2)) = ez_tags.get(&p_bid)
+                            && matches!(
+                                self.bonds[p_bid].cis_trans,
+                                BondCisTrans::E | BondCisTrans::Z
+                            )
                             && idx == 0
                         {
-                            ez_c = Some(c2);
-                        } else if idx == 0 {
-                            let child_has_dbl = self.adj[v]
-                                .iter()
-                                .any(|&(_, cbid)| ez_tags.contains_key(&cbid));
-                            if child_has_dbl {
-                                ez_c = Some('/');
+                            if let Some((entry_sub, away)) = ez_entry.get(&p_bid).copied() {
+                                let want_z = self.bonds[p_bid].cis_trans == BondCisTrans::Z;
+                                let hi_p = highest_cip_double_bond_nbr(self, p, u).map(|(n, _)| n);
+                                let hi_u = highest_cip_double_bond_nbr(self, u, p).map(|(n, _)| n);
+                                let entry_is_hi = hi_p == Some(entry_sub);
+                                let exit_is_hi = hi_u == Some(v);
+                                let entry_side = if away { 1 } else { -1 };
+                                let hi_entry_side =
+                                    if entry_is_hi { entry_side } else { -entry_side };
+                                let hi_exit_side = if want_z {
+                                    hi_entry_side
+                                } else {
+                                    -hi_entry_side
+                                };
+                                let exit_side = if exit_is_hi {
+                                    hi_exit_side
+                                } else {
+                                    -hi_exit_side
+                                };
+                                ez_c = Some(if exit_side > 0 { '/' } else { '\\' });
                             }
+                        } else if let Some((si, d_bid)) = root_ez_pair
+                            && idx == si
+                        {
+                            ez_c = Some('/');
+                            ez_entry.insert(d_bid, (v, true));
+                        } else if idx == 0
+                            && let Some(&(_, cbid)) = self.adj[v].iter().find(|&&(nb, cbid)| {
+                                nb != u
+                                    && matches!(
+                                        self.bonds[cbid].cis_trans,
+                                        BondCisTrans::E | BondCisTrans::Z
+                                    )
+                            })
+                        {
+                            ez_c = Some('/');
+                            ez_entry.insert(cbid, (u, false));
                         }
                         emit.push(Op::Visit {
                             u: v,
@@ -1208,14 +1379,39 @@ impl MolGraph {
         Ok(out)
     }
 
-    fn format_atom_smiles(&self, u: usize, p: usize, children: &[(usize, usize)]) -> String {
+    fn format_atom_smiles(&self, u: usize, emit_seq: &[usize]) -> String {
         let a = &self.atoms[u];
-        let chiral_str = match a.cip_label {
-            Some('R') => "@@",
-            Some('S') => "@",
+        let chiral_str = match (a.chiral, self.effective_chiral_seq(u)) {
+            (ChiralTag::Clockwise | ChiralTag::CounterClockwise, Some(orig_seq))
+                if emit_seq.len() == 4 =>
+            {
+                let orig_sign: i32 = if a.chiral == ChiralTag::Clockwise {
+                    1
+                } else {
+                    -1
+                };
+                let mut perm = [0usize; 4];
+                let mut valid = true;
+                for (k, &ov) in orig_seq.iter().enumerate() {
+                    if let Some(ei) = emit_seq.iter().position(|&ev| ev == ov) {
+                        perm[k] = ei;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid {
+                    if orig_sign * perm_parity(&perm) > 0 {
+                        "@@"
+                    } else {
+                        "@"
+                    }
+                } else {
+                    ""
+                }
+            }
             _ => "",
         };
-        let _ = (p, children);
         let organic = matches!(
             a.symbol.as_str(),
             "*" | "B" | "C" | "N" | "O" | "P" | "S" | "F" | "Cl" | "Br" | "I"
@@ -1269,73 +1465,132 @@ impl MolGraph {
     }
 }
 
-/// Compute recursive Cahn-Ingold-Prelog (CIP) priority ranks for atoms (up to depth 4).
-fn compute_cip_priorities(mol: &MolGraph) -> Vec<u64> {
-    let n = mol.atoms.len();
-    let mut ranks: Vec<u64> = mol
-        .atoms
-        .iter()
-        .map(|a| {
-            let z = u64::from(a.atomic_number);
-            let iso = u64::from(a.isotope.unwrap_or(0));
-            (z << 12) | iso
-        })
-        .collect();
-
-    for _round in 0..4 {
-        let mut next = vec![0u64; n];
-        for i in 0..n {
-            let mut child_tags: Vec<u64> = Vec::new();
-            for &(nbr, bid) in &mol.adj[i] {
-                let mult = match mol.bonds[bid].order {
-                    BondOrder::Double => 2,
-                    BondOrder::Triple => 3,
-                    _ => 1,
-                };
-                for _ in 0..mult {
-                    child_tags.push(ranks[nbr]);
-                }
-            }
-            for _ in 0..mol.atoms[i].total_h() {
-                child_tags.push(1u64 << 12); // H atom priority
-            }
-            child_tags.sort_unstable_by(|a, b| b.cmp(a));
-            let mut acc = ranks[i].wrapping_mul(131);
-            for (k, &t) in child_tags.iter().take(4).enumerate() {
-                acc = acc.wrapping_add(t.wrapping_mul(1u64 << (12 * (3 - k) / 3)));
-            }
-            next[i] = acc;
-        }
-        // Normalize compressed monotonic integer ranks so comparisons are exact!
-        let mut paired: Vec<(u64, usize)> = next.iter().copied().zip(0..n).collect();
-        paired.sort_unstable();
-        let mut r = 10u64;
-        for idx in 0..paired.len() {
-            if idx > 0 && paired[idx].0 != paired[idx - 1].0 {
-                r += 1;
-            }
-            ranks[paired[idx].1] = r;
+/// Compare two ligand branches rooted at `root_a` and `root_b` attached to `anchor` using
+/// directed breadth-first IUPAC Cahn-Ingold-Prelog expansion (multiple bonds and cycle closures
+/// spawn leaf phantom duplicate atoms, scaled in halves so aromatic bonds = 3 vs single = 2).
+fn cip_compare_branches(
+    mol: &MolGraph,
+    anchor: usize,
+    root_a: usize,
+    root_b: usize,
+) -> std::cmp::Ordering {
+    let sig_a = cip_bfs_spheres(mol, anchor, root_a, 12);
+    let sig_b = cip_bfs_spheres(mol, anchor, root_b, 12);
+    for d in 0..sig_a.len().max(sig_b.len()) {
+        let sa = sig_a.get(d).map(Vec::as_slice).unwrap_or(&[]);
+        let sb = sig_b.get(d).map(Vec::as_slice).unwrap_or(&[]);
+        if let ord @ (std::cmp::Ordering::Less | std::cmp::Ordering::Greater) = sa.cmp(sb) {
+            return ord;
         }
     }
-    ranks
+    std::cmp::Ordering::Equal
 }
 
-fn highest_cip_double_bond_side(
+fn cip_atom_key(mol: &MolGraph, node: usize) -> (u16, u16) {
+    if node == usize::MAX {
+        (1, 0)
+    } else {
+        let a = &mol.atoms[node];
+        (u16::from(a.atomic_number), a.isotope.unwrap_or(0))
+    }
+}
+
+fn bond_weight_halves(order: BondOrder) -> usize {
+    match order {
+        BondOrder::Double => 4,
+        BondOrder::Triple => 6,
+        BondOrder::Aromatic => 3,
+        _ => 2,
+    }
+}
+
+fn cip_bfs_spheres(
+    mol: &MolGraph,
+    anchor: usize,
+    root: usize,
+    max_depth: usize,
+) -> Vec<Vec<(u16, u16)>> {
+    let mut spheres = Vec::new();
+    let r_key = cip_atom_key(mol, root);
+    let root_mult = if root == usize::MAX {
+        2
+    } else {
+        mol.adj[anchor]
+            .iter()
+            .find(|&&(nb, _)| nb == root)
+            .map_or(2, |&(_, bid)| bond_weight_halves(mol.bonds[bid].order))
+    };
+    let mut s0 = Vec::with_capacity(root_mult);
+    for _ in 0..root_mult {
+        s0.push(r_key);
+    }
+    s0.sort_unstable_by(|a, b| b.cmp(a));
+    spheres.push(s0);
+
+    if root == usize::MAX {
+        return spheres;
+    }
+
+    // Frontier entries: (current_atom, ancestor_set_including_current)
+    let mut frontier: Vec<(usize, Vec<usize>)> = vec![(root, vec![anchor, root])];
+    for _depth in 1..max_depth {
+        let mut next_frontier: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut bag: Vec<(u16, u16)> = Vec::new();
+        for (cur, ancestors) in frontier {
+            let parent = ancestors
+                .len()
+                .checked_sub(2)
+                .map_or(anchor, |pi| ancestors[pi]);
+            for &(nbr, bid) in &mol.adj[cur] {
+                if nbr == parent {
+                    continue;
+                }
+                let w = bond_weight_halves(mol.bonds[bid].order);
+                let key = cip_atom_key(mol, nbr);
+                for _ in 0..w {
+                    bag.push(key);
+                }
+                if !ancestors.contains(&nbr) {
+                    let mut next_anc = ancestors.clone();
+                    next_anc.push(nbr);
+                    next_frontier.push((nbr, next_anc));
+                }
+            }
+            for _ in 0..mol.atoms[cur].total_h() {
+                bag.push((1, 0));
+                bag.push((1, 0));
+            }
+        }
+        if bag.is_empty() && next_frontier.is_empty() {
+            break;
+        }
+        bag.sort_unstable_by(|a, b| b.cmp(a));
+        spheres.push(bag);
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+    spheres
+}
+
+fn highest_cip_double_bond_nbr(
     mol: &MolGraph,
     atom: usize,
     other_end: usize,
-    cip_ranks: &[u64],
-) -> Option<i32> {
-    let mut subs: Vec<(u64, i32)> = Vec::new();
+) -> Option<(usize, i32)> {
+    let mut subs: Vec<(usize, i32)> = Vec::new();
     for &(nbr, bid) in &mol.adj[atom] {
         if nbr == other_end {
             continue;
         }
         let dir = match mol.bonds[bid].stereo {
             BondStereo::CisTransUp => {
-                // `/` pointing FROM nbr -> atom puts `nbr` DOWN relative to atom (`-1`)!
-                // `/` pointing FROM atom -> nbr puts `nbr` UP relative to atom (`+1`)!
-                if mol.bonds[bid].u == atom { 1 } else { -1 }
+                if mol.bonds[bid].u == atom {
+                    1
+                } else {
+                    -1
+                }
             }
             BondStereo::CisTransDown => {
                 if mol.bonds[bid].u == atom {
@@ -1346,15 +1601,24 @@ fn highest_cip_double_bond_side(
             }
             _ => 0,
         };
-        if dir != 0 {
-            subs.push((cip_ranks[nbr], dir));
-        }
+        subs.push((nbr, dir));
     }
-    if subs.is_empty() {
+    if subs.is_empty() || subs.iter().all(|&(_, d)| d == 0) {
         return None;
     }
-    subs.sort_by_key(|a| std::cmp::Reverse(a.0));
-    Some(subs[0].1)
+    if subs.len() == 2 {
+        let (n0, d0) = subs[0];
+        let (n1, d1) = subs[1];
+        let eff0 = if d0 != 0 { d0 } else { -d1 };
+        let eff1 = if d1 != 0 { d1 } else { -d0 };
+        return match cip_compare_branches(mol, atom, n0, n1) {
+            std::cmp::Ordering::Greater => Some((n0, eff0)),
+            std::cmp::Ordering::Less => Some((n1, eff1)),
+            std::cmp::Ordering::Equal => None,
+        };
+    }
+    let (n0, d0) = subs[0];
+    (d0 != 0).then_some((n0, d0))
 }
 
 fn perm_parity(p: &[usize; 4]) -> i32 {

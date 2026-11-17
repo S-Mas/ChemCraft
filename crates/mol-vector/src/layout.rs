@@ -186,6 +186,28 @@ pub fn generate_2d_coords(mol: &mut MolGraph) {
                     }
                 }
             }
+
+            // If fused ring placement produced crossings or bridged overlap, run Tutte planar cage solver
+            let ring_atoms: BTreeSet<usize> =
+                comp_rings.iter().flat_map(|r| r.iter().copied()).collect();
+            let ring_atom_list: Vec<usize> = ring_atoms.iter().copied().collect();
+            let base_crossings = count_subset_crossings(mol, &ring_atoms, &coords);
+            let is_bridged = (0..comp_rings.len()).any(|i| {
+                let si: BTreeSet<usize> = comp_rings[i].iter().copied().collect();
+                comp_rings
+                    .iter()
+                    .skip(i + 1)
+                    .any(|rj| rj.iter().filter(|v| si.contains(v)).count() >= 3)
+            });
+            if (base_crossings > 0 || is_bridged)
+                && let Some((cage_coords, cage_crossings)) =
+                    solve_bridged_tutte_cage(mol, &comp_rings, &ring_atom_list, cursor_x)
+                && cage_crossings < base_crossings
+            {
+                for (v, pt) in cage_coords {
+                    coords[v] = Some(pt);
+                }
+            }
         } else {
             // Acyclic component root
             let root = comp[0];
@@ -341,7 +363,13 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
             }
         }
 
-        for (p, d) in pos.iter_mut().zip(disp.iter()) {
+        let prev_crossings = if n <= 64 {
+            count_all_crossings(mol, &pos)
+        } else {
+            0
+        };
+        let mut next_pos = pos.clone();
+        for (p, d) in next_pos.iter_mut().zip(disp.iter()) {
             let sx = d[0].clamp(-0.35, 0.35);
             let sy = d[1].clamp(-0.35, 0.35);
             if sx.is_finite() && sy.is_finite() {
@@ -349,11 +377,217 @@ pub fn clean_structure_2d(mol: &mut MolGraph, iterations: usize) {
                 p[1] += sy;
             }
         }
+        if n > 64 || count_all_crossings(mol, &next_pos) <= prev_crossings {
+            pos = next_pos;
+        } else {
+            break;
+        }
     }
 
     for (idx, p) in pos.into_iter().enumerate() {
         mol.atoms[idx].coords_2d = Some(p);
     }
+}
+
+type AtomCoordList = Vec<(usize, [f64; 2])>;
+
+fn solve_bridged_tutte_cage(
+    mol: &MolGraph,
+    comp_rings: &[&Vec<usize>],
+    ring_atoms: &[usize],
+    cursor_x: f64,
+) -> Option<(AtomCoordList, usize)> {
+    let core_set: BTreeSet<usize> = ring_atoms.iter().copied().collect();
+    if core_set.len() < 4 {
+        return None;
+    }
+
+    // Build candidate outer faces: SSSR rings + XOR simple cycles of adjacent pairs
+    let mut cycles: Vec<Vec<usize>> = comp_rings
+        .iter()
+        .filter(|r| r.len() >= 4)
+        .map(|r| (*r).clone())
+        .collect();
+    for i in 0..comp_rings.len() {
+        let ei = ring_edge_set(mol, comp_rings[i]);
+        for rj in comp_rings.iter().skip(i + 1) {
+            let ej = ring_edge_set(mol, rj);
+            let sym: BTreeSet<usize> = ei.symmetric_difference(&ej).copied().collect();
+            if let Some(cyc) = ordered_cycle_from_edges(mol, &sym)
+                && (4..=10).contains(&cyc.len())
+            {
+                cycles.push(cyc);
+            }
+        }
+    }
+
+    let mut best: Option<(usize, f64, AtomCoordList)> = None;
+    for cyc in &cycles {
+        let k = cyc.len();
+        let radius = STANDARD_BOND_LEN * ((k as f64) / (2.0 * PI)).max(1.0) * 1.45;
+        let start_ang = PI / (k as f64);
+        let mut trial: Vec<[f64; 2]> = vec![[cursor_x, 0.0]; mol.atoms.len()];
+        let mut pinned = vec![false; mol.atoms.len()];
+        for (idx, &v) in cyc.iter().enumerate() {
+            let ang = start_ang + 2.0 * PI * (idx as f64) / (k as f64);
+            trial[v] = [cursor_x + radius * ang.cos(), radius * ang.sin()];
+            pinned[v] = true;
+        }
+        // Tutte harmonic Jacobi relaxation for interior vertices
+        for _ in 0..60 {
+            let mut next = trial.clone();
+            for &u in ring_atoms {
+                if pinned[u] {
+                    continue;
+                }
+                let mut sx = 0.0;
+                let mut sy = 0.0;
+                let mut cnt = 0.0;
+                for &(v, _) in &mol.adj[u] {
+                    if core_set.contains(&v) {
+                        sx += trial[v][0];
+                        sy += trial[v][1];
+                        cnt += 1.0;
+                    }
+                }
+                if cnt > 0.0 {
+                    next[u] = [sx / cnt, sy / cnt];
+                }
+            }
+            trial = next;
+        }
+
+        let crossings = count_subset_crossings_slice(mol, &core_set, &trial);
+        let min_dist = min_pairwise_dist(ring_atoms, &trial);
+        let better = match &best {
+            None => true,
+            Some((bc, bd, _)) => crossings < *bc || (crossings == *bc && min_dist > *bd + 1e-4),
+        };
+        if better && min_dist > 1e-3 {
+            let mapped = ring_atoms.iter().map(|&v| (v, trial[v])).collect();
+            best = Some((crossings, min_dist, mapped));
+        }
+    }
+    best.map(|(c, _, m)| (m, c))
+}
+
+fn ring_edge_set(mol: &MolGraph, ring: &[usize]) -> BTreeSet<usize> {
+    let mut edges = BTreeSet::new();
+    for w in 0..ring.len() {
+        let u = ring[w];
+        let v = ring[(w + 1) % ring.len()];
+        if let Some(&(_, bid)) = mol.adj[u].iter().find(|&&(nb, _)| nb == v) {
+            edges.insert(bid);
+        }
+    }
+    edges
+}
+
+fn ordered_cycle_from_edges(mol: &MolGraph, edge_ids: &BTreeSet<usize>) -> Option<Vec<usize>> {
+    if edge_ids.len() < 3 {
+        return None;
+    }
+    let mut adj: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for &bid in edge_ids {
+        let b = &mol.bonds[bid];
+        adj.entry(b.u).or_default().push(b.v);
+        adj.entry(b.v).or_default().push(b.u);
+    }
+    if adj.len() != edge_ids.len() || adj.values().any(|ns| ns.len() != 2) {
+        return None;
+    }
+    let start = *adj.keys().min()?;
+    let mut cyc = vec![start];
+    let mut prev = usize::MAX;
+    let mut cur = start;
+    for _ in 1..adj.len() {
+        let next = *adj.get(&cur)?.iter().find(|&&n| n != prev)?;
+        prev = cur;
+        cur = next;
+        cyc.push(cur);
+    }
+    (cyc.len() == adj.len()).then_some(cyc)
+}
+
+fn min_pairwise_dist(nodes: &[usize], pos: &[[f64; 2]]) -> f64 {
+    let mut md = f64::INFINITY;
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            let a = pos[nodes[i]];
+            let b = pos[nodes[j]];
+            let d = (a[0] - b[0]).hypot(a[1] - b[1]);
+            if d < md {
+                md = d;
+            }
+        }
+    }
+    if md.is_finite() { md } else { 0.0 }
+}
+
+fn count_subset_crossings(
+    mol: &MolGraph,
+    subset: &BTreeSet<usize>,
+    coords: &[Option<[f64; 2]>],
+) -> usize {
+    let pts: Vec<[f64; 2]> = coords.iter().map(|c| c.unwrap_or([0.0, 0.0])).collect();
+    count_subset_crossings_slice(mol, subset, &pts)
+}
+
+/// Count pairs of non-adjacent covalent bonds whose 2D segments intersect strictly.
+pub fn count_bond_crossings(mol: &MolGraph) -> usize {
+    let pos: Vec<[f64; 2]> = mol
+        .atoms
+        .iter()
+        .map(|a| a.coords_2d.unwrap_or([0.0, 0.0]))
+        .collect();
+    count_all_crossings(mol, &pos)
+}
+
+fn count_all_crossings(mol: &MolGraph, pos: &[[f64; 2]]) -> usize {
+    let edges: Vec<(usize, usize)> = mol.bonds.iter().map(|b| (b.u, b.v)).collect();
+    count_edge_crossings(&edges, pos)
+}
+
+fn count_subset_crossings_slice(
+    mol: &MolGraph,
+    subset: &BTreeSet<usize>,
+    pos: &[[f64; 2]],
+) -> usize {
+    let edges: Vec<(usize, usize)> = mol
+        .bonds
+        .iter()
+        .filter(|b| subset.contains(&b.u) && subset.contains(&b.v))
+        .map(|b| (b.u, b.v))
+        .collect();
+    count_edge_crossings(&edges, pos)
+}
+
+fn count_edge_crossings(edges: &[(usize, usize)], pos: &[[f64; 2]]) -> usize {
+    let mut crossings = 0usize;
+    for i in 0..edges.len() {
+        let (u1, v1) = edges[i];
+        for &(u2, v2) in edges.iter().skip(i + 1) {
+            if u1 == u2 || u1 == v2 || v1 == u2 || v1 == v2 {
+                continue;
+            }
+            if segments_strictly_intersect(pos[u1], pos[v1], pos[u2], pos[v2]) {
+                crossings += 1;
+            }
+        }
+    }
+    crossings
+}
+
+fn segments_strictly_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let orient = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| -> f64 {
+        (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    };
+    let o1 = orient(a, b, c);
+    let o2 = orient(a, b, d);
+    let o3 = orient(c, d, a);
+    let o4 = orient(c, d, b);
+    let eps = 1e-7;
+    (o1 * o2 < -eps) && (o3 * o4 < -eps)
 }
 
 /// Interactive ChemDraw/VectorCraft template stamper with snap-to-atom and fused-bond snapping.

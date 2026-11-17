@@ -404,10 +404,25 @@ fn v2000_bond_order(t: u8) -> BondOrder {
     }
 }
 
+/// Collect explicit H atoms needed to disambiguate aromatic `[nH]` nitrogens in SDF CTABs.
+fn aromatic_nh_hydrogens(mol: &MolGraph) -> Vec<(usize, [f64; 2])> {
+    let mut extras = Vec::new();
+    for a in &mol.atoms {
+        if a.aromatic && a.symbol == "N" && a.total_h() > 0 {
+            let [x, y] = a.coords_2d.unwrap_or([0.0, 0.0]);
+            for k in 0..a.total_h() {
+                extras.push((a.id, [x + 0.8 * f64::from(k + 1), y + 0.4]));
+            }
+        }
+    }
+    extras
+}
+
 /// Write a list of `MolGraph` structures as an SDF V2000 multi-record file.
 pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
     let mut out = String::new();
     for mol in mols {
+        let extra_hs = aromatic_nh_hydrogens(mol);
         let name = mol.name.as_deref().unwrap_or("ChemCraft");
         let _ = writeln!(out, "{name}");
         let _ = writeln!(out, "  ChemCraft-V2000");
@@ -415,8 +430,8 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
         let _ = writeln!(
             out,
             "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000",
-            mol.atoms.len(),
-            mol.bonds.len()
+            mol.atoms.len() + extra_hs.len(),
+            mol.bonds.len() + extra_hs.len()
         );
         for a in &mol.atoms {
             let [x, y] = a.coords_2d.unwrap_or([0.0, 0.0]);
@@ -424,6 +439,13 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
                 out,
                 "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
                 x, y, 0.0, a.symbol
+            );
+        }
+        for &(_, [hx, hy]) in &extra_hs {
+            let _ = writeln!(
+                out,
+                "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
+                hx, hy, 0.0, "H"
             );
         }
         for b in &mol.bonds {
@@ -441,6 +463,10 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
                 _ => 0,
             };
             let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", b.u + 1, b.v + 1, t, s);
+        }
+        for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
+            let h_id = mol.atoms.len() + h_i + 1;
+            let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", parent + 1, h_id, 1, 0);
         }
         let charged: Vec<(usize, i8)> = mol
             .atoms
@@ -467,6 +493,7 @@ pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
 /// Write a `MolGraph` as a CTAB V3000 block.
 pub fn write_sdf_v3000(mol: &MolGraph) -> String {
     let mut out = String::new();
+    let extra_hs = aromatic_nh_hydrogens(mol);
     let name = mol.name.as_deref().unwrap_or("ChemCraft");
     let _ = writeln!(out, "{name}");
     let _ = writeln!(out, "  ChemCraft-V3000");
@@ -476,8 +503,8 @@ pub fn write_sdf_v3000(mol: &MolGraph) -> String {
     let _ = writeln!(
         out,
         "M  V30 COUNTS {} {} 0 0 0",
-        mol.atoms.len(),
-        mol.bonds.len()
+        mol.atoms.len() + extra_hs.len(),
+        mol.bonds.len() + extra_hs.len()
     );
     let _ = writeln!(out, "M  V30 BEGIN ATOM");
     for a in &mol.atoms {
@@ -503,6 +530,15 @@ pub fn write_sdf_v3000(mol: &MolGraph) -> String {
             );
         }
     }
+    for (h_i, &(_, [hx, hy])) in extra_hs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "M  V30 {} H {:.4} {:.4} 0 0",
+            mol.atoms.len() + h_i + 1,
+            hx,
+            hy
+        );
+    }
     let _ = writeln!(out, "M  V30 END ATOM");
     let _ = writeln!(out, "M  V30 BEGIN BOND");
     for (idx, b) in mol.bonds.iter().enumerate() {
@@ -527,6 +563,15 @@ pub fn write_sdf_v3000(mol: &MolGraph) -> String {
             b.u + 1,
             b.v + 1,
             cfg
+        );
+    }
+    for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "M  V30 {} 1 {} {}",
+            mol.bonds.len() + h_i + 1,
+            parent + 1,
+            mol.atoms.len() + h_i + 1
         );
     }
     let _ = writeln!(out, "M  V30 END BOND");

@@ -27,6 +27,13 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
     let mut pending_bond: Option<BondOrder> = None;
     let mut pending_stereo = BondStereo::None;
     let mut rings: HashMap<u16, (usize, Option<BondOrder>, BondStereo, usize)> = HashMap::new();
+    #[derive(Clone, Copy)]
+    enum ChiralSlot {
+        Nbr(usize),
+        H,
+        RingOpen(u16),
+    }
+    let mut nbr_slots: Vec<Vec<ChiralSlot>> = Vec::new();
 
     while i < bytes.len() {
         let ch = bytes[i];
@@ -123,8 +130,17 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
                         pending_stereo
                     };
                     mol.add_bond(other, cur, order, stereo)?;
+                    if let Some(slot) = nbr_slots[other]
+                        .iter_mut()
+                        .rev()
+                        .find(|s| matches!(s, ChiralSlot::RingOpen(r) if *r == rnum))
+                    {
+                        *slot = ChiralSlot::Nbr(cur);
+                    }
+                    nbr_slots[cur].push(ChiralSlot::Nbr(other));
                 } else {
                     rings.insert(rnum, (cur, pending_bond, pending_stereo, i));
+                    nbr_slots[cur].push(ChiralSlot::RingOpen(rnum));
                 }
                 pending_bond = None;
                 pending_stereo = BondStereo::None;
@@ -132,7 +148,8 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
             }
             b'[' => {
                 let (mut atom, next_i) = parse_bracket_atom(bytes, i, mol.atoms.len())?;
-                if atom.chiral != ChiralTag::None && atom.explicit_h > 0 {
+                let has_bracket_chiral_h = atom.chiral != ChiralTag::None && atom.explicit_h > 0;
+                if has_bracket_chiral_h {
                     atom.chiral_h_slot = Some(if current.is_some() { 1 } else { 0 });
                 }
                 if mol.atoms.len() >= max_atoms {
@@ -142,6 +159,7 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
                     });
                 }
                 let nid = mol.add_atom(atom);
+                nbr_slots.push(Vec::new());
                 if let Some(prev) = current {
                     let order = resolve_bond_order(
                         pending_bond,
@@ -149,6 +167,11 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
                         mol.atoms[nid].aromatic,
                     );
                     mol.add_bond(prev, nid, order, pending_stereo)?;
+                    nbr_slots[prev].push(ChiralSlot::Nbr(nid));
+                    nbr_slots[nid].push(ChiralSlot::Nbr(prev));
+                }
+                if has_bracket_chiral_h {
+                    nbr_slots[nid].push(ChiralSlot::H);
                 }
                 current = Some(nid);
                 pending_bond = None;
@@ -164,6 +187,7 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
                     });
                 }
                 let nid = mol.add_atom(atom);
+                nbr_slots.push(Vec::new());
                 if let Some(prev) = current {
                     let order = resolve_bond_order(
                         pending_bond,
@@ -171,6 +195,8 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
                         mol.atoms[nid].aromatic,
                     );
                     mol.add_bond(prev, nid, order, pending_stereo)?;
+                    nbr_slots[prev].push(ChiralSlot::Nbr(nid));
+                    nbr_slots[nid].push(ChiralSlot::Nbr(prev));
                 }
                 current = Some(nid);
                 pending_bond = None;
@@ -196,6 +222,18 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
         return Err(MolError::EmptyInput);
     }
 
+    for (idx, slots) in nbr_slots.into_iter().enumerate() {
+        if mol.atoms[idx].chiral != ChiralTag::None {
+            mol.atoms[idx].chiral_seq = slots
+                .into_iter()
+                .filter_map(|s| match s {
+                    ChiralSlot::Nbr(n) => Some(n),
+                    ChiralSlot::H => Some(usize::MAX),
+                    ChiralSlot::RingOpen(_) => None,
+                })
+                .collect();
+        }
+    }
     mol.suppress_explicit_hydrogens();
     mol.desalt();
     mol.perceive()?;

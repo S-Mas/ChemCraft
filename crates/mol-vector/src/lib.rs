@@ -12,8 +12,8 @@ pub use export::{
     export_sar_grid_svg, scene_to_eps, scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
 pub use layout::{
-    RingTemplate, STANDARD_BOND_LEN, SnapTarget, clean_structure_2d, ensure_2d_coords,
-    generate_2d_coords, stamp_ring_template,
+    RingTemplate, STANDARD_BOND_LEN, SnapTarget, clean_structure_2d, count_bond_crossings,
+    ensure_2d_coords, generate_2d_coords, stamp_ring_template,
 };
 pub use scene::{
     ReactionArrow, Rect2, Rgba, SceneStyle, VectorElement, VectorScene, build_mol_scene,
@@ -155,6 +155,86 @@ mod tests {
         )?;
         assert_eq!(mol.atoms.len(), 10);
         assert_eq!(mol.formula(), "C10H8");
+        Ok(())
+    }
+
+    #[test]
+    fn png_grid_title_renders_all_12_glyphs_of_testosterone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mol = parse_smiles("CC12CCC3C(C1CCC2O)CCC4=CC(=O)CCC34C")?;
+        generate_2d_coords(&mut mol);
+        let png_bytes =
+            export_sar_grid_png_bytes(&[("Testosterone", &mol)], 1, 260.0, 220.0, false, 2.0)?;
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png_bytes));
+        let mut reader = decoder.read_info()?;
+        let mut buf = vec![0; reader.output_buffer_size().ok_or("missing buf size")?];
+        let info = reader.next_frame(&mut buf)?;
+        let w = info.width as usize;
+        let h = info.height as usize;
+
+        // Inspect bottom title strip (cell_h = 220, y = 200..216 at scale 2.0 -> py = 402..432)
+        // Each inked column in the title has at least one dark pixel (< 160 RGB luminance)
+        let mut col_heights = vec![0usize; w];
+        for (x, col_h) in col_heights.iter_mut().enumerate().take(w - 6).skip(6) {
+            let mut min_y = usize::MAX;
+            let mut max_y = 0usize;
+            for y in 402..432.min(h) {
+                let idx = (y * w + x) * 4;
+                if buf[idx] < 160 && buf[idx + 1] < 160 && buf[idx + 2] < 160 {
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+            if max_y >= min_y {
+                *col_h = max_y - min_y + 1;
+            }
+        }
+        // Group consecutive inked x-columns into glyph spans and check each letter's height >= 5px
+        let mut spans = Vec::new();
+        let mut in_span = false;
+        let mut span_max_h = 0usize;
+        for &ch in &col_heights {
+            if ch > 0 {
+                in_span = true;
+                span_max_h = span_max_h.max(ch);
+            } else if in_span {
+                spans.push(span_max_h);
+                in_span = false;
+                span_max_h = 0;
+            }
+        }
+        if in_span {
+            spans.push(span_max_h);
+        }
+        assert_eq!(
+            spans.len(),
+            12,
+            "expected 12 glyphs in 'Testosterone', got {spans:?}"
+        );
+        assert!(
+            spans.iter().all(|&gh| gh >= 6),
+            "every glyph of 'Testosterone' must have vertical height >= 6px (no fallback dashes): {spans:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bridged_cages_layout_zero_crossed_bonds() -> Result<(), MolError> {
+        for (name, smi) in [
+            ("Cubane", "C12C3C4C1C5C2C3C45"),
+            ("Prismane", "C12C3C1C4C2C34"),
+            ("Norbornane", "C1CC2CCC1C2"),
+            ("Bicyclo[2.2.2]octane", "C1CC2CCC1CC2"),
+            ("Adamantane", "C1C2CC3CC1CC(C2)C3"),
+        ] {
+            let mut mol = parse_smiles(smi)?;
+            generate_2d_coords(&mut mol);
+            let crossings = count_bond_crossings(&mol);
+            assert_eq!(
+                crossings, 0,
+                "{name} ({smi}) must have 0 crossed bonds, got {crossings}"
+            );
+        }
         Ok(())
     }
 }
