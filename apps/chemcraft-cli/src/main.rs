@@ -8,7 +8,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat};
 use mol_engine::PathSandbox;
 use mol_graph::{parse_smiles, write_sdf_v2000};
-use mol_sar::{SarFilter, SarTable, find_activity_cliffs, find_matched_molecular_pairs};
+use mol_sar::{
+    SarFilter, SarTable, find_activity_cliffs, find_duplicate_compounds,
+    find_matched_molecular_pairs,
+};
 use mol_vector::{
     SceneStyle, build_mol_scene, generate_2d_coords, scene_to_eps, scene_to_pdf_bytes,
     scene_to_png_bytes, scene_to_svg,
@@ -165,7 +168,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mut table = load_table_from_path(&input)?;
             if lipinski_only || no_pains {
-                table.enrich_with_admet(&AdmetCraftProvider);
+                table.enrich_with_admet(&AdmetCraftProvider::default());
             }
             let filter = SarFilter {
                 smarts_substructure: substructure,
@@ -196,21 +199,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             format,
         } => {
             let mut table = load_table_from_path(&input)?;
-            let _ = with_admet;
-            table.enrich_with_admet(&AdmetCraftProvider);
-            let evals: Vec<_> = table
-                .rows
-                .into_iter()
-                .filter_map(|r| r.admet_full)
-                .collect();
-            let fmt = match format {
-                EnrichFormat::Csv => AdmetReportFormat::Csv,
-                EnrichFormat::Json => AdmetReportFormat::Json,
-                EnrichFormat::Pdf => AdmetReportFormat::Pdf,
-            };
-            let mut f = std::fs::File::create(&out)?;
-            AdmetCraftProvider.export_report_to_writer(&evals, &mut f, fmt)?;
-            eprintln!("Enriched {} compounds -> {}", evals.len(), out.display());
+            run_enrich_command(&mut table, with_admet, &out, format)?;
         }
         SubCmd::Mmp {
             input,
@@ -218,11 +207,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             out,
         } => {
             let mut table = load_table_from_path(&input)?;
-            table.enrich_with_admet(&AdmetCraftProvider);
+            table.enrich_with_admet(&AdmetCraftProvider::default());
+            let duplicates = find_duplicate_compounds(&table.rows);
             let cliffs = find_activity_cliffs(&table.rows, min_tanimoto);
             let mmps = find_matched_molecular_pairs(&table.rows);
             let payload = serde_json::to_string_pretty(&serde_json::json!({
                 "compounds": table.rows.len(),
+                "duplicates": duplicates,
                 "activity_cliffs": cliffs,
                 "matched_molecular_pairs": mmps,
             }))?;
@@ -235,7 +226,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         SubCmd::Inspect { smiles } => {
             let mut mol = parse_smiles(&smiles)?;
             generate_2d_coords(&mut mol);
-            let eval = AdmetCraftProvider.evaluate_smiles(&smiles, None)?;
+            let eval = AdmetCraftProvider::default().evaluate_smiles(&smiles, None)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -263,6 +254,103 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+fn escape_csv_cell(raw: &str) -> String {
+    let trimmed = raw.trim_start();
+    let safe = if trimmed.starts_with(['=', '+', '-', '@']) {
+        format!("'{raw}")
+    } else {
+        raw.to_string()
+    };
+    if safe.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", safe.replace('"', "\"\""))
+    } else {
+        safe
+    }
+}
+
+fn run_enrich_command(
+    table: &mut SarTable,
+    with_admet: bool,
+    out: &Path,
+    format: EnrichFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if with_admet {
+        let provider = AdmetCraftProvider::default();
+        table.enrich_with_admet(&provider);
+        let evals: Vec<_> = table
+            .rows
+            .iter()
+            .filter_map(|r| r.admet_full.clone())
+            .collect();
+        let fmt = match format {
+            EnrichFormat::Csv => AdmetReportFormat::Csv,
+            EnrichFormat::Json => AdmetReportFormat::Json,
+            EnrichFormat::Pdf => AdmetReportFormat::Pdf,
+        };
+        let mut f = std::fs::File::create(out)?;
+        provider.export_report_to_writer(&evals, &mut f, fmt)?;
+        eprintln!(
+            "Wrote ADMET report ({} compounds) -> {}",
+            evals.len(),
+            out.display()
+        );
+        return Ok(());
+    }
+
+    match format {
+        EnrichFormat::Csv => {
+            use std::fmt::Write as _;
+            let mut csv_out = String::from(
+                "Molecule,Canonical SMILES,Structural Key,Formula,MW,HeavyAtoms,pIC50,Series\n",
+            );
+            for r in &table.rows {
+                let pic50 = r.pic50.map_or_else(String::new, |v| format!("{v:.3}"));
+                let _ = writeln!(
+                    csv_out,
+                    "{},{},{},{},{:.2},{},{},{}",
+                    escape_csv_cell(&r.name),
+                    escape_csv_cell(&r.canonical_smiles),
+                    escape_csv_cell(&r.structural_key),
+                    escape_csv_cell(&r.formula),
+                    r.mw,
+                    r.heavy_atoms,
+                    pic50,
+                    escape_csv_cell(&r.series)
+                );
+            }
+            std::fs::write(out, csv_out)?;
+        }
+        EnrichFormat::Json => {
+            let rows: Vec<_> = table
+                .rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "name": r.name,
+                        "canonical_smiles": r.canonical_smiles,
+                        "structural_key": r.structural_key,
+                        "formula": r.formula,
+                        "mw": r.mw,
+                        "heavy_atoms": r.heavy_atoms,
+                        "pic50": r.pic50,
+                        "series": r.series,
+                    })
+                })
+                .collect();
+            std::fs::write(out, serde_json::to_string_pretty(&rows)?)?;
+        }
+        EnrichFormat::Pdf => {
+            return Err("PDF ADMET report requires --with-admet".into());
+        }
+    }
+    eprintln!(
+        "Wrote table metadata ({} compounds) -> {}",
+        table.rows.len(),
+        out.display()
+    );
     Ok(())
 }
 
@@ -373,6 +461,137 @@ mod tests {
         assert_eq!(lines[3]["result"]["structuredContent"]["overlap_count"], 0);
         assert!(wdir.join("admet_delta.csv").exists());
         assert_eq!(lines[5]["error"]["code"], -32602);
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn enrich_with_admet_differs_from_without_admet() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_enrich_flag_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+
+        let mut table_plain = SarTable::new();
+        table_plain.load_csv_text(
+            "name,smiles,pIC50\nAspirin,CC(=O)Oc1ccccc1C(=O)O,5.2\nCaffeine,Cn1cnc2c1c(=O)n(C)c(=O)n2C,4.8\n",
+        )?;
+        let mut table_admet = table_plain.clone();
+
+        let plain_csv = base.join("plain.csv");
+        let admet_csv = base.join("admet.csv");
+        run_enrich_command(&mut table_plain, false, &plain_csv, EnrichFormat::Csv)?;
+        run_enrich_command(&mut table_admet, true, &admet_csv, EnrichFormat::Csv)?;
+
+        let plain_text = std::fs::read_to_string(&plain_csv)?;
+        let admet_text = std::fs::read_to_string(&admet_csv)?;
+        assert_ne!(plain_text, admet_text);
+        assert!(admet_text.contains("Consensus LogP"));
+        assert!(!plain_text.contains("Consensus LogP"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_export_sar_grid_eps_and_png_include_multiple_compounds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_mcp_grid_eps_png_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let wdir = base.join("write");
+        std::fs::create_dir_all(&wdir)?;
+
+        let sb = PathSandbox::new(None, Some(&wdir))?;
+        let smiles = [
+            "CC(=O)Oc1ccccc1C(=O)O Aspirin",
+            "Cn1cnc2c1c(=O)n(C)c(=O)n2C Caffeine",
+            "CC(C)Cc1ccc(C(C)C(=O)O)cc1 Ibuprofen",
+            "CC(=O)Nc1ccc(O)cc1 Paracetamol",
+            "c1ccccc1 Benzene",
+            "CCO Ethanol",
+        ];
+        let requests = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})
+                .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{
+                    "name":"export_vector_figure",
+                    "arguments":{"smiles":smiles,"output_path":"grid.eps","format":"eps"}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{
+                    "name":"export_vector_figure",
+                    "arguments":{"smiles":smiles,"output_path":"grid.png","format":"png"}
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(requests.as_bytes()), &mut out_buf, &sb, None)?;
+        let eps = std::fs::read_to_string(wdir.join("grid.eps"))?;
+        for label in [
+            "Aspirin",
+            "Caffeine",
+            "Ibuprofen",
+            "Paracetamol",
+            "Benzene",
+            "Ethanol",
+        ] {
+            assert!(
+                eps.contains(label),
+                "EPS grid missing compound label {label}"
+            );
+        }
+        let png = std::fs::read(wdir.join("grid.png"))?;
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() > 2000);
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_search_substructure_rejects_oversized_csv() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_mcp_oversized_csv_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let rdir = base.join("read");
+        std::fs::create_dir_all(&rdir)?;
+
+        let mut big = String::from("name,smiles\n");
+        for i in 0..80_000 {
+            big.push_str(&format!("Mol_{i},CC(=O)Oc1ccccc1C(=O)O\n"));
+        }
+        assert!(big.len() > 2 * 1024 * 1024);
+        std::fs::write(rdir.join("huge.csv"), big)?;
+
+        let sb = PathSandbox::new(Some(&rdir), None)?;
+        let req = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})
+                .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"search_substructure","arguments":{"file":"huge.csv","smarts":"c1ccccc1"}}
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(req.as_bytes()), &mut out_buf, &sb, None)?;
+        let lines: Vec<serde_json::Value> = String::from_utf8(out_buf)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["result"]["isError"], true);
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

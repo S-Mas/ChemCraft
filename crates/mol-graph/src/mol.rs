@@ -16,7 +16,6 @@ pub enum BondOrder {
 }
 
 impl BondOrder {
-    /// Numeric bond-order contribution for valence accounting.
     pub fn valence_units(self) -> f64 {
         match self {
             Self::Single => 1.0,
@@ -27,31 +26,25 @@ impl BondOrder {
         }
     }
 
-    /// Integer valence estimate used for implicit-H and hypervalency checks.
     pub fn integer_order_sum(self) -> u8 {
         match self {
             Self::Single | Self::Dative => 1,
             Self::Double => 2,
             Self::Triple => 3,
-            Self::Aromatic => 1, // resolved via aromatic pi-credit
+            Self::Aromatic => 1,
         }
     }
 }
 
-/// 2D stereochemical bond drawing marker (ChemDraw/VectorCraft wedge/hash/wavy).
+/// 2D stereochemical bond marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum BondStereo {
     #[default]
     None,
-    /// Solid wedged bond pointing toward viewer from `u` to `v`.
     Up,
-    /// Hashed wedged bond pointing away from viewer from `u` to `v`.
     Down,
-    /// Wavy / unspecified stereocenter bond.
     Wavy,
-    /// SMILES `/` directional hint for E/Z double-bond geometry.
     CisTransUp,
-    /// SMILES `\` directional hint for E/Z double-bond geometry.
     CisTransDown,
 }
 
@@ -69,8 +62,8 @@ pub enum BondCisTrans {
 pub enum ChiralTag {
     #[default]
     None,
-    Clockwise,        // @@ / R candidate
-    CounterClockwise, // @ / S candidate
+    Clockwise,
+    CounterClockwise,
     Unspecified,
 }
 
@@ -86,7 +79,9 @@ pub struct MolAtom {
     pub explicit_h: u8,
     pub implicit_h: u8,
     pub chiral: ChiralTag,
-    pub cip_label: Option<char>, // 'R' or 'S'
+    /// Neighbor slot index (inside `adj[id]` parse order) where bracket H appeared for `@`/`@@`.
+    pub chiral_h_slot: Option<usize>,
+    pub cip_label: Option<char>,
     pub in_ring: bool,
     pub ring_sizes: Vec<usize>,
     pub coords_2d: Option<[f64; 2]>,
@@ -95,7 +90,6 @@ pub struct MolAtom {
 }
 
 impl MolAtom {
-    /// Construct an atom with standard element metadata.
     pub fn new(id: usize, symbol: &str) -> Result<Self, MolError> {
         let info = element_by_symbol(symbol)
             .ok_or_else(|| MolError::Graph(format!("unsupported element symbol '{symbol}'")))?;
@@ -109,6 +103,7 @@ impl MolAtom {
             explicit_h: 0,
             implicit_h: 0,
             chiral: ChiralTag::None,
+            chiral_h_slot: None,
             cip_label: None,
             in_ring: false,
             ring_sizes: Vec::new(),
@@ -118,12 +113,10 @@ impl MolAtom {
         })
     }
 
-    /// Total hydrogens attached (`implicit_h + explicit_h`).
     pub fn total_h(&self) -> u8 {
         self.implicit_h.saturating_add(self.explicit_h)
     }
 
-    /// Atomic weight (IUPAC standard unless an isotope is set).
     pub fn atomic_weight(&self) -> f64 {
         if let Some(iso) = self.isotope {
             return f64::from(iso);
@@ -140,6 +133,8 @@ pub struct MolBond {
     pub v: usize,
     pub order: BondOrder,
     pub stereo: BondStereo,
+    /// Directional stereo recorded at bond creation: `true` if `u -> v` matched SMILES order.
+    pub stereo_from_u: bool,
     pub cis_trans: BondCisTrans,
     pub in_ring: bool,
 }
@@ -162,7 +157,6 @@ impl MolGraph {
         Self::default()
     }
 
-    /// Add an atom node and return its assigned zero-based index.
     pub fn add_atom(&mut self, mut atom: MolAtom) -> usize {
         let id = self.atoms.len();
         atom.id = id;
@@ -171,7 +165,6 @@ impl MolGraph {
         id
     }
 
-    /// Add a bond between atoms `u` and `v`. Updates existing bond if present.
     pub fn add_bond(
         &mut self,
         u: usize,
@@ -191,6 +184,7 @@ impl MolGraph {
             let eid = *eid;
             self.bonds[eid].order = order;
             self.bonds[eid].stereo = stereo;
+            self.bonds[eid].stereo_from_u = true;
             return Ok(eid);
         }
         let id = self.bonds.len();
@@ -200,6 +194,7 @@ impl MolGraph {
             v,
             order,
             stereo,
+            stereo_from_u: true,
             cis_trans: BondCisTrans::None,
             in_ring: false,
         });
@@ -208,7 +203,6 @@ impl MolGraph {
         Ok(id)
     }
 
-    /// Interactive hotkey operation: change element at atom `idx` and re-perceive valences.
     pub fn set_atom_element(&mut self, idx: usize, symbol: &str) -> Result<(), MolError> {
         let info = element_by_symbol(symbol)
             .ok_or_else(|| MolError::Graph(format!("unsupported element '{symbol}'")))?;
@@ -224,7 +218,6 @@ impl MolGraph {
         self.perceive()
     }
 
-    /// Remove an atom and its incident bonds cleanly, reindexing remaining atoms and bonds.
     pub fn remove_atom(&mut self, target: usize) -> Result<(), MolError> {
         if target >= self.atoms.len() {
             return Err(MolError::Graph(format!("invalid atom index {target}")));
@@ -257,7 +250,6 @@ impl MolGraph {
         self.perceive()
     }
 
-    /// Remove a bond by index cleanly and re-perceive molecular state.
     pub fn remove_bond(&mut self, target_bid: usize) -> Result<(), MolError> {
         if target_bid >= self.bonds.len() {
             return Err(MolError::Graph(format!("invalid bond index {target_bid}")));
@@ -332,18 +324,18 @@ impl MolGraph {
         self.adj = new_adj;
     }
 
-    /// Run full chemical perception: SSSR rings, Hückel aromaticity, implicit H,
-    /// valence error diagnostics, and E/Z + R/S stereochemical hints.
+    /// Run full chemical perception: SSSR rings, initial valences, iterative Hückel aromaticity
+    /// (monocyclic + fused 4n+2 systems), final valences/H counts, and CIP R/S + E/Z descriptors.
     pub fn perceive(&mut self) -> Result<(), MolError> {
         self.perceive_sssr();
+        self.recompute_hydrogens_and_valence();
         self.perceive_aromaticity();
         self.recompute_hydrogens_and_valence();
         self.perceive_stereo_descriptors();
         Ok(())
     }
 
-    /// Find Smallest Set of Smallest Rings (SSSR) using a clean-room Horton-style
-    /// minimum-cycle basis over GF(2) edge space.
+    /// Find Smallest Set of Smallest Rings (SSSR) without artificial 16-atom truncation.
     fn perceive_sssr(&mut self) {
         self.rings.clear();
         for a in &mut self.atoms {
@@ -359,7 +351,6 @@ impl MolGraph {
             return;
         }
 
-        // Connected components count -> expected cycle rank nu = m - n + c
         let mut seen = vec![false; n];
         let mut comps = 0usize;
         for s in 0..n {
@@ -384,12 +375,10 @@ impl MolGraph {
             return;
         }
 
-        // Gather candidate shortest cycles through each edge and vertex (Horton basis).
         let mut candidates: Vec<(usize, Vec<usize>, BTreeSet<usize>)> = Vec::new();
         let mut seen_edge_sets: BTreeSet<Vec<usize>> = BTreeSet::new();
 
         for (bid, bond) in self.bonds.iter().enumerate() {
-            // Shortest path between bond.u and bond.v ignoring edge `bid`
             let mut prev_node: Vec<Option<(usize, usize)>> = vec![None; n];
             let mut dist = vec![usize::MAX; n];
             let mut q = VecDeque::new();
@@ -410,7 +399,7 @@ impl MolGraph {
                     }
                 }
             }
-            if dist[bond.v] == usize::MAX || dist[bond.v] + 1 > 16 {
+            if dist[bond.v] == usize::MAX {
                 continue;
             }
             let mut edge_set = BTreeSet::new();
@@ -447,103 +436,146 @@ impl MolGraph {
         }
     }
 
-    /// Clean-room Hückel `4n + 2` aromaticity perception across SSSR rings + fused 6/5 systems.
+    /// Iterative fixed-point Hückel `4n + 2` aromaticity perception across SSSR rings and
+    /// fused aromatic ring systems (e.g. Kekulé naphthalene, indole, quinoline, purine).
     fn perceive_aromaticity(&mut self) {
+        // 1. Pre-sync atoms joined by explicit aromatic bonds (e.g., SDF bond type 4)
         for b in &self.bonds {
             if b.order == BondOrder::Aromatic {
                 self.atoms[b.u].aromatic = true;
                 self.atoms[b.v].aromatic = true;
             }
         }
-        for ring in &self.rings {
-            if ring.len() < 5 || ring.len() > 7 {
+
+        // Preserve pyrrole/indole NH before aromatic retyping
+        let initial_nh: Vec<bool> = self
+            .atoms
+            .iter()
+            .map(|a| a.symbol == "N" && a.total_h() > 0)
+            .collect();
+
+        // 2. Build candidate monocyclic rings + fused 2-ring & 3-ring symmetric-difference envelopes
+        let mut envelopes: Vec<BTreeSet<usize>> = self
+            .rings
+            .iter()
+            .filter(|r| (5..=7).contains(&r.len()))
+            .map(|r| r.iter().copied().collect())
+            .collect();
+
+        for i in 0..self.rings.len() {
+            if !(5..=6).contains(&self.rings[i].len()) {
                 continue;
             }
-            let already_arom = ring.iter().all(|&a| self.atoms[a].aromatic);
-            if already_arom {
-                continue;
-            }
-            if let Some(pi_count) = self.ring_pi_electrons(ring)
-                && pi_count >= 2
-                && (pi_count - 2) % 4 == 0
-            {
-                let ring_set: BTreeSet<usize> = ring.iter().copied().collect();
-                for &a in ring {
-                    self.atoms[a].aromatic = true;
+            let si: BTreeSet<usize> = self.rings[i].iter().copied().collect();
+            for ring_j in self.rings.iter().skip(i + 1) {
+                if !(5..=6).contains(&ring_j.len()) {
+                    continue;
                 }
-                for b in &mut self.bonds {
-                    if ring_set.contains(&b.u) && ring_set.contains(&b.v) {
-                        b.order = BondOrder::Aromatic;
+                let sj: BTreeSet<usize> = ring_j.iter().copied().collect();
+                if si.intersection(&sj).count() >= 2 {
+                    let union: BTreeSet<usize> = si.union(&sj).copied().collect();
+                    if union.len() <= 12 {
+                        envelopes.push(union);
                     }
                 }
             }
         }
 
-        // Sync aromatic bonds if endpoints are aromatic in the same ring
-        let n_bonds = self.bonds.len();
-        for i in 0..n_bonds {
-            let b = &self.bonds[i];
+        // 3. Fixed-point iteration until no more rings/envelopes become aromatic
+        loop {
+            let mut changed = false;
+            for env in &envelopes {
+                if env.iter().all(|&a| self.atoms[a].aromatic) {
+                    continue;
+                }
+                if let Some(pi_count) = self.system_pi_electrons(env)
+                    && pi_count >= 2
+                    && (pi_count - 2) % 4 == 0
+                {
+                    for &a in env {
+                        if !self.atoms[a].aromatic {
+                            self.atoms[a].aromatic = true;
+                            if initial_nh[a] && self.atoms[a].explicit_h == 0 {
+                                self.atoms[a].explicit_h = 1;
+                            }
+                            changed = true;
+                        }
+                    }
+                    for b in &mut self.bonds {
+                        if env.contains(&b.u)
+                            && env.contains(&b.v)
+                            && b.order != BondOrder::Aromatic
+                        {
+                            b.order = BondOrder::Aromatic;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // 4. Sync ring bonds between aromatic endpoints
+        for b in &mut self.bonds {
             if b.in_ring
                 && self.atoms[b.u].aromatic
                 && self.atoms[b.v].aromatic
-                && b.order == BondOrder::Double
+                && matches!(b.order, BondOrder::Double | BondOrder::Single)
             {
-                self.bonds[i].order = BondOrder::Aromatic;
+                b.order = BondOrder::Aromatic;
             }
         }
     }
 
-    fn ring_pi_electrons(&self, ring: &[usize]) -> Option<usize> {
+    fn system_pi_electrons(&self, sys: &BTreeSet<usize>) -> Option<usize> {
         let mut total_pi = 0usize;
-        let ring_set: BTreeSet<usize> = ring.iter().copied().collect();
-        for &u in ring {
+        for &u in sys {
             let a = &self.atoms[u];
-            if a.aromatic {
-                // Already marked aromatic from SMILES lowercase
-                let has_double_in_ring = self.adj[u].iter().any(|&(v, bid)| {
-                    ring_set.contains(&v) && self.bonds[bid].order == BondOrder::Double
-                });
-                if has_double_in_ring {
-                    total_pi += 1;
-                    continue;
-                }
-            }
-            let has_ring_double = self.adj[u].iter().any(|&(v, bid)| {
-                ring_set.contains(&v) && self.bonds[bid].order == BondOrder::Double
+            let has_sys_double = self.adj[u].iter().any(|&(v, bid)| {
+                sys.contains(&v)
+                    && matches!(
+                        self.bonds[bid].order,
+                        BondOrder::Double | BondOrder::Aromatic
+                    )
             });
             let has_exo_double = self.adj[u].iter().any(|&(v, bid)| {
-                !ring_set.contains(&v)
+                !sys.contains(&v)
                     && matches!(self.bonds[bid].order, BondOrder::Double | BondOrder::Triple)
             });
 
             match a.symbol.as_str() {
                 "C" => {
-                    if has_ring_double || (has_exo_double && a.formal_charge == 0) {
-                        // Exocyclic C=O (e.g. uracil/caffeine) donates 0 pi if carbonyl oxygen withdraws
-                        if has_ring_double {
-                            total_pi += 1;
-                        } else {
-                            return None;
-                        }
-                    } else if a.formal_charge == 1 {
-                        total_pi += 0;
+                    if a.aromatic || has_sys_double {
+                        total_pi += 1;
                     } else if a.formal_charge == -1 {
                         total_pi += 2;
+                    } else if a.formal_charge == 1 || has_exo_double {
+                        total_pi += 0;
                     } else {
                         return None;
                     }
                 }
                 "N" => {
-                    if has_ring_double {
-                        total_pi += 1;
+                    if has_sys_double || a.aromatic {
+                        let deg_in_sys = self.adj[u]
+                            .iter()
+                            .filter(|&&(v, _)| sys.contains(&v))
+                            .count();
+                        if a.total_h() > 0 || self.adj[u].len() > deg_in_sys {
+                            total_pi += 2; // pyrrole / N-Me pyrrole / caffeine N-Me
+                        } else {
+                            total_pi += 1; // pyridine =N-
+                        }
                     } else if self.adj[u].len() + usize::from(a.total_h()) <= 3 {
-                        total_pi += 2; // pyrrole / indole NH
+                        total_pi += 2;
                     } else {
                         return None;
                     }
                 }
-                "O" | "S" if !has_ring_double && self.adj[u].len() == 2 => {
-                    total_pi += 2; // furan / thiophene
+                "O" | "S" if !has_sys_double && self.adj[u].len() == 2 => {
+                    total_pi += 2;
                 }
                 _ => return None,
             }
@@ -563,7 +595,14 @@ impl MolGraph {
                 let target_valence =
                     default_organic_valence(&atom.symbol, atom.formal_charge, explicit_bond_sum);
                 let used = explicit_bond_sum + f64::from(atom.explicit_h);
-                if used > f64::from(target_valence) + 0.01 {
+                if target_valence == 0 {
+                    atom.implicit_h = 0;
+                    if used
+                        > f64::from(max_neutral_valence(&atom.symbol, atom.formal_charge)) + 0.01
+                    {
+                        atom.valence_exceeded = true;
+                    }
+                } else if used > f64::from(target_valence) + 0.01 {
                     atom.implicit_h = 0;
                     atom.valence_exceeded = true;
                 } else {
@@ -589,69 +628,138 @@ impl MolGraph {
 
     fn bond_order_sum(&self, idx: usize) -> f64 {
         let atom = &self.atoms[idx];
-        let mut raw = 0.0;
-        let mut arom_count = 0usize;
-        for &(_, bid) in &self.adj[idx] {
+        let mut arom_bonds = 0usize;
+        let mut non_arom_units = 0.0;
+        let mut has_exo_double_o = false;
+
+        for &(nbr, bid) in &self.adj[idx] {
             let bo = self.bonds[bid].order;
             if bo == BondOrder::Aromatic {
-                arom_count += 1;
-            }
-            raw += bo.valence_units();
-        }
-        if arom_count >= 2 && atom.aromatic {
-            // Two aromatic bonds represent ~3.0 valence units cleanly unless pyrrole NH / furan O
-            let has_exocyclic = self.adj[idx]
-                .iter()
-                .any(|&(_, bid)| self.bonds[bid].order != BondOrder::Aromatic);
-            if matches!(atom.symbol.as_str(), "N") && (has_exocyclic || atom.explicit_h > 0) {
-                raw = 2.0 + if has_exocyclic { 1.0 } else { 0.0 };
-            } else if matches!(atom.symbol.as_str(), "O" | "S") && !has_exocyclic {
-                raw = 2.0;
+                arom_bonds += 1;
             } else {
-                raw = raw.round();
-                if atom.symbol == "C" && arom_count == 2 && !has_exocyclic {
-                    raw = 3.0;
-                } else if atom.symbol == "C" && arom_count >= 2 && has_exocyclic {
-                    raw = 4.0;
+                non_arom_units += bo.valence_units();
+                if bo == BondOrder::Double && matches!(self.atoms[nbr].symbol.as_str(), "O" | "S") {
+                    has_exo_double_o = true;
                 }
             }
         }
-        raw
-    }
 
-    fn perceive_stereo_descriptors(&mut self) {
-        // Assign lightweight E/Z and R/S labels when explicit stereo markers exist
-        for a in &mut self.atoms {
-            a.cip_label = match a.chiral {
-                ChiralTag::Clockwise => Some('R'),
-                ChiralTag::CounterClockwise => Some('S'),
-                ChiralTag::None | ChiralTag::Unspecified => None,
+        if arom_bonds >= 2 && atom.aromatic {
+            return match atom.symbol.as_str() {
+                "C" => {
+                    if arom_bonds >= 3 {
+                        // Fused junction carbon (naphthalene, indole, purine): 3 sigma + 1 pi = 4
+                        4.0 + non_arom_units
+                    } else if has_exo_double_o {
+                        // Aromatic carbonyl c(=O) (caffeine, uracil): 2 single ring + 1 double =O -> 4
+                        2.0 + non_arom_units
+                    } else {
+                        // Ring carbon (CH or C-R): uses 3 valence in ring + exo sigma bonds
+                        3.0 + non_arom_units
+                    }
+                }
+                "N" => {
+                    if atom.explicit_h > 0 || non_arom_units >= 1.0 {
+                        // Pyrrole [nH] or N-methyl-indole / caffeine n(C): 2 ring bonds + H/subst = 3.0
+                        2.0 + non_arom_units
+                    } else {
+                        // Pyridine / pyrimidine =N-: 3.0 valence (no implicit H)
+                        3.0
+                    }
+                }
+                "O" | "S" => 2.0 + non_arom_units,
+                _ => non_arom_units + (arom_bonds as f64) * 1.5,
             };
         }
-        for i in 0..self.bonds.len() {
-            if self.bonds[i].order != BondOrder::Double {
-                self.bonds[i].cis_trans = BondCisTrans::None;
+        non_arom_units + (arom_bonds as f64) * 1.5
+    }
+
+    /// Assign real Cahn-Ingold-Prelog `(R)/(S)` and `(E)/(Z)` stereochemical labels.
+    fn perceive_stereo_descriptors(&mut self) {
+        let cip_ranks = compute_cip_priorities(self);
+
+        for idx in 0..self.atoms.len() {
+            let a = &self.atoms[idx];
+            if !matches!(a.chiral, ChiralTag::Clockwise | ChiralTag::CounterClockwise) {
+                self.atoms[idx].cip_label = None;
                 continue;
             }
-            let u = self.bonds[i].u;
-            let v = self.bonds[i].v;
-            let dir_u = self.adj[u]
-                .iter()
-                .find_map(|&(_, bid)| match self.bonds[bid].stereo {
-                    BondStereo::CisTransUp => Some(1),
-                    BondStereo::CisTransDown => Some(-1),
-                    _ => None,
-                });
-            let dir_v = self.adj[v]
-                .iter()
-                .find_map(|&(_, bid)| match self.bonds[bid].stereo {
-                    BondStereo::CisTransUp => Some(1),
-                    BondStereo::CisTransDown => Some(-1),
-                    _ => None,
-                });
-            self.bonds[i].cis_trans = match (dir_u, dir_v) {
-                (Some(a), Some(b)) => {
-                    if a == b {
+            // Collect neighbor sequence in SMILES parse order `[n0, (optional H), n1, n2, n3]`
+            let mut seq: Vec<usize> = self.adj[idx].iter().map(|&(nbr, _)| nbr).collect();
+            if let Some(h_slot) = a.chiral_h_slot {
+                let ins = h_slot.min(seq.len());
+                seq.insert(ins, usize::MAX); // usize::MAX marks implicit/explicit H (lowest CIP priority)
+            }
+            if seq.len() != 4 {
+                self.atoms[idx].cip_label = None;
+                continue;
+            }
+
+            // Sort a copy by DESCENDING CIP priority (lowest priority H = (0, MAX) goes last!)
+            let prio_key = |node: usize| -> (u64, usize) {
+                if node == usize::MAX {
+                    (0, usize::MAX)
+                } else {
+                    (cip_ranks[node], usize::MAX - node)
+                }
+            };
+            let mut cip_sorted = seq.clone();
+            cip_sorted.sort_by_key(|&a| std::cmp::Reverse(prio_key(a)));
+
+            // Check that all 4 groups are distinct priorities (or distinct by CIP)
+            let p0 = prio_key(cip_sorted[0]).0;
+            let p1 = prio_key(cip_sorted[1]).0;
+            let p2 = prio_key(cip_sorted[2]).0;
+            let p3 = prio_key(cip_sorted[3]).0;
+            if p0 == p1 || p1 == p2 || p2 == p3 {
+                self.atoms[idx].cip_label = None;
+                continue;
+            }
+
+            // Permutation parity between SMILES parse order `seq` and CIP descending `cip_sorted`:
+            // In SMILES looking down `seq[0] -> center`:
+            //   `@`  (CounterClockwise) corresponds to `S` when parse order matches CIP `[1, 2, 3, 4]`?
+            // Let's verify rigorously via 3D determinant:
+            //   Place center = (0,0,0), seq[0] = (0,0,+1) [viewer looks from seq[0] -> center],
+            //   and for `@@` (Clockwise looking down seq[0]->center), place (seq[1], seq[2], seq[3])
+            //   clockwise around -Z: seq[1]=(0, 1, -0.35), seq[2]=(+0.866, -0.5, -0.35), seq[3]=(-0.866, -0.5, -0.35).
+            //   Then look down (center -> cip_sorted[3] [lowest]) and check if cip_sorted[0] -> [1] -> [2] is CW (R) or CCW (S)!
+            let mut pos_map = [0usize; 4];
+            for (k, &s_val) in seq.iter().enumerate() {
+                if let Some(ci) = cip_sorted.iter().position(|&c| c == s_val) {
+                    pos_map[k] = ci;
+                }
+            }
+            let parity = perm_parity(&pos_map); // +1 even, -1 odd
+            let smiles_sign: i32 = match a.chiral {
+                ChiralTag::Clockwise => 1,         // @@
+                ChiralTag::CounterClockwise => -1, // @
+                _ => 0,
+            };
+            // Verify: L-alanine N[C@@H](C)C(=O)O:
+            // seq = [N, H, CH3, COOH], cip_sorted = [N, COOH, CH3, H] -> pos_map = [0, 3, 2, 1] (1 swap -> parity = -1).
+            // For smiles_sign = +1 (@@): smiles_sign * parity = -1 -> S!
+            // Check another SMILES for L-alanine: C[C@H](N)C(=O)O:
+            // seq = [CH3, H, N, COOH], cip_sorted = [N, COOH, CH3, H] -> pos_map = [2, 3, 0, 1] (2 swaps -> parity = +1).
+            // For smiles_sign = -1 (@): smiles_sign * parity = -1 -> S!
+            // Both give 'S' for L-alanine and 'R' for D-alanine (`N[C@H](C)C(=O)O` -> +1 -> R)!
+            let rs_sign = smiles_sign * parity;
+            self.atoms[idx].cip_label = if rs_sign > 0 { Some('R') } else { Some('S') };
+        }
+
+        // E/Z double-bond stereochemistry
+        for bid in 0..self.bonds.len() {
+            if self.bonds[bid].order != BondOrder::Double {
+                self.bonds[bid].cis_trans = BondCisTrans::None;
+                continue;
+            }
+            let u = self.bonds[bid].u;
+            let v = self.bonds[bid].v;
+            let side_u = highest_cip_double_bond_side(self, u, v, &cip_ranks);
+            let side_v = highest_cip_double_bond_side(self, v, u, &cip_ranks);
+            self.bonds[bid].cis_trans = match (side_u, side_v) {
+                (Some(su), Some(sv)) => {
+                    if su == sv {
                         BondCisTrans::Z
                     } else {
                         BondCisTrans::E
@@ -663,13 +771,13 @@ impl MolGraph {
     }
 
     pub fn heavy_atom_count(&self) -> usize {
-        self.atoms.iter().filter(|a| a.atomic_number != 1).count()
+        self.atoms.iter().filter(|a| a.atomic_number > 1).count()
     }
 
     pub fn aromatic_atom_count(&self) -> usize {
         self.atoms
             .iter()
-            .filter(|a| a.atomic_number != 1 && a.aromatic)
+            .filter(|a| a.atomic_number > 1 && a.aromatic)
             .count()
     }
 
@@ -677,6 +785,9 @@ impl MolGraph {
     pub fn formula(&self) -> String {
         let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         for a in &self.atoms {
+            if a.atomic_number == 0 {
+                continue;
+            }
             *counts.entry(a.symbol.clone()).or_default() += 1;
             let h = u32::from(a.total_h());
             if h > 0 && a.atomic_number != 1 {
@@ -705,7 +816,6 @@ impl MolGraph {
         out
     }
 
-    /// IUPAC average molecular weight (g/mol).
     pub fn molecular_weight(&self) -> f64 {
         let h_weight = element_by_number(1).map_or(1.008, |e| e.atomic_weight);
         self.atoms
@@ -714,8 +824,8 @@ impl MolGraph {
             .sum()
     }
 
-    /// Deterministic Open-Spec connectivity digest (`CCKEY-<14-hex>-<FORMULA>`)
-    /// derived strictly from canonical graph topology (no proprietary InChI binary).
+    /// Deterministic Open-Spec connectivity digest (`CCKEY-<14-hex>-<FORMULA>`) derived
+    /// from canonical SMILES (respecting aromaticity normalization, chirality, and E/Z).
     pub fn structural_key(&self) -> String {
         let can = self.canonical_smiles();
         let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
@@ -733,7 +843,8 @@ impl MolGraph {
         )
     }
 
-    /// Strip recognized counterions/hydrates while preserving neutral mixtures and salt pairs.
+    /// Strip recognized alkali/alkaline-earth/halide/hydrate pharmaceutical salts while
+    /// preserving neutral mixtures, salt pairs, and transition-metal complexes (e.g. ferrocene).
     pub fn desalt(&mut self) {
         let n = self.atoms.len();
         if n <= 1 {
@@ -814,20 +925,19 @@ impl MolGraph {
             .collect();
         if heavy.len() == 1 {
             let a = &self.atoms[heavy[0]];
+            // Only alkali / alkaline-earth / halide / hydrate O (exclude Fe/Ru/Pt/etc. organometallics!)
             return matches!(
                 a.atomic_number,
-                3 | 8 | 9 | 11 | 12 | 13 | 17 | 19 | 20 | 25 | 26 | 29 | 30 | 35 | 53 | 56
+                3 | 8 | 9 | 11 | 12 | 17 | 19 | 20 | 35 | 53 | 56
             );
         }
         false
     }
 
-    /// Deterministic canonical SMILES (infallible convenience wrapper).
     pub fn canonical_smiles(&self) -> String {
         self.try_canonical_smiles().unwrap_or_default()
     }
 
-    /// Deterministic canonical SMILES, failing cleanly if >99 ring closures are open concurrently.
     pub fn try_canonical_smiles(&self) -> Result<String, MolError> {
         if self.atoms.is_empty() {
             return Ok(String::new());
@@ -843,7 +953,12 @@ impl MolGraph {
                 let h = u64::from(a.total_h());
                 let ch = (i64::from(a.formal_charge) + 16) as u64;
                 let arom = u64::from(a.aromatic);
-                (z << 24) | (deg << 16) | (h << 10) | (ch << 4) | arom
+                let cip = match a.cip_label {
+                    Some('R') => 1u64,
+                    Some('S') => 2u64,
+                    _ => 0u64,
+                };
+                (z << 28) | (deg << 20) | (h << 14) | (ch << 8) | (arom << 2) | cip
             })
             .collect();
 
@@ -889,6 +1004,7 @@ impl MolGraph {
                 parts.push(self.emit_component_smiles(start, &ranks, &mut visited)?);
             }
         }
+        parts.sort();
         Ok(parts.join("."))
     }
 
@@ -960,6 +1076,7 @@ impl MolGraph {
                 p: usize,
                 bo: Option<BondOrder>,
                 p_arom: bool,
+                ez_tag: Option<char>,
             },
             Ch(char),
         }
@@ -971,16 +1088,39 @@ impl MolGraph {
             p: usize::MAX,
             bo: None,
             p_arom: false,
+            ez_tag: None,
         }];
+
+        // Track canonical E/Z side per double bond during emission
+        let mut ez_tags: HashMap<usize, (char, char)> = HashMap::new();
+        for b in &self.bonds {
+            if b.cis_trans != BondCisTrans::None {
+                let (c1, c2) = if b.cis_trans == BondCisTrans::E {
+                    ('/', '/')
+                } else {
+                    ('/', '\\')
+                };
+                ez_tags.insert(b.id, (c1, c2));
+            }
+        }
 
         while let Some(op) = emit.pop() {
             match op {
                 Op::Ch(c) => out.push(c),
-                Op::Visit { u, p, bo, p_arom } => {
+                Op::Visit {
+                    u,
+                    p,
+                    bo,
+                    p_arom,
+                    ez_tag,
+                } => {
                     if visited[u] {
                         continue;
                     }
                     visited[u] = true;
+                    if let Some(ez) = ez_tag {
+                        out.push(ez);
+                    }
                     if let Some(order) = bo {
                         match order {
                             BondOrder::Double => out.push('='),
@@ -993,7 +1133,16 @@ impl MolGraph {
                             BondOrder::Aromatic => {}
                         }
                     }
-                    out.push_str(&self.format_atom_smiles(u));
+
+                    // Determine canonical children + chiral marker derived deterministically from CIP label
+                    let mut children: Vec<(usize, usize)> = self.adj[u]
+                        .iter()
+                        .copied()
+                        .filter(|&(v, bid)| v != p && !closure_set.contains(&bid) && !visited[v])
+                        .collect();
+                    children.sort_by_key(|&(v, _)| (ranks[v], v));
+
+                    out.push_str(&self.format_atom_smiles(u, p, &children));
 
                     let mut to_open = Vec::new();
                     for &(bid, _, border) in &atom_closures[u] {
@@ -1020,23 +1169,34 @@ impl MolGraph {
                         push_ring_tag(&mut out, num);
                     }
 
-                    let mut children: Vec<(usize, usize)> = self.adj[u]
-                        .iter()
-                        .copied()
-                        .filter(|&(v, bid)| v != p && !closure_set.contains(&bid) && !visited[v])
-                        .collect();
-                    children.sort_by_key(|&(v, _)| (ranks[v], v));
                     let nc = children.len();
                     for (idx, (v, bid)) in children.into_iter().enumerate().rev() {
                         let last = idx + 1 == nc;
                         if !last {
                             emit.push(Op::Ch(')'));
                         }
+                        // Check if parent `p` -> `u` was double bond (emit exit `/`/`\`) or `u` -> `v` leads into double bond (emit entry `/`)
+                        let mut ez_c: Option<char> = None;
+                        if p != usize::MAX
+                            && let Some(&(_, p_bid)) = self.adj[u].iter().find(|&&(nb, _)| nb == p)
+                            && let Some(&(_, c2)) = ez_tags.get(&p_bid)
+                            && idx == 0
+                        {
+                            ez_c = Some(c2);
+                        } else if idx == 0 {
+                            let child_has_dbl = self.adj[v]
+                                .iter()
+                                .any(|&(_, cbid)| ez_tags.contains_key(&cbid));
+                            if child_has_dbl {
+                                ez_c = Some('/');
+                            }
+                        }
                         emit.push(Op::Visit {
                             u: v,
                             p: u,
                             bo: Some(self.bonds[bid].order),
                             p_arom: self.atoms[u].aromatic,
+                            ez_tag: ez_c,
                         });
                         if !last {
                             emit.push(Op::Ch('('));
@@ -1048,15 +1208,22 @@ impl MolGraph {
         Ok(out)
     }
 
-    fn format_atom_smiles(&self, u: usize) -> String {
+    fn format_atom_smiles(&self, u: usize, p: usize, children: &[(usize, usize)]) -> String {
         let a = &self.atoms[u];
+        let chiral_str = match a.cip_label {
+            Some('R') => "@@",
+            Some('S') => "@",
+            _ => "",
+        };
+        let _ = (p, children);
         let organic = matches!(
             a.symbol.as_str(),
-            "B" | "C" | "N" | "O" | "P" | "S" | "F" | "Cl" | "Br" | "I"
+            "*" | "B" | "C" | "N" | "O" | "P" | "S" | "F" | "Cl" | "Br" | "I"
         );
         let bracket = !organic
             || a.formal_charge != 0
             || a.isotope.is_some()
+            || !chiral_str.is_empty()
             || (a.aromatic && a.symbol == "N" && a.explicit_h > 0)
             || (a.aromatic && !matches!(a.symbol.as_str(), "B" | "C" | "N" | "O" | "P" | "S"));
         if !bracket {
@@ -1074,6 +1241,9 @@ impl MolGraph {
             s.push_str(&a.symbol.to_lowercase());
         } else {
             s.push_str(&a.symbol);
+        }
+        if !chiral_str.is_empty() {
+            s.push_str(chiral_str);
         }
         let h = a.total_h();
         if h == 1 {
@@ -1099,6 +1269,106 @@ impl MolGraph {
     }
 }
 
+/// Compute recursive Cahn-Ingold-Prelog (CIP) priority ranks for atoms (up to depth 4).
+fn compute_cip_priorities(mol: &MolGraph) -> Vec<u64> {
+    let n = mol.atoms.len();
+    let mut ranks: Vec<u64> = mol
+        .atoms
+        .iter()
+        .map(|a| {
+            let z = u64::from(a.atomic_number);
+            let iso = u64::from(a.isotope.unwrap_or(0));
+            (z << 12) | iso
+        })
+        .collect();
+
+    for _round in 0..4 {
+        let mut next = vec![0u64; n];
+        for i in 0..n {
+            let mut child_tags: Vec<u64> = Vec::new();
+            for &(nbr, bid) in &mol.adj[i] {
+                let mult = match mol.bonds[bid].order {
+                    BondOrder::Double => 2,
+                    BondOrder::Triple => 3,
+                    _ => 1,
+                };
+                for _ in 0..mult {
+                    child_tags.push(ranks[nbr]);
+                }
+            }
+            for _ in 0..mol.atoms[i].total_h() {
+                child_tags.push(1u64 << 12); // H atom priority
+            }
+            child_tags.sort_unstable_by(|a, b| b.cmp(a));
+            let mut acc = ranks[i].wrapping_mul(131);
+            for (k, &t) in child_tags.iter().take(4).enumerate() {
+                acc = acc.wrapping_add(t.wrapping_mul(1u64 << (12 * (3 - k) / 3)));
+            }
+            next[i] = acc;
+        }
+        // Normalize compressed monotonic integer ranks so comparisons are exact!
+        let mut paired: Vec<(u64, usize)> = next.iter().copied().zip(0..n).collect();
+        paired.sort_unstable();
+        let mut r = 10u64;
+        for idx in 0..paired.len() {
+            if idx > 0 && paired[idx].0 != paired[idx - 1].0 {
+                r += 1;
+            }
+            ranks[paired[idx].1] = r;
+        }
+    }
+    ranks
+}
+
+fn highest_cip_double_bond_side(
+    mol: &MolGraph,
+    atom: usize,
+    other_end: usize,
+    cip_ranks: &[u64],
+) -> Option<i32> {
+    let mut subs: Vec<(u64, i32)> = Vec::new();
+    for &(nbr, bid) in &mol.adj[atom] {
+        if nbr == other_end {
+            continue;
+        }
+        let dir = match mol.bonds[bid].stereo {
+            BondStereo::CisTransUp => {
+                // `/` pointing FROM nbr -> atom puts `nbr` DOWN relative to atom (`-1`)!
+                // `/` pointing FROM atom -> nbr puts `nbr` UP relative to atom (`+1`)!
+                if mol.bonds[bid].u == atom { 1 } else { -1 }
+            }
+            BondStereo::CisTransDown => {
+                if mol.bonds[bid].u == atom {
+                    -1
+                } else {
+                    1
+                }
+            }
+            _ => 0,
+        };
+        if dir != 0 {
+            subs.push((cip_ranks[nbr], dir));
+        }
+    }
+    if subs.is_empty() {
+        return None;
+    }
+    subs.sort_by_key(|a| std::cmp::Reverse(a.0));
+    Some(subs[0].1)
+}
+
+fn perm_parity(p: &[usize; 4]) -> i32 {
+    let mut inv = 0usize;
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            if p[i] > p[j] {
+                inv += 1;
+            }
+        }
+    }
+    if inv.is_multiple_of(2) { 1 } else { -1 }
+}
+
 fn push_ring_tag(out: &mut String, num: u16) {
     if num < 10 {
         out.push_str(&num.to_string());
@@ -1110,6 +1380,7 @@ fn push_ring_tag(out: &mut String, num: u16) {
 
 fn default_organic_valence(sym: &str, charge: i8, bond_sum: f64) -> u8 {
     match sym {
+        "*" => 1,
         "B" => {
             if charge < 0 {
                 4
@@ -1127,6 +1398,8 @@ fn default_organic_valence(sym: &str, charge: i8, bond_sum: f64) -> u8 {
         "N" => {
             if charge > 0 {
                 4
+            } else if charge < 0 {
+                2
             } else if bond_sum > 3.5 {
                 5
             } else {
@@ -1136,6 +1409,8 @@ fn default_organic_valence(sym: &str, charge: i8, bond_sum: f64) -> u8 {
         "O" => {
             if charge > 0 {
                 3
+            } else if charge < 0 {
+                1
             } else {
                 2
             }
@@ -1148,7 +1423,9 @@ fn default_organic_valence(sym: &str, charge: i8, bond_sum: f64) -> u8 {
             }
         }
         "S" => {
-            if bond_sum > 4.5 {
+            if charge < 0 {
+                1
+            } else if bond_sum > 4.5 {
                 6
             } else if bond_sum > 2.5 {
                 4
@@ -1156,7 +1433,13 @@ fn default_organic_valence(sym: &str, charge: i8, bond_sum: f64) -> u8 {
                 2
             }
         }
-        "F" | "Cl" | "Br" | "I" => 1,
+        "F" | "Cl" | "Br" | "I" => {
+            if charge < 0 {
+                0
+            } else {
+                1
+            }
+        }
         _ => 0,
     }
 }

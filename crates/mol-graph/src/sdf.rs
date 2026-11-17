@@ -6,6 +6,11 @@ use crate::smiles::DEFAULT_MAX_ATOMS;
 
 /// Parse multi-record SDF text (supports both CTAB **V2000** and **V3000** blocks plus SD tags).
 pub fn parse_sdf(input: &str) -> Vec<Result<MolGraph, MolError>> {
+    parse_sdf_with_limit(input, usize::MAX)
+}
+
+/// Parse at most `max_records` SDF records lazily without allocating beyond the limit.
+pub fn parse_sdf_with_limit(input: &str, max_records: usize) -> Vec<Result<MolGraph, MolError>> {
     if input.trim().is_empty() {
         return vec![Err(MolError::EmptyInput)];
     }
@@ -20,6 +25,7 @@ pub fn parse_sdf(input: &str) -> Vec<Result<MolGraph, MolError>> {
                 Some(parse_mol_block(block))
             }
         })
+        .take(max_records)
         .collect()
 }
 
@@ -43,6 +49,25 @@ pub fn parse_mol_block(block: &str) -> Result<MolGraph, MolError> {
 
 fn parse_v2000_block(lines: &[&str], title: &str) -> Result<MolGraph, MolError> {
     let counts_line = lines[3];
+    if let Some(first_tok) = counts_line.split_whitespace().next()
+        && first_tok.len() > 3
+        && counts_line
+            .get(0..3)
+            .is_some_and(|s| s.trim().chars().all(|c| c.is_ascii_digit()))
+        && counts_line
+            .as_bytes()
+            .get(3)
+            .is_some_and(u8::is_ascii_digit)
+        && counts_line
+            .as_bytes()
+            .get(6)
+            .is_some_and(u8::is_ascii_digit)
+    {
+        return Err(MolError::InvalidSdf {
+            line: 4,
+            msg: "corrupt V2000 counts line (>999 columns overflow); use V3000".to_string(),
+        });
+    }
     let (atom_count, bond_count) = if counts_line.len() >= 6 {
         let a = counts_line
             .get(0..3)
@@ -53,6 +78,15 @@ fn parse_v2000_block(lines: &[&str], title: &str) -> Result<MolGraph, MolError> 
                 line: 4,
                 msg: "invalid V2000 atom count".to_string(),
             })?;
+        if counts_line.as_bytes().get(3).is_some_and(|&b| b == b' ')
+            && let Some(tok0) = counts_line.split_whitespace().next()
+            && tok0.parse::<usize>().is_ok_and(|n| n > 999)
+        {
+            return Err(MolError::InvalidSdf {
+                line: 4,
+                msg: "V2000 atom count exceeds 999; use V3000".to_string(),
+            });
+        }
         let b = counts_line
             .get(3..6)
             .unwrap_or("")

@@ -1,14 +1,14 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use mol_graph::MolGraph;
+use mol_graph::{BondOrder, BondStereo, MolAtom, MolGraph};
 
 use crate::table::SarRow;
 
-/// Detected Matched Molecular Pair (`R1 -> R2` around a shared core).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Detected Matched Molecular Pair (`R1 -> R2` around a shared anchored core `[*]...`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchedMolecularPair {
     pub mol_a_name: String,
     pub mol_b_name: String,
@@ -21,8 +21,9 @@ pub struct MatchedMolecularPair {
     pub delta_mw: f64,
 }
 
-/// Detected Activity Cliff pair ranked by Structure-Activity Landscape Index (`SALI`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Detected Activity Cliff pair ranked by Structure-Activity Landscape Index (`SALI`),
+/// excluding identical/duplicate structures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivityCliff {
     pub row_a_idx: usize,
     pub row_b_idx: usize,
@@ -33,7 +34,47 @@ pub struct ActivityCliff {
     pub sali: f64,
 }
 
-/// Detect Activity Cliffs across rows with numeric `pIC50` values.
+/// Discordant duplicate compound pair detected via canonical `structural_key`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DuplicatePair {
+    pub structural_key: String,
+    pub mol_a_name: String,
+    pub mol_b_name: String,
+    pub delta_pic50: Option<f64>,
+}
+
+/// Detect duplicate structures (including Kekulé vs aromatic representations).
+pub fn find_duplicate_compounds(rows: &[SarRow]) -> Vec<DuplicatePair> {
+    let mut by_key: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (idx, r) in rows.iter().enumerate() {
+        by_key.entry(&r.structural_key).or_default().push(idx);
+    }
+    let mut out = Vec::new();
+    for (key, idxs) in by_key {
+        if idxs.len() < 2 {
+            continue;
+        }
+        for i in 0..idxs.len() {
+            for j in (i + 1)..idxs.len() {
+                let ra = &rows[idxs[i]];
+                let rb = &rows[idxs[j]];
+                let dp = match (ra.pic50, rb.pic50) {
+                    (Some(pa), Some(pb)) => Some((pa - pb).abs()),
+                    _ => None,
+                };
+                out.push(DuplicatePair {
+                    structural_key: key.to_string(),
+                    mol_a_name: ra.name.clone(),
+                    mol_b_name: rb.name.clone(),
+                    delta_pic50: dp,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Detect Activity Cliffs across unique molecules (excluding duplicates) deterministically.
 pub fn find_activity_cliffs(rows: &[SarRow], min_tanimoto: f64) -> Vec<ActivityCliff> {
     let mut cliffs: Vec<ActivityCliff> = (0..rows.len())
         .into_par_iter()
@@ -43,6 +84,10 @@ pub fn find_activity_cliffs(rows: &[SarRow], min_tanimoto: f64) -> Vec<ActivityC
                 return local;
             };
             for j in (i + 1)..rows.len() {
+                if rows[i].structural_key == rows[j].structural_key {
+                    // Never rank duplicate compounds as an Activity Cliff
+                    continue;
+                }
                 let Some(p_j) = rows[j].pic50 else {
                     continue;
                 };
@@ -67,19 +112,23 @@ pub fn find_activity_cliffs(rows: &[SarRow], min_tanimoto: f64) -> Vec<ActivityC
         })
         .collect();
 
-    cliffs.sort_by(|a, b| b.sali.total_cmp(&a.sali));
+    cliffs.sort_by(|a, b| {
+        b.sali
+            .total_cmp(&a.sali)
+            .then_with(|| a.mol_a_name.cmp(&b.mol_a_name))
+            .then_with(|| a.mol_b_name.cmp(&b.mol_b_name))
+    });
     cliffs.truncate(100);
     cliffs
 }
 
-/// Clean-room single-cut Matched Molecular Pairs (`core` >= 50% heavy atoms + terminal `R-group`).
+/// Reproducible single-cut Matched Molecular Pairs (`BTreeMap` + attachment dummy `[*]`),
+/// rejecting duplicate molecules and position-isomer false positives.
 pub fn find_matched_molecular_pairs(rows: &[SarRow]) -> Vec<MatchedMolecularPair> {
-    // Map canonical core SMILES -> list of (row_idx, r_group_smiles)
-    let mut index: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut index: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
 
     for (r_idx, row) in rows.iter().enumerate() {
-        let cuts = single_bond_cuts(&row.mol);
-        for (core, rgrp) in cuts {
+        for (core, rgrp) in single_bond_cuts_anchored(&row.mol) {
             index.entry(core).or_default().push((r_idx, rgrp));
         }
     }
@@ -94,7 +143,10 @@ pub fn find_matched_molecular_pairs(rows: &[SarRow]) -> Vec<MatchedMolecularPair
             for j in (i + 1)..hits.len() {
                 let (a_idx, ref ra) = hits[i];
                 let (b_idx, ref rb) = hits[j];
-                if a_idx == b_idx || ra == rb {
+                if a_idx == b_idx
+                    || ra == rb
+                    || rows[a_idx].structural_key == rows[b_idx].structural_key
+                {
                     continue;
                 }
                 let pair_key = if a_idx < b_idx {
@@ -132,11 +184,23 @@ pub fn find_matched_molecular_pairs(rows: &[SarRow]) -> Vec<MatchedMolecularPair
             }
         }
     }
+
+    out.sort_by(|a, b| {
+        let abs_a = a.delta_pic50.map_or(0.0, f64::abs);
+        let abs_b = b.delta_pic50.map_or(0.0, f64::abs);
+        abs_b
+            .total_cmp(&abs_a)
+            .then_with(|| a.core_smiles.cmp(&b.core_smiles))
+            .then_with(|| a.r_group_a.cmp(&b.r_group_a))
+            .then_with(|| a.r_group_b.cmp(&b.r_group_b))
+            .then_with(|| a.mol_a_name.cmp(&b.mol_a_name))
+            .then_with(|| a.mol_b_name.cmp(&b.mol_b_name))
+    });
     out.truncate(150);
     out
 }
 
-fn single_bond_cuts(mol: &MolGraph) -> Vec<(String, String)> {
+fn single_bond_cuts_anchored(mol: &MolGraph) -> Vec<(String, String)> {
     let total_heavy = mol.heavy_atom_count();
     if total_heavy < 6 {
         return Vec::new();
@@ -144,7 +208,7 @@ fn single_bond_cuts(mol: &MolGraph) -> Vec<(String, String)> {
     let mut res = Vec::new();
     for bid in 0..mol.bonds.len() {
         let b = &mol.bonds[bid];
-        if b.in_ring {
+        if b.in_ring || b.order != BondOrder::Single {
             continue;
         }
         let comp_u = component_without_bond(mol, b.u, bid);
@@ -154,18 +218,17 @@ fn single_bond_cuts(mol: &MolGraph) -> Vec<(String, String)> {
         if comp_u.is_empty() || comp_v.is_empty() {
             continue;
         }
-        // Core must be the larger scaffold, R-group at most 40% of molecule
-        let (core_nodes, r_nodes) = if comp_u.len() >= comp_v.len() {
-            (&comp_u, &comp_v)
+        let (core_nodes, core_cut, r_nodes, r_cut) = if comp_u.len() >= comp_v.len() {
+            (&comp_u, b.u, &comp_v, b.v)
         } else {
-            (&comp_v, &comp_u)
+            (&comp_v, b.v, &comp_u, b.u)
         };
         if core_nodes.len() < 5 || r_nodes.len() > (total_heavy / 2).max(1) {
             continue;
         }
         if let (Some(c_smi), Some(r_smi)) = (
-            induced_canonical(mol, core_nodes),
-            induced_canonical(mol, r_nodes),
+            induced_canonical_with_anchor(mol, core_nodes, core_cut),
+            induced_canonical_with_anchor(mol, r_nodes, r_cut),
         ) {
             res.push((c_smi, r_smi));
         }
@@ -188,12 +251,18 @@ fn component_without_bond(mol: &MolGraph, start: usize, ignored_bid: usize) -> B
     comp
 }
 
-fn induced_canonical(mol: &MolGraph, nodes: &BTreeSet<usize>) -> Option<String> {
+fn induced_canonical_with_anchor(
+    mol: &MolGraph,
+    nodes: &BTreeSet<usize>,
+    cut_atom: usize,
+) -> Option<String> {
     let mut sub = MolGraph::new();
     let mut remap = vec![None; mol.atoms.len()];
     for &old in nodes {
         let mut a = mol.atoms[old].clone();
         a.coords_2d = None;
+        a.chiral = mol_graph::ChiralTag::None;
+        a.chiral_h_slot = None;
         let nid = sub.add_atom(a);
         remap[old] = Some(nid);
     }
@@ -202,6 +271,10 @@ fn induced_canonical(mol: &MolGraph, nodes: &BTreeSet<usize>) -> Option<String> 
             let _ = sub.add_bond(nu, nv, b.order, b.stereo);
         }
     }
+    let anchor_id = remap[cut_atom]?;
+    let dummy = MolAtom::new(0, "*").ok()?;
+    let dummy_id = sub.add_atom(dummy);
+    let _ = sub.add_bond(anchor_id, dummy_id, BondOrder::Single, BondStereo::None);
     sub.perceive().ok()?;
     Some(sub.canonical_smiles())
 }

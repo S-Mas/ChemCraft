@@ -13,20 +13,28 @@ pub struct TabularMolRecord {
     pub columns: BTreeMap<String, String>,
 }
 
-/// Clean-room DataWarrior `.dwar` parser (skips optional `<datawarrior-fileinfo>` /
-/// `<column properties>` metadata headers, locates the SMILES & Name columns, and parses
-/// every row into a `MolGraph` plus numeric/categorical SAR metadata).
 pub fn parse_dwar(input: &str) -> Result<Vec<Result<TabularMolRecord, MolError>>, MolError> {
+    parse_dwar_with_limit(input, usize::MAX)
+}
+
+/// Clean-room DataWarrior `.dwar` parser stopping once `max_rows` records are read.
+/// Requires an explicit SMILES / Structure column header (never guesses column 0 blindly).
+pub fn parse_dwar_with_limit(
+    input: &str,
+    max_rows: usize,
+) -> Result<Vec<Result<TabularMolRecord, MolError>>, MolError> {
     if input.trim().is_empty() {
         return Err(MolError::EmptyInput);
     }
     let normalized = input.replace("\r\n", "\n");
-    let lines = normalized.lines().enumerate();
     let mut in_block: Option<&'static str> = None;
-    let mut header_cols: Option<Vec<String>> = None;
+    let mut header_cols: Option<(Vec<String>, usize, Option<usize>)> = None;
     let mut records = Vec::new();
 
-    for (ln, raw) in lines {
+    for (ln, raw) in normalized.lines().enumerate() {
+        if records.len() >= max_rows {
+            break;
+        }
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
@@ -46,41 +54,42 @@ pub fn parse_dwar(input: &str) -> Result<Vec<Result<TabularMolRecord, MolError>>
             continue;
         }
         if trimmed.starts_with('<') && trimmed.ends_with('>') {
-            // Stop before embedded hitlists/views trailers if present
             break;
         }
 
         let fields: Vec<String> = raw.split('\t').map(|s| s.trim().to_string()).collect();
         if header_cols.is_none() {
-            header_cols = Some(fields);
+            let smi_idx = fields
+                .iter()
+                .position(|h| {
+                    let norm = h.to_ascii_lowercase();
+                    norm == "smiles"
+                        || norm == "canonical smiles"
+                        || norm == "canonical_smiles"
+                        || norm.starts_with("structure of ")
+                        || norm == "structure"
+                })
+                .ok_or_else(|| MolError::InvalidDwar {
+                    line: ln + 1,
+                    msg: "missing SMILES / Structure column header in .dwar".to_string(),
+                })?;
+            let name_idx = fields.iter().position(|h| {
+                let norm = h.to_ascii_lowercase();
+                matches!(
+                    norm.as_str(),
+                    "id" | "name" | "molecule" | "compound" | "compound_id" | "molecule name"
+                )
+            });
+            header_cols = Some((fields, smi_idx, name_idx));
             continue;
         }
 
-        let Some(ref headers) = header_cols else {
+        let Some((ref headers, smi_idx, name_idx)) = header_cols else {
             return Err(MolError::InvalidDwar {
                 line: ln + 1,
                 msg: "missing header row".to_string(),
             });
         };
-
-        let smi_idx = headers
-            .iter()
-            .position(|h| {
-                let norm = h.to_ascii_lowercase();
-                norm == "smiles"
-                    || norm == "canonical smiles"
-                    || norm == "canonical_smiles"
-                    || norm.starts_with("structure of ")
-                    || norm == "structure"
-            })
-            .unwrap_or(0);
-        let name_idx = headers.iter().position(|h| {
-            let norm = h.to_ascii_lowercase();
-            matches!(
-                norm.as_str(),
-                "id" | "name" | "molecule" | "compound" | "compound_id" | "molecule name"
-            )
-        });
 
         let smi = fields.get(smi_idx).map(String::as_str).unwrap_or("").trim();
         if smi.is_empty() {
@@ -128,7 +137,6 @@ pub fn parse_dwar(input: &str) -> Result<Vec<Result<TabularMolRecord, MolError>>
     Ok(records)
 }
 
-/// Export molecules and SAR columns in clean-room `.dwar` format.
 pub fn write_dwar(rows: &[(&MolGraph, &BTreeMap<String, String>)]) -> String {
     let mut all_cols: Vec<String> = Vec::new();
     for (_, props) in rows {
@@ -174,8 +182,16 @@ pub fn write_dwar(rows: &[(&MolGraph, &BTreeMap<String, String>)]) -> String {
     out
 }
 
-/// Parse RFC-4180 CSV into `TabularMolRecord`s using `smiles`/`Canonical SMILES` and SAR columns.
 pub fn parse_csv_records(input: &str) -> Result<Vec<Result<TabularMolRecord, MolError>>, MolError> {
+    parse_csv_records_with_limit(input, usize::MAX)
+}
+
+/// Parse RFC-4180 CSV into at most `max_rows` `TabularMolRecord`s, requiring an explicit
+/// `smiles`/`canonical_smiles`/`smi` header column.
+pub fn parse_csv_records_with_limit(
+    input: &str,
+    max_rows: usize,
+) -> Result<Vec<Result<TabularMolRecord, MolError>>, MolError> {
     if input.trim().is_empty() {
         return Err(MolError::EmptyInput);
     }
@@ -194,7 +210,11 @@ pub fn parse_csv_records(input: &str) -> Result<Vec<Result<TabularMolRecord, Mol
             let norm = c.trim().to_ascii_lowercase().replace(' ', "_");
             matches!(norm.as_str(), "smiles" | "canonical_smiles" | "smi")
         })
-        .unwrap_or(0);
+        .ok_or_else(|| {
+            MolError::InvalidCsv(
+                "missing required 'smiles' / 'Canonical SMILES' column header".to_string(),
+            )
+        })?;
     let name_col = headers.iter().position(|c| {
         let norm = c.trim().to_ascii_lowercase().replace(' ', "_");
         matches!(
@@ -205,6 +225,9 @@ pub fn parse_csv_records(input: &str) -> Result<Vec<Result<TabularMolRecord, Mol
 
     let mut out = Vec::new();
     for (idx, rec_res) in rdr.records().enumerate() {
+        if out.len() >= max_rows {
+            break;
+        }
         let rec = match rec_res {
             Ok(r) => r,
             Err(e) => {

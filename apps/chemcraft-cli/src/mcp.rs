@@ -6,17 +6,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat, compute_admet_delta};
-use mol_engine::{MAX_READ_BYTES, PathSandbox};
+use mol_engine::PathSandbox;
 use mol_graph::{MolGraph, SmartsQuery, mutate_molecule, parse_smiles, write_sdf_v2000};
 use mol_sar::{MorganFp, SarFilter, SarTable};
 use mol_vector::{
-    SceneStyle, build_mol_scene, export_sar_grid_pdf_bytes, export_sar_grid_svg,
-    generate_2d_coords, scene_to_eps, scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
+    SceneStyle, build_mol_scene, export_sar_grid_eps, export_sar_grid_pdf_bytes,
+    export_sar_grid_png_bytes, export_sar_grid_svg, generate_2d_coords, scene_to_eps,
+    scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAX_MCP_MESSAGE_BYTES: usize = 1024 * 1024;
+pub const MAX_MCP_INPUT_FILE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MCP_MOLECULES: usize = 1_000;
 pub const MAX_TCP_CONNECTIONS: usize = 32;
 pub const TCP_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -655,10 +657,11 @@ fn tool_mutate_scaffold(args: &Value) -> Result<Value, String> {
     generate_2d_coords(&mut mutated);
     let new_smi = mutated.canonical_smiles();
     let old_smi = mol.canonical_smiles();
-    let (delta, eval) = match compute_admet_delta(&AdmetCraftProvider, &old_smi, &new_smi, name) {
-        Ok(res) => res,
-        Err(e) => return Ok(tool_err(format!("ADMET evaluation error: {e}"))),
-    };
+    let (delta, eval) =
+        match compute_admet_delta(&AdmetCraftProvider::default(), &old_smi, &new_smi, name) {
+            Ok(res) => res,
+            Err(e) => return Ok(tool_err(format!("ADMET evaluation error: {e}"))),
+        };
     let scene = build_mol_scene(&mutated, &SceneStyle::default(), &[]);
     let svg = scene_to_svg(&scene);
 
@@ -706,11 +709,11 @@ fn tool_search_substructure(args: &Value, sandbox: &PathSandbox) -> Result<Value
         return Err("'min_tanimoto' must be inside [0.0, 1.0]".to_string());
     }
 
-    let (resolved, text) = match sandbox.read_to_string_limited(Path::new(file_str), MAX_READ_BYTES)
-    {
-        Ok(res) => res,
-        Err(e) => return Ok(tool_err(format!("read sandbox error: {e}"))),
-    };
+    let (resolved, text) =
+        match sandbox.read_to_string_limited(Path::new(file_str), MAX_MCP_INPUT_FILE_BYTES) {
+            Ok(res) => res,
+            Err(e) => return Ok(tool_err(format!("read sandbox error: {e}"))),
+        };
 
     let mut table = SarTable::new();
     let ext = resolved
@@ -719,17 +722,14 @@ fn tool_search_substructure(args: &Value, sandbox: &PathSandbox) -> Result<Value
         .unwrap_or("")
         .to_ascii_lowercase();
     let load_res = if ext == "dwar" {
-        table.load_dwar_text(&text)
+        table.load_dwar_text_limited(&text, MAX_MCP_MOLECULES)
     } else if ext == "csv" {
-        table.load_csv_text(&text)
+        table.load_csv_text_limited(&text, MAX_MCP_MOLECULES)
     } else {
-        table.load_sdf_text(&text)
+        table.load_sdf_text_limited(&text, MAX_MCP_MOLECULES)
     };
     if let Err(e) = load_res {
         return Ok(tool_err(format!("parse error: {e}")));
-    }
-    if table.rows.len() > MAX_MCP_MOLECULES {
-        table.rows.truncate(MAX_MCP_MOLECULES);
     }
 
     let filter = SarFilter {
@@ -867,14 +867,9 @@ fn tool_export_vector_figure(args: &Value, sandbox: &PathSandbox) -> Result<Valu
             "pdf" => {
                 export_sar_grid_pdf_bytes(&refs, cols, 250.0, 210.0).map_err(|e| e.to_string())?
             }
-            "eps" => {
-                let scene = build_mol_scene(&mols[0], &SceneStyle::default(), &[]);
-                scene_to_eps(&scene).into_bytes()
-            }
-            "png" => {
-                let scene = build_mol_scene(&mols[0], &SceneStyle::default(), &[]);
-                scene_to_png_bytes(&scene, 2.0).map_err(|e| e.to_string())?
-            }
+            "eps" => export_sar_grid_eps(&refs, cols, 250.0, 210.0, false).into_bytes(),
+            "png" => export_sar_grid_png_bytes(&refs, cols, 250.0, 210.0, false, 2.0)
+                .map_err(|e| e.to_string())?,
             _ => unreachable!(),
         }
     };
@@ -925,7 +920,7 @@ fn tool_analyze_admet(args: &Value, sandbox: &PathSandbox) -> Result<Value, Stri
         items.push((smi, name));
     }
 
-    let provider = AdmetCraftProvider;
+    let provider = AdmetCraftProvider::default();
     let evals: Vec<_> = provider
         .evaluate_batch(&items)
         .into_iter()

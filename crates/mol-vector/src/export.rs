@@ -242,6 +242,87 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
         );
     }
 
+    append_eps_scene(&mut out, scene, 0.0, 0.0, h);
+    let _ = writeln!(out, "showpage\n%%EOF");
+    out
+}
+
+/// Export a multi-molecule SAR grid as Encapsulated PostScript (EPS 3.0).
+pub fn export_sar_grid_eps(
+    items: &[(&str, &MolGraph)],
+    cols: usize,
+    cell_w: f64,
+    cell_h: f64,
+    dark_mode: bool,
+) -> String {
+    let cols = cols.max(1);
+    let rows = items.len().div_ceil(cols).max(1);
+    let total_w = cols as f64 * cell_w;
+    let total_h = rows as f64 * cell_h;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "%!PS-Adobe-3.0 EPSF-3.0");
+    let _ = writeln!(
+        out,
+        "%%BoundingBox: 0 0 {} {}",
+        total_w.ceil() as i64,
+        total_h.ceil() as i64
+    );
+    let _ = writeln!(out, "%%Creator: ChemCraft mol-vector SAR Grid");
+    let _ = writeln!(out, "1 setlinecap 1 setlinejoin");
+    if dark_mode {
+        let _ = writeln!(
+            out,
+            "0.094 0.102 0.125 setrgbcolor 0 0 {total_w:.2} {total_h:.2} rectfill"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "1 1 1 setrgbcolor 0 0 {total_w:.2} {total_h:.2} rectfill"
+        );
+    }
+
+    let style = SceneStyle {
+        width: cell_w,
+        height: cell_h - 24.0,
+        padding: 18.0,
+        stroke_width: 1.4,
+        font_size: 11.0,
+        dark_mode,
+        show_stereo_labels: true,
+    };
+
+    for (idx, (title, mol)) in items.iter().enumerate() {
+        let r = idx / cols;
+        let c = idx % cols;
+        let ox = c as f64 * cell_w;
+        let oy = r as f64 * cell_h;
+        let py_bot = total_h - (oy + cell_h);
+        let _ = writeln!(
+            out,
+            "0.82 0.85 0.88 setrgbcolor 0.8 setlinewidth newpath {ox:.2} {py_bot:.2} {cell_w:.2} {cell_h:.2} rectstroke"
+        );
+        let scene = build_mol_scene(mol, &style, &[]);
+        append_eps_scene(&mut out, &scene, ox, oy, total_h);
+        let safe = escape_pdf_ps_text(&truncate_str(title, 26));
+        let title_col = if dark_mode {
+            "0.91 0.92 0.95"
+        } else {
+            "0.11 0.12 0.14"
+        };
+        let tx = ox + cell_w * 0.5;
+        let ty = total_h - (oy + cell_h - 9.0);
+        let _ = writeln!(
+            out,
+            "/Helvetica-Bold findfont 10 scalefont setfont {title_col} setrgbcolor {tx:.2} {ty:.2} moveto ({safe}) dup stringwidth pop -0.5 mul 0 rmoveto show"
+        );
+    }
+
+    let _ = writeln!(out, "showpage\n%%EOF");
+    out
+}
+
+fn append_eps_scene(out: &mut String, scene: &VectorScene, ox: f64, oy: f64, h: f64) {
     for el in &scene.elements {
         match el {
             VectorElement::Line {
@@ -262,10 +343,10 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
                     f64::from(color.0) / 255.0,
                     f64::from(color.1) / 255.0,
                     f64::from(color.2) / 255.0,
-                    x1,
-                    h - y1,
-                    x2,
-                    h - y2
+                    x1 + ox,
+                    h - (y1 + oy),
+                    x2 + ox,
+                    h - (y2 + oy)
                 );
                 if *dashed {
                     let _ = writeln!(out, "[] 0 setdash");
@@ -284,11 +365,11 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
                         f64::from(color.0) / 255.0,
                         f64::from(color.1) / 255.0,
                         f64::from(color.2) / 255.0,
-                        first[0],
-                        h - first[1]
+                        first[0] + ox,
+                        h - (first[1] + oy)
                     );
                     for p in &points[1..] {
-                        let _ = writeln!(out, "{:.2} {:.2} lineto", p[0], h - p[1]);
+                        let _ = writeln!(out, "{:.2} {:.2} lineto", p[0] + ox, h - (p[1] + oy));
                     }
                     let _ = writeln!(out, "stroke");
                 }
@@ -301,11 +382,11 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
                         f64::from(fill.0) / 255.0,
                         f64::from(fill.1) / 255.0,
                         f64::from(fill.2) / 255.0,
-                        first[0],
-                        h - first[1]
+                        first[0] + ox,
+                        h - (first[1] + oy)
                     );
                     for p in &points[1..] {
-                        let _ = writeln!(out, "{:.2} {:.2} lineto", p[0], h - p[1]);
+                        let _ = writeln!(out, "{:.2} {:.2} lineto", p[0] + ox, h - (p[1] + oy));
                     }
                     let _ = writeln!(out, "closepath fill");
                 }
@@ -324,19 +405,34 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
                     f64::from(color.0) / 255.0,
                     f64::from(color.1) / 255.0,
                     f64::from(color.2) / 255.0,
-                    p0[0],
-                    h - p0[1],
-                    p1[0],
-                    h - p1[1],
-                    p2[0],
-                    h - p2[1],
-                    p3[0],
-                    h - p3[1]
+                    p0[0] + ox,
+                    h - (p0[1] + oy),
+                    p1[0] + ox,
+                    h - (p1[1] + oy),
+                    p2[0] + ox,
+                    h - (p2[1] + oy),
+                    p3[0] + ox,
+                    h - (p3[1] + oy)
                 );
             }
             VectorElement::Circle {
-                cx, cy, r, stroke, ..
+                cx,
+                cy,
+                r,
+                fill,
+                stroke,
             } => {
+                if let Some(f) = fill {
+                    let _ = writeln!(
+                        out,
+                        "{:.3} {:.3} {:.3} setrgbcolor newpath {:.2} {:.2} {r:.2} 0 360 arc fill",
+                        f64::from(f.0) / 255.0,
+                        f64::from(f.1) / 255.0,
+                        f64::from(f.2) / 255.0,
+                        cx + ox,
+                        h - (cy + oy)
+                    );
+                }
                 if let Some((c, w)) = stroke {
                     let _ = writeln!(
                         out,
@@ -344,8 +440,8 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
                         f64::from(c.0) / 255.0,
                         f64::from(c.1) / 255.0,
                         f64::from(c.2) / 255.0,
-                        cx,
-                        h - cy
+                        cx + ox,
+                        h - (cy + oy)
                     );
                 }
             }
@@ -364,15 +460,13 @@ pub fn scene_to_eps(scene: &VectorScene) -> String {
                     f64::from(color.0) / 255.0,
                     f64::from(color.1) / 255.0,
                     f64::from(color.2) / 255.0,
-                    cx,
-                    h - cy,
+                    cx + ox,
+                    h - (cy + oy),
                     -font_size * 0.32
                 );
             }
         }
     }
-    let _ = writeln!(out, "showpage\n%%EOF");
-    out
 }
 
 /// Export a `VectorScene` as a compressed pure-Rust `FlateDecode` vector PDF 1.4.
@@ -539,7 +633,87 @@ fn append_pdf_scene(stream: &mut String, scene: &VectorScene, ox: f64, oy: f64, 
                     page_h - (p3[1] + oy)
                 );
             }
-            VectorElement::Circle { .. } => {}
+            VectorElement::Circle {
+                cx,
+                cy,
+                r,
+                fill,
+                stroke,
+            } => {
+                let x = cx + ox;
+                let y = page_h - (cy + oy);
+                let k = r * 0.552_284_749_8;
+                if let Some(f) = fill {
+                    let _ = writeln!(
+                        stream,
+                        "{:.3} {:.3} {:.3} rg {:.2} {:.2} m {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c f",
+                        f64::from(f.0) / 255.0,
+                        f64::from(f.1) / 255.0,
+                        f64::from(f.2) / 255.0,
+                        x + r,
+                        y,
+                        x + r,
+                        y + k,
+                        x + k,
+                        y + r,
+                        x,
+                        y + r,
+                        x - k,
+                        y + r,
+                        x - r,
+                        y + k,
+                        x - r,
+                        y,
+                        x - r,
+                        y - k,
+                        x - k,
+                        y - r,
+                        x,
+                        y - r,
+                        x + k,
+                        y - r,
+                        x + r,
+                        y - k,
+                        x + r,
+                        y
+                    );
+                }
+                if let Some((c, w)) = stroke {
+                    let _ = writeln!(
+                        stream,
+                        "{:.3} {:.3} {:.3} RG {w:.2} w {:.2} {:.2} m {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c S",
+                        f64::from(c.0) / 255.0,
+                        f64::from(c.1) / 255.0,
+                        f64::from(c.2) / 255.0,
+                        x + r,
+                        y,
+                        x + r,
+                        y + k,
+                        x + k,
+                        y + r,
+                        x,
+                        y + r,
+                        x - k,
+                        y + r,
+                        x - r,
+                        y + k,
+                        x - r,
+                        y,
+                        x - r,
+                        y - k,
+                        x - k,
+                        y - r,
+                        x,
+                        y - r,
+                        x + k,
+                        y - r,
+                        x + r,
+                        y - k,
+                        x + r,
+                        y
+                    );
+                }
+            }
             VectorElement::Label {
                 text,
                 cx,
@@ -639,7 +813,110 @@ pub fn scene_to_png_bytes(scene: &VectorScene, scale: f64) -> Result<Vec<u8>, Ve
         pixmap.fill(Color::from_rgba8(bg.0, bg.1, bg.2, bg.3));
     }
     let xform = Transform::from_scale(sc as f32, sc as f32);
+    render_scene_onto_pixmap(&mut pixmap, scene, xform);
+    encode_pixmap_png(&pixmap)
+}
 
+/// Rasterize a multi-molecule SAR grid to an anti-aliased RGBA PNG buffer.
+pub fn export_sar_grid_png_bytes(
+    items: &[(&str, &MolGraph)],
+    cols: usize,
+    cell_w: f64,
+    cell_h: f64,
+    dark_mode: bool,
+    scale: f64,
+) -> Result<Vec<u8>, VectorError> {
+    let cols = cols.max(1);
+    let rows = items.len().div_ceil(cols).max(1);
+    let total_w = cols as f64 * cell_w;
+    let total_h = rows as f64 * cell_h;
+    let sc = scale.clamp(0.5, 4.0);
+    let px_w = ((total_w * sc).round() as u32).max(16);
+    let px_h = ((total_h * sc).round() as u32).max(16);
+    let mut pixmap = Pixmap::new(px_w, px_h).ok_or(VectorError::Dimensions)?;
+    let bg = if dark_mode {
+        Color::from_rgba8(24, 26, 32, 255)
+    } else {
+        Color::from_rgba8(255, 255, 255, 255)
+    };
+    pixmap.fill(bg);
+
+    let style = SceneStyle {
+        width: cell_w,
+        height: cell_h - 24.0,
+        padding: 18.0,
+        stroke_width: 1.4,
+        font_size: 11.0,
+        dark_mode,
+        show_stereo_labels: true,
+    };
+
+    let border_col = Rgba(210, 215, 222, 255);
+    let title_col = if dark_mode {
+        Rgba(232, 236, 242, 255)
+    } else {
+        Rgba(28, 30, 36, 255)
+    };
+
+    for (idx, (title, mol)) in items.iter().enumerate() {
+        let r = idx / cols;
+        let c = idx % cols;
+        let ox = c as f64 * cell_w;
+        let oy = r as f64 * cell_h;
+        let xform = Transform::from_scale(sc as f32, sc as f32).pre_translate(ox as f32, oy as f32);
+
+        let mut pb = PathBuilder::new();
+        pb.push_rect(
+            tiny_skia::Rect::from_xywh(0.0, 0.0, cell_w as f32, cell_h as f32)
+                .ok_or(VectorError::Dimensions)?,
+        );
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(border_col.0, border_col.1, border_col.2, border_col.3);
+        if let Some(p) = pb.finish() {
+            pixmap.stroke_path(
+                &p,
+                &paint,
+                &Stroke {
+                    width: 1.0,
+                    ..Stroke::default()
+                },
+                xform,
+                None,
+            );
+        }
+        let scene = build_mol_scene(mol, &style, &[]);
+        render_scene_onto_pixmap(&mut pixmap, &scene, xform);
+        draw_vector_glyph_label(
+            &mut pixmap,
+            &truncate_str(title, 22),
+            cell_w * 0.5,
+            cell_h - 11.0,
+            9.5,
+            title_col,
+            xform,
+        );
+    }
+
+    encode_pixmap_png(&pixmap)
+}
+
+fn encode_pixmap_png(pixmap: &Pixmap) -> Result<Vec<u8>, VectorError> {
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, pixmap.width(), pixmap.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| VectorError::Png(e.to_string()))?;
+        writer
+            .write_image_data(pixmap.data())
+            .map_err(|e| VectorError::Png(e.to_string()))?;
+    }
+    Ok(png_bytes)
+}
+
+fn render_scene_onto_pixmap(pixmap: &mut Pixmap, scene: &VectorScene, xform: Transform) {
     for el in &scene.elements {
         match el {
             VectorElement::Line {
@@ -781,24 +1058,10 @@ pub fn scene_to_png_bytes(scene: &VectorScene, scale: f64) -> Result<Vec<u8>, Ve
                 color,
                 ..
             } => {
-                draw_vector_glyph_label(&mut pixmap, text, *cx, *cy, *font_size, *color, xform);
+                draw_vector_glyph_label(pixmap, text, *cx, *cy, *font_size, *color, xform);
             }
         }
     }
-
-    let mut png_bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut png_bytes, px_w, px_h);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| VectorError::Png(e.to_string()))?;
-        writer
-            .write_image_data(pixmap.data())
-            .map_err(|e| VectorError::Png(e.to_string()))?;
-    }
-    Ok(png_bytes)
 }
 
 /// Crisp geometric stroke-font renderer for PNG export (zero system font dependencies).
@@ -987,6 +1250,10 @@ fn escape_pdf_ps_text(s: &str) -> String {
             ')' => out.push_str("\\)"),
             '\\' => out.push_str("\\\\"),
             c if c.is_ascii() && !c.is_control() => out.push(c),
+            '\u{00A0}'..='\u{00FF}' => {
+                let code = c as u32;
+                let _ = write!(out, "\\{code:03o}");
+            }
             _ => out.push('?'),
         }
     }

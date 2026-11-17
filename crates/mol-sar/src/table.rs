@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use mol_admet_bridge::{AdmetProvider, AdmetSummary, MoleculeEvaluation};
 use mol_graph::{
-    MolError, MolGraph, SmartsQuery, parse_csv_records, parse_dwar, parse_sdf, parse_smiles,
+    MolError, MolGraph, SmartsQuery, parse_csv_records_with_limit, parse_dwar_with_limit,
+    parse_sdf_with_limit, parse_smiles,
 };
 
 use crate::fp::MorganFp;
@@ -16,6 +17,7 @@ pub struct SarRow {
     pub id: usize,
     pub name: String,
     pub canonical_smiles: String,
+    pub structural_key: String,
     pub formula: String,
     pub mw: f64,
     pub heavy_atoms: usize,
@@ -85,6 +87,7 @@ impl SarTable {
             .clone()
             .unwrap_or_else(|| format!("Compound_{}", id + 1));
         let canonical_smiles = mol.canonical_smiles();
+        let structural_key = mol.structural_key();
         let formula = mol.formula();
         let mw = mol.molecular_weight();
         let heavy_atoms = mol.heavy_atom_count();
@@ -100,6 +103,7 @@ impl SarTable {
             id,
             name,
             canonical_smiles,
+            structural_key,
             formula,
             mw,
             heavy_atoms,
@@ -116,7 +120,11 @@ impl SarTable {
 
     /// Import compounds from SDF (V2000/V3000) text.
     pub fn load_sdf_text(&mut self, text: &str) -> Result<usize, MolError> {
-        let parsed = parse_sdf(text);
+        self.load_sdf_text_limited(text, usize::MAX)
+    }
+
+    pub fn load_sdf_text_limited(&mut self, text: &str, limit: usize) -> Result<usize, MolError> {
+        let parsed = parse_sdf_with_limit(text, limit);
         let mut added = 0usize;
         for mol in parsed.into_iter().flatten() {
             self.add_molecule(mol, None, None);
@@ -130,7 +138,11 @@ impl SarTable {
 
     /// Import compounds from `.dwar` DataWarrior text.
     pub fn load_dwar_text(&mut self, text: &str) -> Result<usize, MolError> {
-        let parsed = parse_dwar(text)?;
+        self.load_dwar_text_limited(text, usize::MAX)
+    }
+
+    pub fn load_dwar_text_limited(&mut self, text: &str, limit: usize) -> Result<usize, MolError> {
+        let parsed = parse_dwar_with_limit(text, limit)?;
         let mut added = 0usize;
         for item in parsed.into_iter().flatten() {
             self.add_molecule(item.mol, None, None);
@@ -144,7 +156,11 @@ impl SarTable {
 
     /// Import compounds from CSV text.
     pub fn load_csv_text(&mut self, text: &str) -> Result<usize, MolError> {
-        let parsed = parse_csv_records(text)?;
+        self.load_csv_text_limited(text, usize::MAX)
+    }
+
+    pub fn load_csv_text_limited(&mut self, text: &str, limit: usize) -> Result<usize, MolError> {
+        let parsed = parse_csv_records_with_limit(text, limit)?;
         let mut added = 0usize;
         for item in parsed.into_iter().flatten() {
             self.add_molecule(item.mol, None, None);

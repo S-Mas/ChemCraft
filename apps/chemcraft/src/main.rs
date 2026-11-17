@@ -176,7 +176,7 @@ impl ChemCraftApp {
         };
         match sb.open_write(std::path::Path::new(filename)) {
             Ok((resolved, mut f)) => {
-                match AdmetCraftProvider.export_report_to_writer(&evals, &mut f, fmt) {
+                match AdmetCraftProvider::default().export_report_to_writer(&evals, &mut f, fmt) {
                     Ok(()) => {
                         self.status_msg =
                             format!("Exported AdmetCraft report -> {}", resolved.display())
@@ -818,10 +818,11 @@ impl eframe::App for ChemCraftApp {
                     && let Some(aid) = self.drag_start_atom
                 {
                     let delta = resp.drag_delta();
+                    let scale = scene.world_scale.max(1e-6);
                     let mut mol = (*self.session.canvas_mol).clone();
                     if let Some(Some(coords)) = mol.atoms.get_mut(aid).map(|a| &mut a.coords_2d) {
-                        coords[0] += f64::from(delta.x) / 28.0;
-                        coords[1] -= f64::from(delta.y) / 28.0;
+                        coords[0] += f64::from(delta.x) / scale;
+                        coords[1] -= f64::from(delta.y) / scale;
                     }
                     self.session.canvas_mol = std::sync::Arc::new(mol);
                 }
@@ -833,8 +834,8 @@ impl eframe::App for ChemCraftApp {
             if resp.clicked()
                 && let Some(cp) = resp.interact_pointer_pos()
             {
-                let wx = f64::from(cp.x - rect.min.x) / 28.0;
-                let wy = -f64::from(cp.y - rect.min.y) / 28.0;
+                let [wx, wy] = scene
+                    .screen_to_world(f64::from(cp.x - rect.min.x), f64::from(cp.y - rect.min.y));
                 match self.tool {
                     DrawTool::Ring(r) => {
                         self.run_cmd(Command::StampRing {

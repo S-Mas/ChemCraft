@@ -27,11 +27,18 @@ impl MorganFp {
             .map(|i| {
                 let a = &mol.atoms[i];
                 let deg = mol.adj[i].len() as u64;
+                let cip = match a.cip_label {
+                    Some('R') => 1u64,
+                    Some('S') => 2u64,
+                    _ => 0u64,
+                };
                 let mut h = mix64(0x9e37_79b9_7f4a_7c15 ^ u64::from(a.atomic_number));
                 h = mix64(h ^ (deg << 8));
                 h = mix64(h ^ (u64::from(a.total_h()) << 16));
                 h = mix64(h ^ ((a.formal_charge as i64 as u64) << 24));
-                h = mix64(h ^ (u64::from(a.aromatic) << 32) ^ (u64::from(a.in_ring) << 33));
+                h = mix64(
+                    h ^ (u64::from(a.aromatic) << 32) ^ (u64::from(a.in_ring) << 33) ^ (cip << 36),
+                );
                 fp.set_hash(h);
                 h
             })
@@ -50,7 +57,12 @@ impl MorganFp {
                             BondOrder::Aromatic => 4,
                             BondOrder::Dative => 5,
                         };
-                        (bo, inv[nbr])
+                        let ez = match mol.bonds[bid].cis_trans {
+                            mol_graph::BondCisTrans::None => 0u64,
+                            mol_graph::BondCisTrans::E => 1,
+                            mol_graph::BondCisTrans::Z => 2,
+                        };
+                        ((bo << 2) | ez, inv[nbr])
                     })
                     .collect();
                 nbr_tags.sort_unstable();

@@ -10,6 +10,13 @@ pub struct ElementMeta {
 
 static ELEMENTS: &[ElementMeta] = &[
     ElementMeta {
+        atomic_number: 0,
+        symbol: "*",
+        atomic_weight: 0.0,
+        electronegativity: 0.0,
+        default_valences: &[1],
+    },
+    ElementMeta {
         atomic_number: 1,
         symbol: "H",
         atomic_weight: 1.008,
@@ -133,7 +140,7 @@ static ELEMENTS: &[ElementMeta] = &[
         symbol: "Fe",
         atomic_weight: 55.845,
         electronegativity: 1.83,
-        default_valences: &[2, 3],
+        default_valences: &[2, 3, 10],
     },
     ElementMeta {
         atomic_number: 29,
@@ -164,6 +171,27 @@ static ELEMENTS: &[ElementMeta] = &[
         default_valences: &[1],
     },
     ElementMeta {
+        atomic_number: 44,
+        symbol: "Ru",
+        atomic_weight: 101.07,
+        electronegativity: 2.20,
+        default_valences: &[2, 3, 4, 8],
+    },
+    ElementMeta {
+        atomic_number: 45,
+        symbol: "Rh",
+        atomic_weight: 102.91,
+        electronegativity: 2.28,
+        default_valences: &[1, 3],
+    },
+    ElementMeta {
+        atomic_number: 46,
+        symbol: "Pd",
+        atomic_weight: 106.42,
+        electronegativity: 2.20,
+        default_valences: &[2, 4],
+    },
+    ElementMeta {
         atomic_number: 47,
         symbol: "Ag",
         atomic_weight: 107.868,
@@ -184,35 +212,43 @@ static ELEMENTS: &[ElementMeta] = &[
         electronegativity: 0.89,
         default_valences: &[2],
     },
+    ElementMeta {
+        atomic_number: 78,
+        symbol: "Pt",
+        atomic_weight: 195.084,
+        electronegativity: 2.28,
+        default_valences: &[2, 4],
+    },
 ];
 
-/// Look up element metadata by symbol (case-insensitive for canonical organic/inorganic symbols).
 pub fn element_by_symbol(sym: &str) -> Option<&'static ElementMeta> {
     ELEMENTS.iter().find(|e| e.symbol.eq_ignore_ascii_case(sym))
 }
 
-/// Look up element metadata by atomic number.
 pub fn element_by_number(z: u8) -> Option<&'static ElementMeta> {
     ELEMENTS.iter().find(|e| e.atomic_number == z)
 }
 
-/// Standard maximum neutral valence used by interactive valence error checks.
 pub fn max_neutral_valence(symbol: &str, formal_charge: i8) -> u8 {
     let base = match symbol {
-        "H" | "F" | "Cl" | "Br" | "I" | "Li" | "Na" | "K" => 1,
+        "*" | "H" | "F" | "Cl" | "Br" | "I" | "Li" | "Na" | "K" => 1,
         "O" => 2,
-        "N" => 3, // N+ can have 4
-        "B" => 3, // B- can have 4
+        "N" => 3,
+        "B" => 3,
         "C" | "Si" => 4,
         "P" => 5,
         "S" | "Se" => 6,
-        _ => 6,
+        _ => 12,
     };
     match (symbol, formal_charge) {
         ("N", c) if c > 0 => 4,
+        ("N", c) if c < 0 => 2,
         ("O", c) if c > 0 => 3,
+        ("O", c) if c < 0 => 1,
+        ("S", c) if c < 0 => 1,
         ("B", c) if c < 0 => 4,
         ("C", c) if c < 0 => 3,
+        ("F" | "Cl" | "Br" | "I", c) if c < 0 => 0,
         _ => base,
     }
 }

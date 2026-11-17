@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use crate::error::MolError;
 use crate::mol::{BondOrder, MolAtom, MolGraph};
 
-/// Compiled clean-room SMARTS query graph supporting atom/bond primitives, boolean OR `,`,
-/// negation `!`, ring constraints `R`/`rN`, degree `D`, total H `H`, and charge.
+/// Compiled clean-room SMARTS query graph supporting atom/bond primitives,
+/// precedence (`;` low-AND > `,` OR > `&`/juxtaposed high-AND), `!` negation,
+/// `[R]`/`[RN]`/`[rN]`, `D`, `H`, `#Z`, and bounded charge `[-15, +15]`.
 #[derive(Debug, Clone)]
 pub struct SmartsQuery {
     nodes: Vec<SmartsNode>,
@@ -12,9 +13,10 @@ pub struct SmartsQuery {
     adj: Vec<Vec<(usize, usize)>>,
 }
 
+/// Top-level conjunction of comma-separated OR-clauses (`a,b;c` => `(a OR b) AND c`).
 #[derive(Debug, Clone)]
 struct SmartsNode {
-    alternatives: Vec<Vec<AtomPred>>, // comma-separated OR clauses of AND primitives
+    semi_conjuncts: Vec<Vec<Vec<AtomPred>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,7 +27,8 @@ enum AtomPred {
     AnyAliphatic,
     Element { sym: String, aromatic: Option<bool> },
     AtomicNum(u8),
-    InRing(Option<bool>),
+    InRing(bool),
+    RingCount(usize),
     RingSize(usize),
     TotalH(u8),
     Degree(usize),
@@ -46,7 +49,6 @@ enum BondCond {
 }
 
 impl SmartsQuery {
-    /// Parse a SMARTS pattern string cleanly.
     pub fn parse(pattern: &str) -> Result<Self, MolError> {
         let s = pattern.trim();
         if s.is_empty() {
@@ -207,7 +209,7 @@ impl SmartsQuery {
                     };
                     let nid = nodes.len();
                     nodes.push(SmartsNode {
-                        alternatives: vec![vec![pred]],
+                        semi_conjuncts: vec![vec![vec![pred]]],
                     });
                     adj.push(Vec::new());
                     if let Some(prev) = current {
@@ -239,12 +241,10 @@ impl SmartsQuery {
         Ok(Self { nodes, edges, adj })
     }
 
-    /// True if `mol` contains at least one match of this SMARTS pattern.
     pub fn matches(&self, mol: &MolGraph) -> bool {
         !self.find_matches(mol, true).is_empty()
     }
 
-    /// Return atom mappings `[target_atom_idx_for_q0, ...]` matching this pattern.
     pub fn find_all_matches(&self, mol: &MolGraph) -> Vec<Vec<usize>> {
         self.find_matches(mol, false)
     }
@@ -286,7 +286,6 @@ impl SmartsQuery {
             results.push(mapping.to_vec());
             return;
         }
-        // Restrict candidate target atoms using already-mapped neighbors of q_idx
         let prev_req: Vec<(usize, BondCond)> = self.adj[q_idx]
             .iter()
             .filter_map(|&(qn, eid)| {
@@ -329,35 +328,55 @@ impl SmartsQuery {
     }
 }
 
+/// Precedence per Daylight SMARTS: `;` (lowest AND) -> `,` (OR) -> `&` / juxtaposed (highest AND).
 fn parse_smarts_bracket(inner: &str, base_pos: usize) -> Result<SmartsNode, MolError> {
-    let mut alternatives = Vec::new();
-    for part in inner.split(',') {
-        let mut preds = Vec::new();
-        let bytes = part.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let neg = bytes[i] == b'!';
-            if neg {
-                i += 1;
-            }
-            if bytes.get(i) == Some(&b';') || bytes.get(i) == Some(&b'&') {
-                i += 1;
-                continue;
-            }
-            let (pred, next_i) = parse_single_pred(bytes, i, base_pos + i)?;
-            preds.push(if neg {
-                AtomPred::Negated(Box::new(pred))
-            } else {
-                pred
-            });
-            i = next_i;
-            while bytes.get(i) == Some(&b';') || bytes.get(i) == Some(&b'&') {
-                i += 1;
-            }
-        }
-        alternatives.push(preds);
+    if inner.trim().is_empty() {
+        return Err(MolError::InvalidSmarts {
+            pos: base_pos,
+            msg: "empty bracket expression '[]'".to_string(),
+        });
     }
-    Ok(SmartsNode { alternatives })
+    let mut semi_conjuncts = Vec::new();
+    for semi_part in inner.split(';') {
+        if semi_part.is_empty() {
+            return Err(MolError::InvalidSmarts {
+                pos: base_pos,
+                msg: "empty ';' clause in SMARTS".to_string(),
+            });
+        }
+        let mut or_branches = Vec::new();
+        for or_part in semi_part.split(',') {
+            if or_part.is_empty() {
+                return Err(MolError::InvalidSmarts {
+                    pos: base_pos,
+                    msg: "empty ',' branch in SMARTS".to_string(),
+                });
+            }
+            let mut preds = Vec::new();
+            let bytes = or_part.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'&' {
+                    i += 1;
+                    continue;
+                }
+                let neg = bytes[i] == b'!';
+                if neg {
+                    i += 1;
+                }
+                let (pred, next_i) = parse_single_pred(bytes, i, base_pos + i)?;
+                preds.push(if neg {
+                    AtomPred::Negated(Box::new(pred))
+                } else {
+                    pred
+                });
+                i = next_i;
+            }
+            or_branches.push(preds);
+        }
+        semi_conjuncts.push(or_branches);
+    }
+    Ok(SmartsNode { semi_conjuncts })
 }
 
 fn parse_single_pred(
@@ -381,20 +400,24 @@ fn parse_single_pred(
                 pos: err_pos,
                 msg: "expected atomic number after '#'".to_string(),
             })?;
-            Ok((AtomPred::AtomicNum(z as u8), next_i))
+            let z_u8 = u8::try_from(z).map_err(|_| MolError::InvalidSmarts {
+                pos: err_pos,
+                msg: format!("atomic number #{z} out of u8 range"),
+            })?;
+            Ok((AtomPred::AtomicNum(z_u8), next_i))
         }
         b'R' => {
-            if let Some((_n, next_i)) = read_u32(bytes, pos + 1) {
-                Ok((AtomPred::InRing(Some(true)), next_i))
+            if let Some((n, next_i)) = read_u32(bytes, pos + 1) {
+                Ok((AtomPred::RingCount(n as usize), next_i))
             } else {
-                Ok((AtomPred::InRing(Some(true)), pos + 1))
+                Ok((AtomPred::InRing(true), pos + 1))
             }
         }
         b'r' => {
             if let Some((n, next_i)) = read_u32(bytes, pos + 1) {
                 Ok((AtomPred::RingSize(n as usize), next_i))
             } else {
-                Ok((AtomPred::InRing(Some(true)), pos + 1))
+                Ok((AtomPred::InRing(true), pos + 1))
             }
         }
         b'D' => {
@@ -403,15 +426,43 @@ fn parse_single_pred(
         }
         b'H' => {
             let (h, next_i) = read_u32(bytes, pos + 1).unwrap_or((1, pos + 1));
-            Ok((AtomPred::TotalH(h as u8), next_i))
+            let h_u8 = u8::try_from(h).map_err(|_| MolError::InvalidSmarts {
+                pos: err_pos,
+                msg: format!("H count {h} out of range"),
+            })?;
+            Ok((AtomPred::TotalH(h_u8), next_i))
         }
-        b'+' => {
-            let (c, next_i) = read_u32(bytes, pos + 1).unwrap_or((1, pos + 1));
-            Ok((AtomPred::Charge(c as i8), next_i))
-        }
-        b'-' => {
-            let (c, next_i) = read_u32(bytes, pos + 1).unwrap_or((1, pos + 1));
-            Ok((AtomPred::Charge(-(c as i8)), next_i))
+        b'+' | b'-' => {
+            let sign: i32 = if ch == b'+' { 1 } else { -1 };
+            let (mag, next_i) = if let Some((v, ni)) = read_u32(bytes, pos + 1) {
+                let mag_i32 = i32::try_from(v).map_err(|_| MolError::InvalidSmarts {
+                    pos: err_pos,
+                    msg: "formal charge integer overflow".to_string(),
+                })?;
+                (mag_i32, ni)
+            } else {
+                let mut count = 1i32;
+                let mut k = pos + 1;
+                while bytes.get(k) == Some(&ch) {
+                    count += 1;
+                    if count > 15 {
+                        return Err(MolError::InvalidSmarts {
+                            pos: err_pos,
+                            msg: "formal charge magnitude exceeds [-15, +15]".to_string(),
+                        });
+                    }
+                    k += 1;
+                }
+                (count, k)
+            };
+            let charge = sign.saturating_mul(mag);
+            if !(-15..=15).contains(&charge) {
+                return Err(MolError::InvalidSmarts {
+                    pos: err_pos,
+                    msg: format!("formal charge {charge} outside [-15, +15]"),
+                });
+            }
+            Ok((AtomPred::Charge(charge as i8), next_i))
         }
         _ => {
             if ch.is_ascii_alphabetic() {
@@ -465,9 +516,11 @@ fn read_u32(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
 }
 
 fn node_matches(node: &SmartsNode, atom: &MolAtom, mol: &MolGraph) -> bool {
-    node.alternatives
-        .iter()
-        .any(|conj| conj.iter().all(|p| pred_matches(p, atom, mol)))
+    node.semi_conjuncts.iter().all(|or_branches| {
+        or_branches
+            .iter()
+            .any(|and_preds| and_preds.iter().all(|p| pred_matches(p, atom, mol)))
+    })
 }
 
 fn pred_matches(pred: &AtomPred, atom: &MolAtom, mol: &MolGraph) -> bool {
@@ -480,7 +533,10 @@ fn pred_matches(pred: &AtomPred, atom: &MolAtom, mol: &MolGraph) -> bool {
             atom.symbol == *sym && aromatic.is_none_or(|ar| atom.aromatic == ar)
         }
         AtomPred::AtomicNum(z) => atom.atomic_number == *z,
-        AtomPred::InRing(flag) => flag.map_or(atom.in_ring, |req| atom.in_ring == req),
+        AtomPred::InRing(req) => atom.in_ring == *req,
+        AtomPred::RingCount(cnt) => {
+            mol.rings.iter().filter(|r| r.contains(&atom.id)).count() == *cnt
+        }
         AtomPred::RingSize(sz) => atom.ring_sizes.contains(sz),
         AtomPred::TotalH(h) => atom.total_h() == *h,
         AtomPred::Degree(d) => mol.adj[atom.id].len() == *d,

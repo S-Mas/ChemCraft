@@ -86,4 +86,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
+
+    #[test]
+    fn zip_decompression_bomb_and_4000_openat2_dir_races_are_blocked()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use flate2::{Compression, write::DeflateEncoder};
+        use std::io::Write;
+
+        // 1. Decompression bomb test: ~40 MB zeros compressed to tiny archive declaring uncomp=42 bytes
+        let huge = vec![b' '; 40 * 1024 * 1024];
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&huge)?;
+        let comp = enc.finish()?;
+        let mut zip = Vec::new();
+        zip.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&42u32.to_le_bytes()); // spoofed 42-byte header!
+        zip.extend_from_slice(&13u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(b"manifest.json");
+        zip.extend_from_slice(&comp);
+        assert!(matches!(
+            decode_chemcraft_zip(&zip),
+            Err(ProjectError::InvalidArchive(_))
+        ));
+
+        // 2. 4,000 intermediate-directory symlink swap race test
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
+            let base = std::env::temp_dir().join("chemcraft_sb_race_4k");
+            let _ = std::fs::remove_dir_all(&base);
+            let r = base.join("read");
+            let w = base.join("write");
+            let outside = base.join("outside");
+            std::fs::create_dir_all(r.join("sub"))?;
+            std::fs::create_dir_all(w.join("sub"))?;
+            std::fs::create_dir_all(&outside)?;
+            std::fs::write(outside.join("leak.smi"), "SECRET_OUTSIDE")?;
+            std::fs::write(r.join("sub/leak.smi"), "SAFE_INSIDE")?;
+
+            let sb = PathSandbox::new(Some(&r), Some(&w))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_r = Arc::clone(&stop);
+            let r_link = r.join("sub");
+            let w_link = w.join("sub");
+
+            let racer = std::thread::spawn(move || {
+                let mut t = false;
+                while !stop_r.load(Ordering::Relaxed) {
+                    t = !t;
+                    let _ = std::fs::remove_file(&r_link);
+                    let _ = std::fs::remove_dir_all(&r_link);
+                    let _ = std::fs::remove_file(&w_link);
+                    let _ = std::fs::remove_dir_all(&w_link);
+                    if t {
+                        let _ = symlink(&outside, &r_link);
+                        let _ = symlink(&outside, &w_link);
+                    } else {
+                        let _ = std::fs::create_dir(&r_link);
+                        let _ = std::fs::write(r_link.join("leak.smi"), "SAFE_INSIDE");
+                        let _ = std::fs::create_dir(&w_link);
+                    }
+                }
+            });
+
+            for _ in 0..4_000 {
+                if let Ok((_, txt)) =
+                    sb.read_to_string_limited(std::path::Path::new("sub/leak.smi"), 1024)
+                {
+                    assert_ne!(txt, "SECRET_OUTSIDE", "leaked outside read-root!");
+                }
+                if let Ok((_, mut f)) = sb.open_write(std::path::Path::new("sub/pwn.svg")) {
+                    let _ = f.write_all(b"x");
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let _ = racer.join();
+            assert!(
+                !base.join("outside/pwn.svg").exists(),
+                "wrote outside write-root!"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        Ok(())
+    }
 }

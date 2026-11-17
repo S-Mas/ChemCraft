@@ -105,7 +105,7 @@ impl ChemSession {
             self.live_admet = None;
             return Ok(());
         }
-        let eval = AdmetCraftProvider
+        let eval = AdmetCraftProvider::default()
             .evaluate_smiles(&smi, self.canvas_mol.name.as_deref())
             .map_err(|e| e.to_string())?;
         self.live_admet = Some(eval);
@@ -114,7 +114,7 @@ impl ChemSession {
 
     pub fn recompute_sar_analytics(&mut self) {
         let mut table = (*self.sar_table).clone();
-        table.enrich_with_admet(&AdmetCraftProvider);
+        table.enrich_with_admet(&AdmetCraftProvider::default());
         self.cliffs = find_activity_cliffs(&table.rows, 0.40);
         self.mmps = find_matched_molecular_pairs(&table.rows);
         self.sar_table = Arc::new(table);
@@ -390,7 +390,7 @@ impl CommandRegistry {
                 generate_2d_coords(&mut mutated);
                 let new_smi = mutated.canonical_smiles();
                 let (delta, eval) = compute_admet_delta(
-                    &AdmetCraftProvider,
+                    &AdmetCraftProvider::default(),
                     &old_smi,
                     &new_smi,
                     mutated.name.as_deref(),
@@ -417,7 +417,7 @@ impl CommandRegistry {
                     mol.name = Some(format!("Drawn_{}", table.rows.len() + 1));
                 }
                 let row_id = table.add_molecule(mol, pic50, Some("Canvas".to_string()));
-                table.enrich_with_admet(&AdmetCraftProvider);
+                table.enrich_with_admet(&AdmetCraftProvider::default());
                 session.selected_sar_idx = Some(row_id);
                 session.sar_table = Arc::new(table);
                 session.recompute_sar_analytics();

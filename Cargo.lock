@@ -117,28 +117,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "admet-calc"
-version = "0.2.0"
-dependencies = [
- "chem-core",
- "rayon",
- "serde",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "admet-report"
-version = "0.2.0"
-dependencies = [
- "admet-calc",
- "chem-core",
- "csv",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -673,15 +651,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ced0551234e87afee12411d535648dd89d2e7f34c78b753395567aff3d447ff"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "chem-core"
-version = "0.2.0"
-dependencies = [
- "csv",
- "serde",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1976,10 +1945,12 @@ dependencies = [
 name = "mol-admet-bridge"
 version = "0.1.0"
 dependencies = [
- "admet-calc",
- "admet-report",
+ "csv",
+ "flate2",
+ "mol-graph",
  "rayon",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -1994,6 +1965,7 @@ dependencies = [
  "mol-graph",
  "mol-sar",
  "mol-vector",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

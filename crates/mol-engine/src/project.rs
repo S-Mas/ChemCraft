@@ -158,13 +158,28 @@ pub fn decode_chemcraft_zip(bytes: &[u8]) -> Result<ChemCraftDocument, ProjectEr
             "truncated ZIP entry payload".to_string(),
         ));
     }
+    /// Hard uncompressed payload limit (32 MiB) to neutralize ZIP decompression bombs.
+    const MAX_ARCHIVE_UNCOMPRESSED_BYTES: usize = 32 * 1024 * 1024;
     let payload = &bytes[data_start..data_end];
     let raw = match method {
-        0 => payload.to_vec(),
+        0 => {
+            if payload.len() > MAX_ARCHIVE_UNCOMPRESSED_BYTES {
+                return Err(ProjectError::InvalidArchive(
+                    "archive exceeds 32 MiB uncompressed safety limit".to_string(),
+                ));
+            }
+            payload.to_vec()
+        }
         8 => {
-            let mut dec = DeflateDecoder::new(payload);
+            let dec = DeflateDecoder::new(payload);
             let mut out = Vec::new();
-            dec.read_to_end(&mut out)?;
+            dec.take((MAX_ARCHIVE_UNCOMPRESSED_BYTES + 1) as u64)
+                .read_to_end(&mut out)?;
+            if out.len() > MAX_ARCHIVE_UNCOMPRESSED_BYTES {
+                return Err(ProjectError::InvalidArchive(
+                    "decompression bomb rejected: exceeds 32 MiB safety limit".to_string(),
+                ));
+            }
             out
         }
         other => {

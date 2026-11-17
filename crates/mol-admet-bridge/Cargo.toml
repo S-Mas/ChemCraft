@@ -3,14 +3,16 @@ name = "mol-admet-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Decoupled AdmetProvider trait and live in-process bridge to AdmetCraft (admet-calc & admet-report)"
+description = "Self-contained AdmetProvider trait, built-in pure-Rust ADMET/druglikeness engine, and optional admetcraft-cli IPC bridge"
 
 [lints]
 workspace = true
 
 [dependencies]
-admet-calc = { path = "../../../AdmetCraft/crates/admet-calc" }
-admet-report = { path = "../../../AdmetCraft/crates/admet-report" }
+csv.workspace = true
+flate2.workspace = true
+mol-graph = { path = "../mol-graph" }
 rayon.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

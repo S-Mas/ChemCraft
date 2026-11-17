@@ -131,7 +131,10 @@ pub fn parse_smiles_with_limit(input: &str, max_atoms: usize) -> Result<MolGraph
                 i = next_i;
             }
             b'[' => {
-                let (atom, next_i) = parse_bracket_atom(bytes, i, mol.atoms.len())?;
+                let (mut atom, next_i) = parse_bracket_atom(bytes, i, mol.atoms.len())?;
+                if atom.chiral != ChiralTag::None && atom.explicit_h > 0 {
+                    atom.chiral_h_slot = Some(if current.is_some() { 1 } else { 0 });
+                }
                 if mol.atoms.len() >= max_atoms {
                     return Err(MolError::TooManyAtoms {
                         count: mol.atoms.len() + 1,
@@ -238,6 +241,7 @@ fn parse_organic_atom(bytes: &[u8], pos: usize, id: usize) -> Result<(MolAtom, u
         ("Br", false, 2)
     } else {
         let s = match b {
+            b'*' => ("*", false),
             b'B' => ("B", false),
             b'C' => ("C", false),
             b'N' => ("N", false),
@@ -289,6 +293,24 @@ fn parse_bracket_atom(bytes: &[u8], start: usize, id: usize) -> Result<(MolAtom,
     }
 
     let first = bytes[i];
+    if first == b'*' {
+        i += 1;
+        let mut atom = MolAtom::new(id, "*")?;
+        atom.from_bracket = true;
+        if bytes.get(i) == Some(&b':') {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        if bytes.get(i) != Some(&b']') {
+            return Err(MolError::InvalidSmiles {
+                pos: i,
+                msg: "expected ']' closing '*' bracket atom".to_string(),
+            });
+        }
+        return Ok((atom, i + 1));
+    }
     if !first.is_ascii_alphabetic() {
         return Err(MolError::InvalidSmiles {
             pos: i,

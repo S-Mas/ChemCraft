@@ -115,6 +115,8 @@ pub enum VectorElement {
 pub struct VectorScene {
     pub width: f64,
     pub height: f64,
+    pub world_center: [f64; 2],
+    pub world_scale: f64,
     pub background: Option<Rgba>,
     pub elements: Vec<VectorElement>,
     pub atom_screen_pos: Vec<[f64; 2]>,
@@ -122,6 +124,15 @@ pub struct VectorScene {
 }
 
 impl VectorScene {
+    /// Exact inverse transform from viewport screen coordinates `(sx, sy)` back to `coords_2d`.
+    pub fn screen_to_world(&self, sx: f64, sy: f64) -> [f64; 2] {
+        let sc = self.world_scale.max(1e-6);
+        [
+            self.world_center[0] + (sx - self.width * 0.5) / sc,
+            self.world_center[1] - (sy - self.height * 0.5) / sc,
+        ]
+    }
+
     /// Count any overlapping atom/stereo label bounding boxes (publication QA metric: ideally 0).
     pub fn label_overlap_count(&self) -> usize {
         let mut count = 0usize;
@@ -160,6 +171,8 @@ pub fn build_mol_scene(
         return VectorScene {
             width: style.width,
             height: style.height,
+            world_center: [0.0, 0.0],
+            world_scale: 28.0,
             background: bg,
             elements: Vec::new(),
             atom_screen_pos: Vec::new(),
@@ -593,6 +606,8 @@ pub fn build_mol_scene(
     VectorScene {
         width: style.width,
         height: style.height,
+        world_center: [cx_world, cy_world],
+        world_scale: scale,
         background: bg,
         elements,
         atom_screen_pos: atom_pos,

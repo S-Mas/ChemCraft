@@ -8,8 +8,8 @@ pub mod layout;
 pub mod scene;
 
 pub use export::{
-    VectorError, export_sar_grid_pdf_bytes, export_sar_grid_svg, scene_to_eps, scene_to_pdf_bytes,
-    scene_to_png_bytes, scene_to_svg,
+    VectorError, export_sar_grid_eps, export_sar_grid_pdf_bytes, export_sar_grid_png_bytes,
+    export_sar_grid_svg, scene_to_eps, scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
 pub use layout::{
     RingTemplate, STANDARD_BOND_LEN, SnapTarget, clean_structure_2d, ensure_2d_coords,
@@ -75,6 +75,68 @@ mod tests {
         assert!(grid_svg.contains("Testosterone") && grid_svg.contains("Sildenafil"));
         let grid_pdf = export_sar_grid_pdf_bytes(&refs, 4, 240.0, 200.0)?;
         assert!(grid_pdf.starts_with(b"%PDF-1.4"));
+        let grid_eps = export_sar_grid_eps(&refs, 4, 240.0, 200.0, false);
+        assert!(grid_eps.contains("Testosterone") && grid_eps.contains("Ciprofloxacin"));
+        let grid_png = export_sar_grid_png_bytes(&refs, 4, 240.0, 200.0, false, 1.0)?;
+        assert!(grid_png.starts_with(&[137, 80, 78, 71]));
+        Ok(())
+    }
+
+    #[test]
+    fn pdf_renders_circles_winansi_accents_and_screen_to_world_roundtrips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let style = SceneStyle::default();
+        let mut mol = parse_smiles("c1ccccc1")?;
+        generate_2d_coords(&mut mol);
+        let mut scene = build_mol_scene(&mol, &style, &[]);
+        // Inverse screen -> world roundtrip check
+        let sp = scene.atom_screen_pos[0];
+        let wp = scene.screen_to_world(sp[0], sp[1]);
+        let orig = mol.atoms[0].coords_2d.unwrap_or([0.0, 0.0]);
+        assert!((wp[0] - orig[0]).abs() < 1e-6);
+        assert!((wp[1] - orig[1]).abs() < 1e-6);
+
+        // Add explicit Circle + accented Label
+        scene.elements.push(VectorElement::Circle {
+            cx: 120.0,
+            cy: 90.0,
+            r: 14.0,
+            fill: Some(Rgba(225, 45, 45, 55)),
+            stroke: Some((Rgba(220, 38, 38, 220), 1.5)),
+        });
+        scene.elements.push(VectorElement::Label {
+            text: "Cafeína".to_string(),
+            cx: 200.0,
+            cy: 40.0,
+            font_size: 12.0,
+            color: Rgba(20, 20, 20, 255),
+            bbox: Rect2 {
+                x: 170.0,
+                y: 34.0,
+                w: 60.0,
+                h: 12.0,
+            },
+        });
+        let eps = scene_to_eps(&scene);
+        assert!(eps.contains("Cafe\\355na"));
+        assert!(eps.contains("arc fill") && eps.contains("arc stroke"));
+
+        // Decompress PDF content stream to verify circle Bezier curves + WinAnsi octal!
+        let pdf = scene_to_pdf_bytes(&scene)?;
+        let start = pdf
+            .windows(7)
+            .position(|w| w == b"stream\n")
+            .ok_or("missing pdf stream")?
+            + 7;
+        let end = pdf
+            .windows(10)
+            .position(|w| w == b"\nendstream")
+            .ok_or("missing pdf endstream")?;
+        let mut dec = flate2::read::ZlibDecoder::new(&pdf[start..end]);
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut text)?;
+        assert!(text.contains("Cafe\\355na"));
+        assert!(text.contains(" c f") && text.contains(" c S"));
         Ok(())
     }
 
