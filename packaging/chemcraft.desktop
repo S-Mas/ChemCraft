@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=ChemCraft
+Comment=2D Vector Molecular Design, SAR Explorer, and Live AdmetCraft Studio
+Exec=chemcraft
+Icon=chemcraft
+Terminal=false
+Type=Application
+Categories=Science;Chemistry;Graphics;
+StartupWMClass=chemcraft

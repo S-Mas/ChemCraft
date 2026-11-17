@@ -1,0 +1,18 @@
+[package]
+name = "chemcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ChemCraft native desktop studio: VectorCraft 2D molecular drawing, DataWarrior-style SAR explorer, and live AdmetCraft inspector"
+
+[lints]
+workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+mol-admet-bridge = { path = "../../crates/mol-admet-bridge" }
+mol-engine = { path = "../../crates/mol-engine" }
+mol-graph = { path = "../../crates/mol-graph" }
+mol-sar = { path = "../../crates/mol-sar" }
+mol-vector = { path = "../../crates/mol-vector" }

@@ -1,0 +1,16 @@
+[package]
+name = "mol-sar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory DataWarrior-style SAR engine: Morgan ECFP4 fingerprints, Tanimoto, SMARTS filtering, MMP, Activity Cliffs, and AdmetCraft enrichment"
+
+[lints]
+workspace = true
+
+[dependencies]
+mol-admet-bridge = { path = "../mol-admet-bridge" }
+mol-graph = { path = "../mol-graph" }
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true

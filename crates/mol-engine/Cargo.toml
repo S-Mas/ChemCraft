@@ -1,0 +1,21 @@
+[package]
+name = "mol-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session state, Copy-on-Write structural Undo/Redo, CommandRegistry, .chemcraft ZIP+JSON atomic archives, and hardened PathSandbox"
+
+[lints]
+workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+flate2.workspace = true
+libc.workspace = true
+mol-admet-bridge = { path = "../mol-admet-bridge" }
+mol-graph = { path = "../mol-graph" }
+mol-sar = { path = "../mol-sar" }
+mol-vector = { path = "../mol-vector" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

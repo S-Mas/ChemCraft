@@ -1,0 +1,8 @@
+/target/
+/dist/
+/study.cany/
+/study_capture*/
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store

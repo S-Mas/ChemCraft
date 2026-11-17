@@ -1,0 +1,16 @@
+[package]
+name = "mol-admet-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Decoupled AdmetProvider trait and live in-process bridge to AdmetCraft (admet-calc & admet-report)"
+
+[lints]
+workspace = true
+
+[dependencies]
+admet-calc = { path = "../../../AdmetCraft/crates/admet-calc" }
+admet-report = { path = "../../../AdmetCraft/crates/admet-report" }
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "mol-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "2D molecular coordinate layout, geometric cleaning, VectorCraft-style vector scene IR, and SVG/EPS/PDF/PNG export"
+
+[lints]
+workspace = true
+
+[dependencies]
+flate2.workspace = true
+mol-graph = { path = "../mol-graph" }
+png.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tiny-skia.workspace = true
