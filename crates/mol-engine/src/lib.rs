@@ -3,10 +3,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chimerax;
 pub mod commands;
 pub mod project;
 pub mod sandbox;
 
+pub use chimerax::{
+    ChimeraXBundle, ChimeraXError, default_chimerax_export_dir, is_chimerax_available,
+    launch_chimerax_for_mol, write_chimerax_bundle,
+};
 pub use commands::{
     ChemSession, Command, CommandError, CommandInfo, CommandOutcome, CommandRegistry,
 };
@@ -179,6 +184,32 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&base);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn peptide_command_and_chimerax_bundle_export_work() -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = ChemSession::new();
+        CommandRegistry::execute(
+            &mut session,
+            Command::BuildPeptide {
+                sequence: "Ac-Ala-Gly-Tyr-Ser-NH2".to_string(),
+                secondary_structure: mol_graph::SecondaryStructure::AlphaHelix,
+            },
+        )?;
+        assert!(!session.canvas_mol.atoms.is_empty());
+
+        let out_dir = std::env::temp_dir().join("chemcraft_chimerax_unit_test");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let bundle = write_chimerax_bundle(&session.canvas_mol, &out_dir, Some("agys_helix"))?;
+        assert!(bundle.is_peptide);
+        assert!(bundle.script_path.exists());
+        assert!(bundle.structure_path.exists());
+        let cxc = std::fs::read_to_string(&bundle.script_path)?;
+        assert!(cxc.contains("open agys_helix.pdb"));
+        assert!(cxc.contains("cartoon"));
+        assert!(cxc.contains("hbonds reveal true"));
+        let _ = std::fs::remove_dir_all(&out_dir);
         Ok(())
     }
 }

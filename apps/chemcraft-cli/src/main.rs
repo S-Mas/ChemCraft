@@ -6,8 +6,13 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat};
-use mol_engine::PathSandbox;
-use mol_graph::{parse_smiles, write_sdf_v2000};
+use mol_engine::{
+    PathSandbox, default_chimerax_export_dir, launch_chimerax_for_mol, write_chimerax_bundle,
+};
+use mol_graph::{
+    SecondaryStructure, build_peptide, generate_3d_coords, parse_smiles, write_pdb,
+    write_sdf_v2000, write_sdf_v2000_3d,
+};
 use mol_sar::{
     SarFilter, SarTable, find_activity_cliffs, find_duplicate_compounds,
     find_matched_molecular_pairs,
@@ -41,6 +46,29 @@ enum EnrichFormat {
     Csv,
     Json,
     Pdf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PeptideSsCli {
+    Beta,
+    Alpha,
+    Extended,
+}
+
+impl From<PeptideSsCli> for SecondaryStructure {
+    fn from(value: PeptideSsCli) -> Self {
+        match value {
+            PeptideSsCli::Beta => SecondaryStructure::BetaStrand,
+            PeptideSsCli::Alpha => SecondaryStructure::AlphaHelix,
+            PeptideSsCli::Extended => SecondaryStructure::Extended,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Export3dFormat {
+    Pdb,
+    Sdf3d,
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,6 +120,39 @@ enum SubCmd {
         min_tanimoto: f64,
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Build a peptide in 2D + 3D from 1-letter or 3-letter sequence (`Ac-Ala-Gly-Ser-NH2`, `AGYS`) and export SVG/PDB/3D-SDF.
+    Peptide {
+        sequence: String,
+        #[arg(long, value_enum, default_value_t = PeptideSsCli::Beta)]
+        ss: PeptideSsCli,
+        #[arg(long)]
+        svg: Option<PathBuf>,
+        #[arg(long)]
+        pdb: Option<PathBuf>,
+        #[arg(long)]
+        sdf3d: Option<PathBuf>,
+    },
+    /// Generate a 3D conformer from SMILES and export PDB or 3D SDF V2000.
+    Export3d {
+        smiles: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_enum, default_value_t = Export3dFormat::Pdb)]
+        format: Export3dFormat,
+    },
+    /// Export a self-contained ChimeraX 3D bundle (.pdb/.sdf + .cxc) and optionally launch ChimeraX.
+    Chimerax {
+        #[arg(long)]
+        smiles: Option<String>,
+        #[arg(long)]
+        peptide: Option<String>,
+        #[arg(long, value_enum, default_value_t = PeptideSsCli::Alpha)]
+        ss: PeptideSsCli,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long)]
+        launch: bool,
     },
     /// Inspect SMILES structure, key, coordinates, and AdmetCraft profile as JSON.
     Inspect { smiles: String },
@@ -252,6 +313,82 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 mcp::run_mcp_stdio(&sandbox)?;
             }
+        }
+        SubCmd::Peptide {
+            sequence,
+            ss,
+            svg,
+            pdb,
+            sdf3d,
+        } => {
+            let mol = build_peptide(&sequence, ss.into())?;
+            if let Some(svg_out) = svg {
+                let scene = build_mol_scene(&mol, &SceneStyle::default(), &[]);
+                std::fs::write(&svg_out, scene_to_svg(&scene).as_bytes())?;
+            }
+            if let Some(pdb_out) = pdb {
+                std::fs::write(&pdb_out, write_pdb(&mol).as_bytes())?;
+            }
+            if let Some(sdf_out) = sdf3d {
+                std::fs::write(&sdf_out, write_sdf_v2000_3d(&[&mol]).as_bytes())?;
+            }
+            let summary = serde_json::json!({
+                "name": mol.name,
+                "sequence": mol.properties.get("PEPTIDE_SEQUENCE"),
+                "one_letter": mol.properties.get("PEPTIDE_1LETTER"),
+                "secondary_structure": mol.properties.get("SECONDARY_STRUCTURE"),
+                "residues": mol.properties.get("PEPTIDE_RESIDUES"),
+                "est_charge_ph74": mol.properties.get("EST_CHARGE_PH74"),
+                "formula": mol.formula(),
+                "mw": mol.molecular_weight(),
+                "canonical_smiles": mol.canonical_smiles(),
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        SubCmd::Export3d {
+            smiles,
+            out,
+            format,
+        } => {
+            let mut mol = parse_smiles(&smiles)?;
+            generate_3d_coords(&mut mol);
+            let txt = match format {
+                Export3dFormat::Pdb => write_pdb(&mol),
+                Export3dFormat::Sdf3d => write_sdf_v2000_3d(&[&mol]),
+            };
+            std::fs::write(&out, txt.as_bytes())?;
+            eprintln!("Exported 3D -> {}", out.display());
+        }
+        SubCmd::Chimerax {
+            smiles,
+            peptide,
+            ss,
+            out_dir,
+            launch,
+        } => {
+            let mol = if let Some(seq) = peptide {
+                build_peptide(&seq, ss.into())?
+            } else if let Some(smi) = smiles {
+                let mut m = parse_smiles(&smi)?;
+                generate_3d_coords(&mut m);
+                m
+            } else {
+                return Err("provide --smiles or --peptide".into());
+            };
+            let target_dir = out_dir.unwrap_or_else(default_chimerax_export_dir);
+            let bundle = if launch {
+                launch_chimerax_for_mol(&mol, Some(&target_dir))?
+            } else {
+                write_chimerax_bundle(&mol, &target_dir, None)?
+            };
+            let info = serde_json::json!({
+                "dir": bundle.dir.display().to_string(),
+                "script": bundle.script_path.display().to_string(),
+                "structure": bundle.structure_path.display().to_string(),
+                "is_peptide": bundle.is_peptide,
+                "launched": launch,
+            });
+            println!("{}", serde_json::to_string_pretty(&info)?);
         }
     }
     Ok(())
@@ -637,6 +774,98 @@ mod tests {
             elapsed.as_secs_f64() < 2.5,
             "1000-atom MCP draw_from_smiles took too long: {elapsed:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_build_peptide_export_3d_and_chimerax_bundle_work_inside_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_mcp_peptide_chimerax_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let wdir = base.join("write");
+        std::fs::create_dir_all(&wdir)?;
+
+        let sb = PathSandbox::new(None, Some(&wdir))?;
+        let req = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})
+                .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{
+                    "name":"build_peptide",
+                    "arguments":{
+                        "sequence":"Ac-Ala-Gly-Ser-NH2",
+                        "secondary_structure":"alpha-helix",
+                        "output_pdb":"pep.pdb",
+                        "output_svg":"pep.svg"
+                    }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{
+                    "name":"export_3d",
+                    "arguments":{
+                        "smiles":"CC(=O)Oc1ccccc1C(=O)O",
+                        "output_path":"aspirin_3d.sdf",
+                        "format":"sdf3d"
+                    }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{
+                    "name":"export_chimerax",
+                    "arguments":{
+                        "peptide":"Tyr-Gly-Gly-Phe-Met",
+                        "secondary_structure":"beta-strand",
+                        "stem":"enkephalin"
+                    }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":4,"method":"tools/call",
+                "params":{
+                    "name":"export_3d",
+                    "arguments":{
+                        "smiles":"CCO",
+                        "output_path":"../outside.pdb",
+                        "format":"pdb"
+                    }
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(req.as_bytes()), &mut out_buf, &sb, None)?;
+        let lines: Vec<serde_json::Value> = String::from_utf8(out_buf)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[1]["result"]["isError"], false);
+        assert_eq!(lines[2]["result"]["isError"], false);
+        assert_eq!(lines[3]["result"]["isError"], false);
+        // Path traversal rejected by sandbox
+        assert_eq!(lines[4]["result"]["isError"], true);
+
+        assert!(wdir.join("pep.pdb").exists());
+        assert!(wdir.join("pep.svg").exists());
+        assert!(wdir.join("aspirin_3d.sdf").exists());
+        assert!(wdir.join("enkephalin.cxc").exists());
+        assert!(wdir.join("enkephalin.pdb").exists());
+        let cxc = std::fs::read_to_string(wdir.join("enkephalin.cxc"))?;
+        assert!(cxc.contains("open enkephalin.pdb"));
+        assert!(cxc.contains("cartoon"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

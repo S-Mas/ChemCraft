@@ -8,6 +8,7 @@ pub mod descriptors;
 
 use std::fmt::Write as _;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub use descriptors::{
@@ -28,6 +29,7 @@ pub enum AdmetReportFormat {
     Csv,
     Json,
     Pdf,
+    SvgBoiledEgg,
 }
 
 #[derive(Debug, Error)]
@@ -125,12 +127,37 @@ pub struct AdmetCraftProvider {
 }
 
 impl AdmetCraftProvider {
+    pub fn is_external_cli_available() -> bool {
+        Command::new("admetcraft-cli")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    pub fn is_external_gui_available() -> bool {
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                if dir.join("admetcraft").is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn evaluate_with_optional_cli(
         smiles: &str,
         name: Option<&str>,
     ) -> Option<MoleculeEvaluation> {
-        let out = Command::new("admetcraft-cli")
-            .args(["eval", smiles])
+        let mut cmd = Command::new("admetcraft-cli");
+        cmd.args(["eval", smiles]);
+        if let Some(n) = name {
+            cmd.args(["--name", n]);
+        }
+        let out = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -145,6 +172,109 @@ impl AdmetCraftProvider {
         }
         Some(ev)
     }
+
+    /// Generate an official AdmetCraft report (`csv`/`json`/`pdf`/`svg` BOILED-Egg) using
+    /// `admetcraft-cli batch` inside `work_dir` when installed, or fall back to built-in export.
+    pub fn run_full_report_with_handoff(
+        &self,
+        items: &[(String, String)],
+        work_dir: &Path,
+        out_path: &Path,
+        format: AdmetReportFormat,
+    ) -> Result<String, BridgeError> {
+        if items.is_empty() {
+            return Err(BridgeError::Report("empty evaluation list".to_string()));
+        }
+        std::fs::create_dir_all(work_dir)
+            .map_err(|e| BridgeError::Report(format!("mkdir {}: {e}", work_dir.display())))?;
+
+        let smi_path = work_dir.join("chemcraft_handoff.smi");
+        let mut smi_buf = String::new();
+        for (smi, name) in items {
+            let clean_name = name.replace(['\r', '\n'], " ");
+            let _ = writeln!(smi_buf, "{smi} {clean_name}");
+        }
+        std::fs::write(&smi_path, smi_buf.as_bytes())
+            .map_err(|e| BridgeError::Report(format!("write {}: {e}", smi_path.display())))?;
+
+        let fmt_flag = match format {
+            AdmetReportFormat::Csv => "csv",
+            AdmetReportFormat::Json => "json",
+            AdmetReportFormat::Pdf => "pdf",
+            AdmetReportFormat::SvgBoiledEgg => "svg",
+        };
+        if let Ok(out) = Command::new("admetcraft-cli")
+            .arg("batch")
+            .arg(&smi_path)
+            .arg("--out")
+            .arg(out_path)
+            .arg("--format")
+            .arg(fmt_flag)
+            .arg("--read-root")
+            .arg(work_dir)
+            .arg("--write-root")
+            .arg(out_path.parent().unwrap_or(work_dir))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            && out.status.success()
+        {
+            return Ok(format!(
+                "Delegated to AdmetCraft CLI -> {}",
+                out_path.display()
+            ));
+        }
+
+        if format == AdmetReportFormat::SvgBoiledEgg {
+            return Err(BridgeError::Report(
+                "BOILED-Egg SVG export requires external `admetcraft-cli` on PATH".to_string(),
+            ));
+        }
+
+        let batch_items: Vec<(String, Option<String>)> = items
+            .iter()
+            .map(|(s, n)| (s.clone(), Some(n.clone())))
+            .collect();
+        let evals = self.evaluate_batch(&batch_items);
+        let ok_evals: Vec<_> = evals.into_iter().filter_map(Result::ok).collect();
+        let mut file = std::fs::File::create(out_path)
+            .map_err(|e| BridgeError::Report(format!("create {}: {e}", out_path.display())))?;
+        self.export_report_to_writer(&ok_evals, &mut file, format)?;
+        Ok(format!(
+            "Exported built-in ADMET report -> {}",
+            out_path.display()
+        ))
+    }
+}
+
+/// Write an optional `.smi` handoff file and spawn the standalone `admetcraft` GUI desktop app.
+pub fn launch_admetcraft_gui(
+    items: &[(String, String)],
+    export_dir: &Path,
+) -> Result<PathBuf, BridgeError> {
+    std::fs::create_dir_all(export_dir)
+        .map_err(|e| BridgeError::Report(format!("mkdir {}: {e}", export_dir.display())))?;
+    let smi_path = export_dir.join("chemcraft_to_admetcraft.smi");
+    let mut smi_buf = String::new();
+    for (smi, name) in items {
+        let _ = writeln!(smi_buf, "{smi} {}", name.replace(['\r', '\n'], " "));
+    }
+    std::fs::write(&smi_path, smi_buf.as_bytes())
+        .map_err(|e| BridgeError::Report(format!("write {}: {e}", smi_path.display())))?;
+
+    Command::new("admetcraft")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            BridgeError::Report(format!(
+                "failed to launch `admetcraft` GUI (saved SMILES at {}): {e}",
+                smi_path.display()
+            ))
+        })?;
+    Ok(smi_path)
 }
 
 impl AdmetProvider for AdmetCraftProvider {
@@ -240,6 +370,11 @@ impl AdmetProvider for AdmetCraftProvider {
                 writer
                     .write_all(&bytes)
                     .map_err(|e| BridgeError::Report(e.to_string()))?;
+            }
+            AdmetReportFormat::SvgBoiledEgg => {
+                return Err(BridgeError::Report(
+                    "BOILED-Egg SVG export requires external `admetcraft-cli` on PATH".to_string(),
+                ));
             }
         }
         writer

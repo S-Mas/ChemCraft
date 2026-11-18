@@ -151,10 +151,14 @@ fn parse_v2000_block(lines: &[&str], title: &str) -> Result<MolGraph, MolError> 
             line: ln + 1,
             msg: "invalid Y coordinate".to_string(),
         })?;
+        let z: f64 = toks[2].parse().unwrap_or(0.0);
         let sym = toks[3];
         let mut atom = MolAtom::new(idx, sym)?;
         if x.is_finite() && y.is_finite() {
             atom.coords_2d = Some([x, y]);
+            if z.is_finite() && z.abs() > 1e-4 {
+                atom.coords_3d = Some([x, y, z]);
+            }
         }
         if let Some(chg_s) = toks.get(5)
             && let Ok(code) = chg_s.parse::<u8>()
@@ -267,9 +271,13 @@ fn parse_v3000_block(lines: &[&str], title: &str) -> Result<MolGraph, MolError> 
             let sym = toks[1];
             let x: f64 = toks[2].parse().unwrap_or(0.0);
             let y: f64 = toks[3].parse().unwrap_or(0.0);
+            let z: f64 = toks[4].parse().unwrap_or(0.0);
             let mut atom = MolAtom::new(mol.atoms.len(), sym)?;
             if x.is_finite() && y.is_finite() {
                 atom.coords_2d = Some([x, y]);
+                if z.is_finite() && z.abs() > 1e-4 {
+                    atom.coords_3d = Some([x, y, z]);
+                }
             }
             for kv in &toks[5..] {
                 if let Some(chg_s) = kv.strip_prefix("CHG=")

@@ -1,24 +1,38 @@
 #![forbid(unsafe_code)]
 
+mod viewer3d;
 mod widgets;
 
 use std::path::PathBuf;
 
 use eframe::egui;
 use egui::{Color32, Pos2, RichText, Sense, Stroke, Vec2};
-use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat};
+use mol_admet_bridge::{
+    AdmetCraftProvider, AdmetProvider, AdmetReportFormat, launch_admetcraft_gui,
+};
 use mol_engine::{
     ChemCraftDocument, ChemSession, Command, CommandRegistry, MAX_READ_BYTES, PathSandbox,
-    decode_chemcraft_zip, save_chemcraft_atomic,
+    decode_chemcraft_zip, is_chimerax_available, launch_chimerax_for_mol, save_chemcraft_atomic,
 };
-use mol_graph::{BondOrder, BondStereo, parse_csv_records, parse_dwar, parse_sdf};
+use mol_graph::{
+    BondOrder, BondStereo, SecondaryStructure, canonical_amino_acids, generate_3d_coords,
+    parse_csv_records, parse_dwar, parse_sdf, write_pdb, write_sdf_v2000_3d,
+};
 use mol_vector::{
     ReactionArrow, RingTemplate, SceneStyle, VectorScene, build_mol_scene, scene_to_eps,
     scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
+use viewer3d::{Viewer3dState, render_3d_viewport};
 use widgets::{
     ScatterXAxis, draw_admet_radar, draw_sar_scatter, paint_mol_thumbnail, paint_vector_scene,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    View2D,
+    View3D,
+    Split2D3D,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrawTool {
@@ -41,6 +55,14 @@ enum SarTab {
 struct ChemCraftApp {
     session: ChemSession,
     tool: DrawTool,
+    view_mode: ViewMode,
+    viewer_3d: Viewer3dState,
+    peptide_seq: String,
+    peptide_ss: SecondaryStructure,
+    peptide_drawer_open: bool,
+    chimerax_available: bool,
+    admet_cli_available: bool,
+    admet_gui_available: bool,
     active_element: &'static str,
     smiles_bar: String,
     file_path_bar: String,
@@ -66,14 +88,27 @@ impl ChemCraftApp {
             .display()
             .to_string();
         let smiles_bar = session.canvas_mol.canonical_smiles();
+        let chimerax_available = is_chimerax_available();
+        let admet_cli_available = AdmetCraftProvider::is_external_cli_available();
+        let admet_gui_available = AdmetCraftProvider::is_external_gui_available();
         Self {
             session,
             tool: DrawTool::BondOrder(BondOrder::Single),
+            view_mode: ViewMode::Split2D3D,
+            viewer_3d: Viewer3dState::default(),
+            peptide_seq: "Ac-Ala-Gly-Tyr-Ser-NH2".to_string(),
+            peptide_ss: SecondaryStructure::AlphaHelix,
+            peptide_drawer_open: false,
+            chimerax_available,
+            admet_cli_available,
+            admet_gui_available,
             active_element: "C",
             smiles_bar,
             file_path_bar: String::new(),
             export_dir,
-            status_msg: "Ready — Draw 2D structures, snap rings, or explore 50 SAR compounds + live AdmetCraft".to_string(),
+            status_msg:
+                "Ready — 2D Vector + 3D Conformer + Peptide Builder + ChimeraX + AdmetCraft"
+                    .to_string(),
             dark_mode: false,
             sar_tab: SarTab::Table,
             scatter_x: ScatterXAxis::ConsensusLogP,
@@ -154,6 +189,116 @@ impl ChemCraftApp {
         }
     }
 
+    fn export_structure_3d(&mut self, fmt: &str) {
+        if self.session.canvas_mol.atoms.is_empty() {
+            self.status_msg = "Canvas is empty".to_string();
+            return;
+        }
+        let root = PathBuf::from(&self.export_dir);
+        let sb = match PathSandbox::new(None, Some(&root)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_msg = format!("Export sandbox error: {e}");
+                return;
+            }
+        };
+        let (filename, content) = match fmt {
+            "pdb" => (
+                "chemcraft_structure.pdb".to_string(),
+                write_pdb(&self.session.canvas_mol),
+            ),
+            "sdf3d" => (
+                "chemcraft_structure_3d.sdf".to_string(),
+                write_sdf_v2000_3d(&[&self.session.canvas_mol]),
+            ),
+            _ => return,
+        };
+        match sb.open_write(std::path::Path::new(&filename)) {
+            Ok((resolved, mut f)) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(content.as_bytes()) {
+                    self.status_msg = format!("Write error: {e}");
+                } else {
+                    self.status_msg = format!("Exported 3D -> {}", resolved.display());
+                }
+            }
+            Err(e) => self.status_msg = format!("Sandbox write error: {e}"),
+        }
+    }
+
+    fn open_in_chimerax(&mut self) {
+        match launch_chimerax_for_mol(&self.session.canvas_mol, None) {
+            Ok(bundle) => {
+                self.status_msg = format!("Launched ChimeraX ({})", bundle.script_path.display());
+            }
+            Err(e) => {
+                self.status_msg = format!("ChimeraX: {e}");
+            }
+        }
+    }
+
+    fn collect_handoff_items(&self) -> Vec<(String, String)> {
+        let mut items = Vec::new();
+        if !self.session.canvas_mol.atoms.is_empty() {
+            let smi = self.session.canvas_mol.canonical_smiles();
+            if !smi.is_empty() {
+                items.push((
+                    smi,
+                    self.session
+                        .canvas_mol
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "Canvas_Mol".to_string()),
+                ));
+            }
+        }
+        for row in &self.session.sar_table.rows {
+            if !row.canonical_smiles.is_empty() {
+                items.push((row.canonical_smiles.clone(), row.name.clone()));
+            }
+        }
+        items
+    }
+
+    fn open_in_admetcraft(&mut self) {
+        let items = self.collect_handoff_items();
+        if items.is_empty() {
+            self.status_msg = "Nothing to send to AdmetCraft".to_string();
+            return;
+        }
+        let dir = PathBuf::from(&self.export_dir);
+        match launch_admetcraft_gui(&items, &dir) {
+            Ok(smi_path) => {
+                self.status_msg = format!(
+                    "Launched AdmetCraft GUI (handoff SMILES saved at {})",
+                    smi_path.display()
+                );
+            }
+            Err(e) => {
+                self.status_msg = format!("AdmetCraft launch: {e}");
+            }
+        }
+    }
+
+    fn export_admet_boiled_egg(&mut self) {
+        let items = self.collect_handoff_items();
+        if items.is_empty() {
+            self.status_msg = "No compounds available for BOILED-Egg plot".to_string();
+            return;
+        }
+        let work_dir = PathBuf::from(&self.export_dir);
+        let out_path = work_dir.join("admetcraft_boiled_egg.svg");
+        match self.session.admet_provider().run_full_report_with_handoff(
+            &items,
+            &work_dir,
+            &out_path,
+            AdmetReportFormat::SvgBoiledEgg,
+        ) {
+            Ok(msg) => self.status_msg = msg,
+            Err(e) => self.status_msg = format!("AdmetCraft BOILED-Egg error: {e}"),
+        }
+    }
+
     fn export_admet_report(&mut self, fmt: AdmetReportFormat, filename: &str) {
         let evals: Vec<_> = self
             .session
@@ -176,16 +321,332 @@ impl ChemCraftApp {
         };
         match sb.open_write(std::path::Path::new(filename)) {
             Ok((resolved, mut f)) => {
-                match AdmetCraftProvider::default().export_report_to_writer(&evals, &mut f, fmt) {
+                match self
+                    .session
+                    .admet_provider()
+                    .export_report_to_writer(&evals, &mut f, fmt)
+                {
                     Ok(()) => {
-                        self.status_msg =
-                            format!("Exported AdmetCraft report -> {}", resolved.display())
+                        self.status_msg = format!("Exported ADMET report -> {}", resolved.display())
                     }
-                    Err(e) => self.status_msg = format!("AdmetCraft export error: {e}"),
+                    Err(e) => self.status_msg = format!("ADMET export error: {e}"),
                 }
             }
             Err(e) => self.status_msg = format!("Sandbox error: {e}"),
         }
+    }
+
+    fn render_peptide_drawer(&mut self, ctx: &egui::Context) {
+        if !self.peptide_drawer_open {
+            return;
+        }
+        let mut open = self.peptide_drawer_open;
+        let mut trigger_build = false;
+        egui::Window::new("Peptide Builder (2D + 3D + PDB)")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(410.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Build canonical L-peptides in 2D + 3D from 1-letter or 3-letter sequences:")
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Sequence:");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.peptide_seq)
+                            .desired_width(240.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        trigger_build = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Secondary structure:");
+                    ui.selectable_value(
+                        &mut self.peptide_ss,
+                        SecondaryStructure::BetaStrand,
+                        "Beta-Strand",
+                    );
+                    ui.selectable_value(
+                        &mut self.peptide_ss,
+                        SecondaryStructure::AlphaHelix,
+                        "Alpha-Helix",
+                    );
+                    ui.selectable_value(
+                        &mut self.peptide_ss,
+                        SecondaryStructure::Extended,
+                        "Extended",
+                    );
+                });
+                ui.separator();
+                ui.label(RichText::new("Append residue:").small().weak());
+                ui.horizontal_wrapped(|ui| {
+                    for (c1, c3, full) in canonical_amino_acids() {
+                        if ui
+                            .small_button(format!("{c1} ({c3})"))
+                            .on_hover_text(full)
+                            .clicked()
+                        {
+                            let s = self.peptide_seq.trim().to_string();
+                            if s.is_empty() {
+                                self.peptide_seq = c3.to_string();
+                            } else if let Some(prefix) = s.strip_suffix("-NH2") {
+                                if prefix.contains('-') {
+                                    self.peptide_seq = format!("{prefix}-{c3}-NH2");
+                                } else {
+                                    self.peptide_seq = format!("{prefix}{c1}-NH2");
+                                }
+                            } else if s.contains('-') {
+                                self.peptide_seq = format!("{s}-{c3}");
+                            } else {
+                                self.peptide_seq = format!("{s}{c1}");
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Preset: Ac-AGYS-NH2").clicked() {
+                        self.peptide_seq = "Ac-Ala-Gly-Tyr-Ser-NH2".to_string();
+                        trigger_build = true;
+                    }
+                    if ui.button("Preset: RGD (cyclic/strand)").clicked() {
+                        self.peptide_seq = "Arg-Gly-Asp".to_string();
+                        self.peptide_ss = SecondaryStructure::BetaStrand;
+                        trigger_build = true;
+                    }
+                    if ui.button("Preset: Poly-Ala Helix (A8)").clicked() {
+                        self.peptide_seq = "AAAAAAAA".to_string();
+                        self.peptide_ss = SecondaryStructure::AlphaHelix;
+                        trigger_build = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Build Peptide (2D + 3D)").clicked() {
+                        trigger_build = true;
+                    }
+                    if ui.button("Clear Seq").clicked() {
+                        self.peptide_seq.clear();
+                    }
+                });
+            });
+        self.peptide_drawer_open = open;
+        if trigger_build {
+            let seq = self.peptide_seq.clone();
+            let ss = self.peptide_ss;
+            self.run_cmd(Command::BuildPeptide {
+                sequence: seq,
+                secondary_structure: ss,
+            });
+            self.viewer_3d.reset();
+            if self.view_mode == ViewMode::View2D {
+                self.view_mode = ViewMode::Split2D3D;
+            }
+        }
+    }
+
+    fn draw_2d_canvas_at_rect(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let resp = ui.interact(
+            rect,
+            ui.id().with("chemcraft_2d_canvas"),
+            Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        let bg = if self.dark_mode {
+            Color32::from_rgb(22, 24, 30)
+        } else {
+            Color32::from_rgb(255, 255, 255)
+        };
+        painter.rect_filled(rect, 4.0, bg);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0_f32, Color32::from_gray(165)),
+            egui::StrokeKind::Inside,
+        );
+
+        let style = SceneStyle {
+            width: f64::from(rect.width()),
+            height: f64::from(rect.height()),
+            padding: 30.0,
+            stroke_width: 2.0,
+            font_size: 14.0,
+            dark_mode: self.dark_mode,
+            show_stereo_labels: true,
+        };
+        let mut scene = build_mol_scene(
+            &self.session.canvas_mol,
+            &style,
+            &self.session.reaction_arrows,
+        );
+        scene.background = None;
+        paint_vector_scene(&painter, &scene, rect.min);
+
+        self.hover_atom = None;
+        let mut hover_bond = None;
+        if let Some(hp) = resp.hover_pos() {
+            let lx = f64::from(hp.x - rect.min.x);
+            let ly = f64::from(hp.y - rect.min.y);
+            let mut best_d = 16.0_f64;
+            for (aid, sp) in scene.atom_screen_pos.iter().enumerate() {
+                let d = (sp[0] - lx).hypot(sp[1] - ly);
+                if d < best_d {
+                    best_d = d;
+                    self.hover_atom = Some(aid);
+                }
+            }
+            if self.hover_atom.is_none() {
+                let mut best_bd = 11.0_f64;
+                for (bid, b) in self.session.canvas_mol.bonds.iter().enumerate() {
+                    if let (Some(p1), Some(p2)) = (
+                        scene.atom_screen_pos.get(b.u),
+                        scene.atom_screen_pos.get(b.v),
+                    ) {
+                        let d = point_seg_dist([lx, ly], *p1, *p2);
+                        if d < best_bd {
+                            best_bd = d;
+                            hover_bond = Some(bid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(aid) = self.hover_atom
+            && let Some(sp) = scene.atom_screen_pos.get(aid)
+        {
+            painter.circle_stroke(
+                Pos2::new(rect.min.x + sp[0] as f32, rect.min.y + sp[1] as f32),
+                11.0,
+                Stroke::new(1.8_f32, Color32::from_rgb(34, 139, 230)),
+            );
+        } else if let Some(bid) = hover_bond
+            && let (Some(p1), Some(p2)) = (
+                scene
+                    .atom_screen_pos
+                    .get(self.session.canvas_mol.bonds[bid].u),
+                scene
+                    .atom_screen_pos
+                    .get(self.session.canvas_mol.bonds[bid].v),
+            )
+        {
+            painter.line_segment(
+                [
+                    Pos2::new(rect.min.x + p1[0] as f32, rect.min.y + p1[1] as f32),
+                    Pos2::new(rect.min.x + p2[0] as f32, rect.min.y + p2[1] as f32),
+                ],
+                Stroke::new(4.5_f32, Color32::from_rgba_unmultiplied(34, 139, 230, 110)),
+            );
+        }
+
+        if self.tool == DrawTool::SelectMove {
+            if resp.drag_started() {
+                self.drag_start_atom = self.hover_atom;
+            }
+            if resp.dragged()
+                && let Some(aid) = self.drag_start_atom
+            {
+                let delta = resp.drag_delta();
+                let scale = scene.world_scale.max(1e-6);
+                let mut mol = (*self.session.canvas_mol).clone();
+                if let Some(Some(coords)) = mol.atoms.get_mut(aid).map(|a| &mut a.coords_2d) {
+                    coords[0] += f64::from(delta.x) / scale;
+                    coords[1] -= f64::from(delta.y) / scale;
+                }
+                self.session.canvas_mol = std::sync::Arc::new(mol);
+            }
+            if resp.drag_stopped() {
+                self.drag_start_atom = None;
+            }
+        }
+
+        if resp.clicked()
+            && let Some(cp) = resp.interact_pointer_pos()
+        {
+            let [wx, wy] =
+                scene.screen_to_world(f64::from(cp.x - rect.min.x), f64::from(cp.y - rect.min.y));
+            match self.tool {
+                DrawTool::Ring(r) => {
+                    self.run_cmd(Command::StampRing {
+                        template_name: r.label().to_string(),
+                        x: wx,
+                        y: wy,
+                        snap_atom: self.hover_atom,
+                        snap_bond: hover_bond,
+                    });
+                }
+                DrawTool::BondOrder(order) => {
+                    let new_pos = [wx, wy];
+                    self.run_cmd(Command::AddAtomAndBond {
+                        from_atom: self.hover_atom.or_else(|| {
+                            if self.session.canvas_mol.atoms.is_empty() {
+                                None
+                            } else {
+                                Some(self.session.canvas_mol.atoms.len() - 1)
+                            }
+                        }),
+                        symbol: self.active_element.to_string(),
+                        x: new_pos[0],
+                        y: new_pos[1],
+                        order,
+                        stereo: BondStereo::None,
+                    });
+                }
+                DrawTool::BondStereo(stereo) => {
+                    let mut mol = (*self.session.canvas_mol).clone();
+                    if let Some(bid) = hover_bond {
+                        mol.bonds[bid].stereo = stereo;
+                        let _ = mol.perceive();
+                        self.session.canvas_mol = std::sync::Arc::new(mol);
+                        let _ = self.session.refresh_live_admet();
+                    } else if let Some(aid) = self.hover_atom {
+                        self.run_cmd(Command::AddAtomAndBond {
+                            from_atom: Some(aid),
+                            symbol: self.active_element.to_string(),
+                            x: wx,
+                            y: wy,
+                            order: BondOrder::Single,
+                            stereo,
+                        });
+                    }
+                }
+                DrawTool::Eraser => {
+                    let mut mol = (*self.session.canvas_mol).clone();
+                    if let Some(aid) = self.hover_atom {
+                        let _ = mol.remove_atom(aid);
+                        self.session.canvas_mol = std::sync::Arc::new(mol);
+                        let _ = self.session.refresh_live_admet();
+                        self.smiles_bar = self.session.canvas_mol.canonical_smiles();
+                    } else if let Some(bid) = hover_bond {
+                        let _ = mol.remove_bond(bid);
+                        self.session.canvas_mol = std::sync::Arc::new(mol);
+                        let _ = self.session.refresh_live_admet();
+                        self.smiles_bar = self.session.canvas_mol.canonical_smiles();
+                    }
+                }
+                DrawTool::ReactionArrow => {
+                    let sx = f64::from(cp.x - rect.min.x);
+                    let sy = f64::from(cp.y - rect.min.y);
+                    if let Some(start) = self.arrow_start.take() {
+                        let mut arrows = (*self.session.reaction_arrows).clone();
+                        arrows.push(ReactionArrow {
+                            start,
+                            end: [sx, sy],
+                            label_above: "Reagent".to_string(),
+                            label_below: String::new(),
+                        });
+                        self.session.reaction_arrows = std::sync::Arc::new(arrows);
+                    } else {
+                        self.arrow_start = Some([sx, sy]);
+                    }
+                }
+                DrawTool::SelectMove => {}
+            }
+        }
+        self.last_canvas_scene = Some(scene);
     }
 
     fn save_project(&mut self) {
@@ -440,18 +901,22 @@ impl eframe::App for ChemCraftApp {
         }
         self.handle_shortcuts(ctx);
         self.render_palette(ctx);
+        self.render_peptide_drawer(ctx);
 
         // 1. Top Toolbar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("ChemCraft").strong());
-                ui.label(RichText::new("Vector 2D + SAR + AdmetCraft").weak());
+                ui.label(RichText::new("2D/3D + Peptides + SAR + ChimeraX + AdmetCraft").weak());
                 ui.separator();
                 if ui.button("Demo 50 SAR").clicked() {
                     self.run_cmd(Command::LoadDemo50Sar);
                 }
                 if ui.button("Clean 2D").clicked() {
                     self.run_cmd(Command::CleanStructure2D);
+                }
+                if ui.button("Peptide Builder").clicked() {
+                    self.peptide_drawer_open = !self.peptide_drawer_open;
                 }
                 if ui.button("-COOH -> Tetrazole").clicked() {
                     self.run_cmd(Command::MutateBioisostere {
@@ -487,7 +952,21 @@ impl eframe::App for ChemCraftApp {
                 if ui.button("PNG").clicked() {
                     self.export_canvas("png");
                 }
+                if ui.button("PDB").clicked() {
+                    self.export_structure_3d("pdb");
+                }
+                if ui.button("3D SDF").clicked() {
+                    self.export_structure_3d("sdf3d");
+                }
                 ui.separator();
+                let cx_btn = ui.button("Visualizar en ChimeraX").on_hover_text(if self.chimerax_available {
+                    "Exporta .pdb/.sdf + .cxc en la carpeta sandbox de ChimeraX y lo abre en 3D avanzado"
+                } else {
+                    "Exporta bundle .pdb/.sdf + .cxc para abrir en UCSF ChimeraX"
+                });
+                if cx_btn.clicked() {
+                    self.open_in_chimerax();
+                }
                 if ui
                     .button(if self.dark_mode { "Light" } else { "Dark" })
                     .clicked()
@@ -577,6 +1056,31 @@ impl eframe::App for ChemCraftApp {
                         .weak(),
                 );
 
+                ui.add_space(6.0);
+                ui.strong("Quick Peptide (2D + 3D)");
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.peptide_seq)
+                        .hint_text("Ala-Gly-Tyr-Ser / AGYS"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Build Peptide").clicked() {
+                        let seq = self.peptide_seq.clone();
+                        let ss = self.peptide_ss;
+                        self.run_cmd(Command::BuildPeptide {
+                            sequence: seq,
+                            secondary_structure: ss,
+                        });
+                        self.viewer_3d.reset();
+                        if self.view_mode == ViewMode::View2D {
+                            self.view_mode = ViewMode::Split2D3D;
+                        }
+                    }
+                    if ui.button("20-AA Pad...").clicked() {
+                        self.peptide_drawer_open = true;
+                    }
+                });
+
                 ui.add_space(8.0);
                 ui.strong("Import (.sdf/.dwar/.csv/.chemcraft)");
                 ui.add(
@@ -589,93 +1093,129 @@ impl eframe::App for ChemCraftApp {
                 }
             });
 
-        // 3. Right Dockable Panel: Live ADMET Inspector (AdmetCraft)
+        // 3. Right Dockable Panel: Live ADMET Inspector (ChemCraft <-> AdmetCraft Bridge)
         egui::SidePanel::right("admet_inspector")
-            .default_width(290.0)
+            .default_width(305.0)
             .show(ctx, |ui| {
-                ui.heading("Live ADMET Inspector");
-                ui.label(
-                    RichText::new("Powered in-process by AdmetCraft")
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Live ADMET Inspector");
+                    ui.label(
+                        RichText::new(
+                            if self.session.prefer_external_admet && self.admet_cli_available {
+                                "Engine: External AdmetCraft CLI (`admetcraft-cli`)"
+                            } else {
+                                "Engine: ChemCraft Quick ADMET (Built-in)"
+                            },
+                        )
                         .small()
                         .weak(),
-                );
-                ui.separator();
-
-                if let Some(ref eval) = self.session.live_admet {
-                    draw_admet_radar(ui, eval, self.dark_mode);
+                    );
+                    if self.admet_cli_available {
+                        let mut ext = self.session.prefer_external_admet;
+                        if ui
+                            .checkbox(&mut ext, "Delegate evals to external `admetcraft-cli`")
+                            .changed()
+                        {
+                            self.session.prefer_external_admet = ext;
+                            let _ = self.session.refresh_live_admet();
+                        }
+                    }
                     ui.separator();
-                    let p = &eval.physicochemical;
-                    let l = &eval.lipophilicity;
-                    let pk = &eval.pharmacokinetics;
-                    let d = &eval.druglikeness;
-                    let mc = &eval.medicinal_chemistry;
 
-                    egui::Grid::new("admet_kv").striped(true).show(ui, |ui| {
-                        ui.label("Formula");
-                        ui.monospace(&p.formula);
-                        ui.end_row();
-                        ui.label("MW");
-                        ui.label(format!("{:.2} g/mol", p.molecular_weight));
-                        ui.end_row();
-                        ui.label("Consensus LogP");
-                        ui.label(format!("{:.2}", l.consensus_log_p));
-                        ui.end_row();
-                        ui.label("TPSA");
-                        ui.label(format!("{:.2} A^2", p.tpsa));
-                        ui.end_row();
-                        ui.label("HBD / HBA");
-                        ui.label(format!("{} / {}", p.h_bond_donors, p.h_bond_acceptors));
-                        ui.end_row();
-                        ui.label("ESOL LogS");
-                        ui.label(format!(
-                            "{:.2} ({})",
-                            eval.water_solubility.esol.log_s,
-                            eval.water_solubility.esol.class.as_str()
-                        ));
-                        ui.end_row();
-                        ui.label("GI Absorption");
-                        ui.strong(pk.gi_absorption.as_str());
-                        ui.end_row();
-                        ui.label("BBB Permeant");
-                        ui.label(if pk.bbb_permeant { "Yes" } else { "No" });
-                        ui.end_row();
-                        ui.label("Lipinski");
-                        ui.label(format!("{} violation(s)", d.lipinski.violations));
-                        ui.end_row();
-                        ui.label("PAINS / Brenk");
-                        ui.label(format!(
-                            "{} / {} alert(s)",
-                            mc.pains_alerts.len(),
-                            mc.brenk_alerts.len()
-                        ));
-                        ui.end_row();
-                    });
+                    if let Some(ref eval) = self.session.live_admet {
+                        draw_admet_radar(ui, eval, self.dark_mode);
+                        ui.separator();
+                        let p = &eval.physicochemical;
+                        let l = &eval.lipophilicity;
+                        let pk = &eval.pharmacokinetics;
+                        let d = &eval.druglikeness;
+                        let mc = &eval.medicinal_chemistry;
 
-                    if let Some(ref delta) = self.session.last_mutation_delta {
-                        ui.add_space(6.0);
-                        ui.group(|ui| {
-                            ui.strong("Bioisostere ADMET Delta");
+                        egui::Grid::new("admet_kv").striped(true).show(ui, |ui| {
+                            ui.label("Formula");
+                            ui.monospace(&p.formula);
+                            ui.end_row();
+                            ui.label("MW");
+                            ui.label(format!("{:.2} g/mol", p.molecular_weight));
+                            ui.end_row();
+                            ui.label("Consensus LogP");
+                            ui.label(format!("{:.2}", l.consensus_log_p));
+                            ui.end_row();
+                            ui.label("TPSA");
+                            ui.label(format!("{:.2} A^2", p.tpsa));
+                            ui.end_row();
+                            ui.label("HBD / HBA");
+                            ui.label(format!("{} / {}", p.h_bond_donors, p.h_bond_acceptors));
+                            ui.end_row();
+                            ui.label("ESOL LogS");
                             ui.label(format!(
-                                "ΔMW: {:+.2} | ΔLogP: {:+.2} | ΔTPSA: {:+.2}",
-                                delta.delta_mw, delta.delta_logp, delta.delta_tpsa
+                                "{:.2} ({})",
+                                eval.water_solubility.esol.log_s,
+                                eval.water_solubility.esol.class.as_str()
                             ));
-                            ui.label(format!("GI: {} -> {}", delta.old_gi, delta.new_gi));
+                            ui.end_row();
+                            ui.label("GI Absorption");
+                            ui.strong(pk.gi_absorption.as_str());
+                            ui.end_row();
+                            ui.label("BBB Permeant");
+                            ui.label(if pk.bbb_permeant { "Yes" } else { "No" });
+                            ui.end_row();
+                            ui.label("Lipinski");
+                            ui.label(format!("{} violation(s)", d.lipinski.violations));
+                            ui.end_row();
+                            ui.label("PAINS / Brenk");
+                            ui.label(format!(
+                                "{} / {} alert(s)",
+                                mc.pains_alerts.len(),
+                                mc.brenk_alerts.len()
+                            ));
+                            ui.end_row();
                         });
-                    }
-                } else {
-                    ui.label("Draw a structure on the canvas to see live ADMET predictions.");
-                }
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.strong("Send to AdmetCraft Reports");
-                ui.horizontal(|ui| {
-                    if ui.button("Export SAR ADMET CSV").clicked() {
-                        self.export_admet_report(AdmetReportFormat::Csv, "chemcraft_admet.csv");
+                        if let Some(ref delta) = self.session.last_mutation_delta {
+                            ui.add_space(6.0);
+                            ui.group(|ui| {
+                                ui.strong("Bioisostere ADMET Delta");
+                                ui.label(format!(
+                                    "ΔMW: {:+.2} | ΔLogP: {:+.2} | ΔTPSA: {:+.2}",
+                                    delta.delta_mw, delta.delta_logp, delta.delta_tpsa
+                                ));
+                                ui.label(format!("GI: {} -> {}", delta.old_gi, delta.new_gi));
+                            });
+                        }
+                    } else {
+                        ui.label("Draw a structure or build a peptide to inspect properties.");
                     }
-                    if ui.button("Export ADMET PDF").clicked() {
-                        self.export_admet_report(AdmetReportFormat::Pdf, "chemcraft_admet.pdf");
-                    }
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.strong("Handoff to AdmetCraft (Dedicated PK Studio)");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Export ADMET CSV").clicked() {
+                            self.export_admet_report(AdmetReportFormat::Csv, "chemcraft_admet.csv");
+                        }
+                        if ui.button("Export ADMET PDF").clicked() {
+                            self.export_admet_report(AdmetReportFormat::Pdf, "chemcraft_admet.pdf");
+                        }
+                        if ui
+                            .add_enabled(
+                                self.admet_cli_available,
+                                egui::Button::new("BOILED-Egg SVG (AdmetCraft)"),
+                            )
+                            .clicked()
+                        {
+                            self.export_admet_boiled_egg();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.admet_gui_available,
+                                egui::Button::new("Open in AdmetCraft GUI"),
+                            )
+                            .clicked()
+                        {
+                            self.open_in_admetcraft();
+                        }
+                    });
                 });
             });
 
@@ -709,6 +1249,31 @@ impl eframe::App for ChemCraftApp {
                 }
             });
 
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("View:");
+                ui.selectable_value(&mut self.view_mode, ViewMode::View2D, "2D Vector");
+                ui.selectable_value(&mut self.view_mode, ViewMode::View3D, "3D Interactive");
+                ui.selectable_value(&mut self.view_mode, ViewMode::Split2D3D, "Split 2D + 3D");
+                if self.view_mode != ViewMode::View2D {
+                    ui.separator();
+                    ui.checkbox(&mut self.viewer_3d.show_ribbon, "Peptide Ribbon");
+                    ui.checkbox(&mut self.viewer_3d.show_labels, "Atom Labels");
+                    ui.checkbox(&mut self.viewer_3d.auto_spin, "Spin");
+                    if ui.button("Rebuild 3D").clicked() {
+                        let mut mol = (*self.session.canvas_mol).clone();
+                        generate_3d_coords(&mut mol);
+                        self.session.canvas_mol = std::sync::Arc::new(mol);
+                        self.status_msg = "Regenerated 3D conformer coordinates".to_string();
+                    }
+                    if ui.button("Reset Cam").clicked() {
+                        self.viewer_3d.reset();
+                    }
+                    if ui.button("Visualizar en ChimeraX").clicked() {
+                        self.open_in_chimerax();
+                    }
+                }
+            });
+
             if !self.session.canvas_mol.warnings.is_empty() {
                 ui.colored_label(
                     Color32::from_rgb(220, 48, 48),
@@ -716,205 +1281,48 @@ impl eframe::App for ChemCraftApp {
                 );
             }
 
-            // Center-top interactive vector canvas
-            let canvas_h = (ui.available_height() * 0.44).max(210.0);
+            // Center-top interactive viewport (2D Vector / 3D Conformer / Split 2D + 3D)
+            let canvas_h = (ui.available_height() * 0.44).max(220.0);
             let canvas_w = ui.available_width().max(320.0);
-            let (rect, resp) =
-                ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::click_and_drag());
-            let painter = ui.painter_at(rect);
-            let bg = if self.dark_mode {
-                Color32::from_rgb(22, 24, 30)
-            } else {
-                Color32::from_rgb(255, 255, 255)
-            };
-            painter.rect_filled(rect, 4.0, bg);
-            painter.rect_stroke(
-                rect,
-                4.0,
-                Stroke::new(1.0_f32, Color32::from_gray(165)),
-                egui::StrokeKind::Inside,
-            );
+            let (full_rect, _) =
+                ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::hover());
 
-            let style = SceneStyle {
-                width: f64::from(rect.width()),
-                height: f64::from(rect.height()),
-                padding: 30.0,
-                stroke_width: 2.0,
-                font_size: 14.0,
-                dark_mode: self.dark_mode,
-                show_stereo_labels: true,
-            };
-            let mut scene = build_mol_scene(
-                &self.session.canvas_mol,
-                &style,
-                &self.session.reaction_arrows,
-            );
-            scene.background = None;
-            paint_vector_scene(&painter, &scene, rect.min);
-
-            // Interactive hit-testing for atom/bond snapping and editing
-            self.hover_atom = None;
-            let mut hover_bond = None;
-            if let Some(hp) = resp.hover_pos() {
-                let lx = f64::from(hp.x - rect.min.x);
-                let ly = f64::from(hp.y - rect.min.y);
-                let mut best_d = 16.0_f64;
-                for (aid, sp) in scene.atom_screen_pos.iter().enumerate() {
-                    let d = (sp[0] - lx).hypot(sp[1] - ly);
-                    if d < best_d {
-                        best_d = d;
-                        self.hover_atom = Some(aid);
-                    }
+            match self.view_mode {
+                ViewMode::View2D => {
+                    self.draw_2d_canvas_at_rect(ui, full_rect);
                 }
-                if self.hover_atom.is_none() {
-                    let mut best_bd = 11.0_f64;
-                    for (bid, b) in self.session.canvas_mol.bonds.iter().enumerate() {
-                        if let (Some(p1), Some(p2)) = (
-                            scene.atom_screen_pos.get(b.u),
-                            scene.atom_screen_pos.get(b.v),
-                        ) {
-                            let d = point_seg_dist([lx, ly], *p1, *p2);
-                            if d < best_bd {
-                                best_bd = d;
-                                hover_bond = Some(bid);
-                            }
-                        }
-                    }
+                ViewMode::View3D => {
+                    let mol_ref = std::sync::Arc::clone(&self.session.canvas_mol);
+                    render_3d_viewport(
+                        ui,
+                        &mol_ref,
+                        &mut self.viewer_3d,
+                        full_rect,
+                        self.dark_mode,
+                    );
+                }
+                ViewMode::Split2D3D => {
+                    let gap = 6.0_f32;
+                    let half_w = ((full_rect.width() - gap) * 0.5).max(120.0);
+                    let left_rect = egui::Rect::from_min_size(
+                        full_rect.min,
+                        Vec2::new(half_w, full_rect.height()),
+                    );
+                    let right_rect = egui::Rect::from_min_size(
+                        Pos2::new(full_rect.min.x + half_w + gap, full_rect.min.y),
+                        Vec2::new(half_w, full_rect.height()),
+                    );
+                    self.draw_2d_canvas_at_rect(ui, left_rect);
+                    let mol_ref = std::sync::Arc::clone(&self.session.canvas_mol);
+                    render_3d_viewport(
+                        ui,
+                        &mol_ref,
+                        &mut self.viewer_3d,
+                        right_rect,
+                        self.dark_mode,
+                    );
                 }
             }
-
-            if let Some(aid) = self.hover_atom
-                && let Some(sp) = scene.atom_screen_pos.get(aid)
-            {
-                painter.circle_stroke(
-                    Pos2::new(rect.min.x + sp[0] as f32, rect.min.y + sp[1] as f32),
-                    11.0,
-                    Stroke::new(1.8_f32, Color32::from_rgb(34, 139, 230)),
-                );
-            } else if let Some(bid) = hover_bond
-                && let (Some(p1), Some(p2)) = (
-                    scene
-                        .atom_screen_pos
-                        .get(self.session.canvas_mol.bonds[bid].u),
-                    scene
-                        .atom_screen_pos
-                        .get(self.session.canvas_mol.bonds[bid].v),
-                )
-            {
-                painter.line_segment(
-                    [
-                        Pos2::new(rect.min.x + p1[0] as f32, rect.min.y + p1[1] as f32),
-                        Pos2::new(rect.min.x + p2[0] as f32, rect.min.y + p2[1] as f32),
-                    ],
-                    Stroke::new(4.5_f32, Color32::from_rgba_unmultiplied(34, 139, 230, 110)),
-                );
-            }
-
-            if self.tool == DrawTool::SelectMove {
-                if resp.drag_started() {
-                    self.drag_start_atom = self.hover_atom;
-                }
-                if resp.dragged()
-                    && let Some(aid) = self.drag_start_atom
-                {
-                    let delta = resp.drag_delta();
-                    let scale = scene.world_scale.max(1e-6);
-                    let mut mol = (*self.session.canvas_mol).clone();
-                    if let Some(Some(coords)) = mol.atoms.get_mut(aid).map(|a| &mut a.coords_2d) {
-                        coords[0] += f64::from(delta.x) / scale;
-                        coords[1] -= f64::from(delta.y) / scale;
-                    }
-                    self.session.canvas_mol = std::sync::Arc::new(mol);
-                }
-                if resp.drag_stopped() {
-                    self.drag_start_atom = None;
-                }
-            }
-
-            if resp.clicked()
-                && let Some(cp) = resp.interact_pointer_pos()
-            {
-                let [wx, wy] = scene
-                    .screen_to_world(f64::from(cp.x - rect.min.x), f64::from(cp.y - rect.min.y));
-                match self.tool {
-                    DrawTool::Ring(r) => {
-                        self.run_cmd(Command::StampRing {
-                            template_name: r.label().to_string(),
-                            x: wx,
-                            y: wy,
-                            snap_atom: self.hover_atom,
-                            snap_bond: hover_bond,
-                        });
-                    }
-                    DrawTool::BondOrder(order) => {
-                        let new_pos = [wx, wy];
-                        self.run_cmd(Command::AddAtomAndBond {
-                            from_atom: self.hover_atom.or_else(|| {
-                                if self.session.canvas_mol.atoms.is_empty() {
-                                    None
-                                } else {
-                                    Some(self.session.canvas_mol.atoms.len() - 1)
-                                }
-                            }),
-                            symbol: self.active_element.to_string(),
-                            x: new_pos[0],
-                            y: new_pos[1],
-                            order,
-                            stereo: BondStereo::None,
-                        });
-                    }
-                    DrawTool::BondStereo(stereo) => {
-                        let mut mol = (*self.session.canvas_mol).clone();
-                        if let Some(bid) = hover_bond {
-                            mol.bonds[bid].stereo = stereo;
-                            let _ = mol.perceive();
-                            self.session.canvas_mol = std::sync::Arc::new(mol);
-                            let _ = self.session.refresh_live_admet();
-                        } else if let Some(aid) = self.hover_atom {
-                            self.run_cmd(Command::AddAtomAndBond {
-                                from_atom: Some(aid),
-                                symbol: self.active_element.to_string(),
-                                x: wx,
-                                y: wy,
-                                order: BondOrder::Single,
-                                stereo,
-                            });
-                        }
-                    }
-                    DrawTool::Eraser => {
-                        let mut mol = (*self.session.canvas_mol).clone();
-                        if let Some(aid) = self.hover_atom {
-                            let _ = mol.remove_atom(aid);
-                            self.session.canvas_mol = std::sync::Arc::new(mol);
-                            let _ = self.session.refresh_live_admet();
-                            self.smiles_bar = self.session.canvas_mol.canonical_smiles();
-                        } else if let Some(bid) = hover_bond {
-                            let _ = mol.remove_bond(bid);
-                            self.session.canvas_mol = std::sync::Arc::new(mol);
-                            let _ = self.session.refresh_live_admet();
-                            self.smiles_bar = self.session.canvas_mol.canonical_smiles();
-                        }
-                    }
-                    DrawTool::ReactionArrow => {
-                        let sx = f64::from(cp.x - rect.min.x);
-                        let sy = f64::from(cp.y - rect.min.y);
-                        if let Some(start) = self.arrow_start.take() {
-                            let mut arrows = (*self.session.reaction_arrows).clone();
-                            arrows.push(ReactionArrow {
-                                start,
-                                end: [sx, sy],
-                                label_above: "Reagent".to_string(),
-                                label_below: String::new(),
-                            });
-                            self.session.reaction_arrows = std::sync::Arc::new(arrows);
-                        } else {
-                            self.arrow_start = Some([sx, sy]);
-                        }
-                    }
-                    DrawTool::SelectMove => {}
-                }
-            }
-            self.last_canvas_scene = Some(scene);
 
             ui.separator();
             // 5. Center-Bottom Panel: Interactive DataWarrior-Style SAR Explorer

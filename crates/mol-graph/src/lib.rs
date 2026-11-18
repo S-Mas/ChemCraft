@@ -3,15 +3,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod coords3d;
 pub mod dwar;
 pub mod element;
 pub mod error;
 pub mod mol;
 pub mod mutate;
+pub mod peptide;
 pub mod sdf;
 pub mod smarts;
 pub mod smiles;
 
+pub use coords3d::{
+    compute_3d_coords, covalent_radius, ensure_3d_coords, generate_3d_coords, ideal_bond_length,
+    write_pdb, write_sdf_v2000_3d,
+};
 pub use dwar::{
     TabularMolRecord, parse_csv_records, parse_csv_records_with_limit, parse_dwar,
     parse_dwar_with_limit, write_dwar,
@@ -19,10 +25,15 @@ pub use dwar::{
 pub use element::{ElementMeta, element_by_number, element_by_symbol, max_neutral_valence};
 pub use error::MolError;
 pub use mol::{
-    BondCisTrans, BondOrder, BondStereo, ChiralTag, MolAtom, MolBond, MolGraph, highest_cip_end_nbr,
+    BondCisTrans, BondOrder, BondStereo, ChiralTag, MolAtom, MolBond, MolGraph, PdbAtomMeta,
+    highest_cip_end_nbr,
 };
 pub use mutate::{
     SubstituentKind, attach_fragment_at, mutate_molecule, replace_carboxyl_with_tetrazole,
+};
+pub use peptide::{
+    MAX_PEPTIDE_RESIDUES, ParsedPeptide, SecondaryStructure, build_peptide, canonical_amino_acids,
+    parse_peptide_sequence,
 };
 pub use sdf::{parse_mol_block, parse_sdf, parse_sdf_with_limit, write_sdf_v2000, write_sdf_v3000};
 pub use smarts::SmartsQuery;
@@ -473,6 +484,107 @@ $$$$
         mol.perceive()?;
         assert!(mol.atoms[c].valence_exceeded);
         assert!(mol.warnings.iter().any(|w| w.contains("Valence error")));
+        Ok(())
+    }
+
+    #[test]
+    fn generates_valid_3d_coords_pdb_and_all_20_amino_acid_peptides() -> Result<(), MolError> {
+        // 1. Small drug molecule 3D generation + PDB + 3D SDF roundtrip
+        let mut sildenafil =
+            parse_smiles("CCCc1nn(C)c2c(=O)[nH]c(-c3cc(S(=O)(=O)N4CCN(C)CC4)ccc3OCC)nc12")?;
+        sildenafil.name = Some("Sildenafil".to_string());
+        generate_3d_coords(&mut sildenafil);
+        assert!(
+            sildenafil
+                .atoms
+                .iter()
+                .all(|a| { a.coords_3d.is_some_and(|p| p.iter().all(|v| v.is_finite())) })
+        );
+        let z_span: f64 = sildenafil
+            .atoms
+            .iter()
+            .filter_map(|a| a.coords_3d.map(|p| p[2].abs()))
+            .fold(0.0, f64::max);
+        assert!(
+            z_span > 0.25,
+            "expected non-flat 3D conformer, z_span={z_span}"
+        );
+
+        for b in &sildenafil.bonds {
+            let p1 = sildenafil.atoms[b.u]
+                .coords_3d
+                .ok_or(MolError::EmptyInput)?;
+            let p2 = sildenafil.atoms[b.v]
+                .coords_3d
+                .ok_or(MolError::EmptyInput)?;
+            let d = ((p1[0] - p2[0]).powi(2) + (p1[1] - p2[1]).powi(2) + (p1[2] - p2[2]).powi(2))
+                .sqrt();
+            assert!(
+                (0.95..=2.25).contains(&d),
+                "unrealistic 3D bond distance {d} between atoms {} and {}",
+                b.u,
+                b.v
+            );
+        }
+
+        let pdb = write_pdb(&sildenafil);
+        assert!(pdb.contains("HETATM") && pdb.contains("CONECT") && pdb.contains("END"));
+
+        let sdf3d = write_sdf_v2000_3d(&[&sildenafil]);
+        let parsed3d = parse_sdf(&sdf3d)
+            .into_iter()
+            .next()
+            .ok_or(MolError::EmptyInput)??;
+        assert_eq!(parsed3d.atoms.len(), sildenafil.atoms.len());
+        assert!(parsed3d.atoms.iter().any(|a| a.coords_3d.is_some()));
+
+        // 2. Peptide sequence parsing (1-letter, 3-letter, caps, errors)
+        let p_3 = parse_peptide_sequence("Ac-Ala-Gly-Cys-Pro-Tyr-NH2")?;
+        assert_eq!(p_3.one_letter, "AGCPY");
+        assert!(p_3.n_acetyl && p_3.c_amide);
+
+        // Build full 20-amino-acid peptide in both BetaStrand and AlphaHelix
+        let all20_strand = build_peptide("ACDEFGHIKLMNPQRSTVWY", SecondaryStructure::BetaStrand)?;
+        let all20_helix = build_peptide(
+            "Ac-ACDEFGHIKLMNPQRSTVWY-NH2",
+            SecondaryStructure::AlphaHelix,
+        )?;
+        assert!(
+            all20_strand.warnings.is_empty(),
+            "{:?}",
+            all20_strand.warnings
+        );
+        assert!(
+            all20_helix.warnings.is_empty(),
+            "{:?}",
+            all20_helix.warnings
+        );
+        assert!(all20_strand.atoms.iter().all(|a| a.coords_2d.is_some()));
+        assert!(all20_strand.atoms.iter().all(|a| a.coords_3d.is_some()));
+
+        let pep_pdb = write_pdb(&all20_helix);
+        assert!(
+            pep_pdb.contains("ATOM  ") && pep_pdb.contains("ALA A") && pep_pdb.contains("TRP A")
+        );
+        assert!(pep_pdb.contains("\nTER\n"));
+
+        // Proline closes a 5-membered pyrrolidine ring
+        let pro = build_peptide("PG", SecondaryStructure::Extended)?;
+        assert!(pro.rings.iter().any(|r| r.len() == 5));
+
+        // L-Ala CA CIP should match S
+        let l_ala_pep = build_peptide("Ala", SecondaryStructure::BetaStrand)?;
+        let ca = l_ala_pep
+            .atoms
+            .iter()
+            .find(|a| a.pdb_meta.as_ref().is_some_and(|m| m.atom_name == "CA"))
+            .ok_or(MolError::EmptyInput)?;
+        assert_eq!(ca.cip_label, Some('S'));
+
+        // Reject invalid residue and oversized sequence cleanly
+        assert!(build_peptide("AXG", SecondaryStructure::BetaStrand).is_err());
+        let too_long = "A".repeat(MAX_PEPTIDE_RESIDUES + 1);
+        assert!(build_peptide(&too_long, SecondaryStructure::BetaStrand).is_err());
         Ok(())
     }
 }

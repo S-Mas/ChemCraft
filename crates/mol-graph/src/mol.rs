@@ -67,6 +67,16 @@ pub enum ChiralTag {
     Unspecified,
 }
 
+/// Optional PDB / biomolecular residue metadata for peptide & complex export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdbAtomMeta {
+    pub atom_name: String,
+    pub res_name: String,
+    pub res_seq: u16,
+    pub chain: char,
+    pub is_hetatm: bool,
+}
+
 /// Atom node inside an editable `MolGraph`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MolAtom {
@@ -88,6 +98,10 @@ pub struct MolAtom {
     pub in_ring: bool,
     pub ring_sizes: Vec<usize>,
     pub coords_2d: Option<[f64; 2]>,
+    #[serde(default)]
+    pub coords_3d: Option<[f64; 3]>,
+    #[serde(default)]
+    pub pdb_meta: Option<PdbAtomMeta>,
     pub valence_exceeded: bool,
     pub from_bracket: bool,
 }
@@ -112,6 +126,8 @@ impl MolAtom {
             in_ring: false,
             ring_sizes: Vec::new(),
             coords_2d: None,
+            coords_3d: None,
+            pdb_meta: None,
             valence_exceeded: false,
             from_bracket: false,
         })

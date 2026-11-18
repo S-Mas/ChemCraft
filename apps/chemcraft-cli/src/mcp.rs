@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat, compute_admet_delta};
 use mol_engine::PathSandbox;
-use mol_graph::{MolGraph, SmartsQuery, mutate_molecule, parse_smiles, write_sdf_v2000};
+use mol_graph::{
+    MolGraph, SecondaryStructure, SmartsQuery, build_peptide, generate_3d_coords, mutate_molecule,
+    parse_smiles, write_pdb, write_sdf_v2000, write_sdf_v2000_3d,
+};
 use mol_sar::{MorganFp, SarFilter, SarTable};
 use mol_vector::{
     SceneStyle, build_mol_scene, export_sar_grid_eps, export_sar_grid_pdf_bytes,
@@ -547,6 +550,49 @@ fn mcp_tool_catalog() -> Value {
                     "evaluations": { "type": "array" }
                 }
             }
+        },
+        {
+            "name": "build_peptide",
+            "description": "Build a peptide in 2D and 3D from 1-letter or 3-letter sequence (e.g. 'Ac-Ala-Gly-Ser-NH2', 'AGYS'), returning SMILES, SVG, and optionally writing .pdb/.svg inside --write-root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sequence": { "type": "string" },
+                    "secondary_structure": { "type": "string", "enum": ["beta-strand", "alpha-helix", "extended"] },
+                    "output_pdb": { "type": "string" },
+                    "output_svg": { "type": "string" }
+                },
+                "required": ["sequence"]
+            }
+        },
+        {
+            "name": "export_3d",
+            "description": "Generate 3D coordinates for a SMILES or peptide sequence and write PDB or 3D SDF V2000 inside --write-root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "peptide": { "type": "string" },
+                    "secondary_structure": { "type": "string", "enum": ["beta-strand", "alpha-helix", "extended"] },
+                    "output_path": { "type": "string" },
+                    "format": { "type": "string", "enum": ["pdb", "sdf3d"] }
+                },
+                "required": ["output_path", "format"]
+            }
+        },
+        {
+            "name": "export_chimerax",
+            "description": "Export a self-contained UCSF ChimeraX 3D bundle (.pdb, .sdf, and .cxc script) inside --write-root without leaving the sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "peptide": { "type": "string" },
+                    "secondary_structure": { "type": "string", "enum": ["beta-strand", "alpha-helix", "extended"] },
+                    "stem": { "type": "string" }
+                },
+                "required": ["stem"]
+            }
         }
     ])
 }
@@ -558,6 +604,9 @@ fn dispatch_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Result<Valu
         "search_substructure" => tool_search_substructure(args, sandbox),
         "export_vector_figure" => tool_export_vector_figure(args, sandbox),
         "mol.analyze_admet" => tool_analyze_admet(args, sandbox),
+        "build_peptide" => tool_build_peptide(args, sandbox),
+        "export_3d" => tool_export_3d(args, sandbox),
+        "export_chimerax" => tool_export_chimerax(args, sandbox),
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -964,6 +1013,202 @@ fn tool_analyze_admet(args: &Value, sandbox: &PathSandbox) -> Result<Value, Stri
             "count": evals.len(),
             "report_written": report_path_written,
             "evaluations": evals,
+        }),
+    ))
+}
+
+fn parse_ss_arg(args: &Value) -> Result<SecondaryStructure, String> {
+    match args.get("secondary_structure").and_then(Value::as_str) {
+        None => Ok(SecondaryStructure::BetaStrand),
+        Some(s) => SecondaryStructure::from_str_lossy(s)
+            .ok_or_else(|| format!("invalid secondary_structure '{s}'")),
+    }
+}
+
+fn resolve_mol_from_args(args: &Value) -> Result<MolGraph, String> {
+    let ss = parse_ss_arg(args)?;
+    if let Some(seq) = args
+        .get("peptide")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return build_peptide(seq, ss).map_err(|e| format!("peptide error: {e}"));
+    }
+    if let Some(smi) = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mut m = parse_smiles(smi).map_err(|e| format!("SMILES parse error: {e}"))?;
+        generate_3d_coords(&mut m);
+        return Ok(m);
+    }
+    Err("provide either non-empty 'smiles' or 'peptide'".to_string())
+}
+
+fn tool_build_peptide(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let seq = args
+        .get("sequence")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required non-empty 'sequence'".to_string())?;
+    let ss = parse_ss_arg(args)?;
+    let mol = match build_peptide(seq, ss) {
+        Ok(m) => m,
+        Err(e) => return Ok(tool_err(format!("peptide build error: {e}"))),
+    };
+    let scene = build_mol_scene(&mol, &SceneStyle::default(), &[]);
+    let svg = scene_to_svg(&scene);
+
+    let mut pdb_written = None;
+    if let Some(pdb_rel) = args.get("output_pdb").and_then(Value::as_str) {
+        let (resolved, mut f) = match sandbox.open_write(Path::new(pdb_rel)) {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+        };
+        f.write_all(write_pdb(&mol).as_bytes())
+            .map_err(|e| e.to_string())?;
+        pdb_written = Some(resolved.display().to_string());
+    }
+    let mut svg_written = None;
+    if let Some(svg_rel) = args.get("output_svg").and_then(Value::as_str) {
+        let (resolved, mut f) = match sandbox.open_write(Path::new(svg_rel)) {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+        };
+        f.write_all(svg.as_bytes()).map_err(|e| e.to_string())?;
+        svg_written = Some(resolved.display().to_string());
+    }
+
+    Ok(tool_ok(
+        format!(
+            "Built peptide {} ({})",
+            mol.properties
+                .get("PEPTIDE_SEQUENCE")
+                .map_or(seq, String::as_str),
+            mol.formula()
+        ),
+        json!({
+            "sequence": mol.properties.get("PEPTIDE_SEQUENCE"),
+            "one_letter": mol.properties.get("PEPTIDE_1LETTER"),
+            "secondary_structure": mol.properties.get("SECONDARY_STRUCTURE"),
+            "residues": mol.properties.get("PEPTIDE_RESIDUES"),
+            "est_charge_ph74": mol.properties.get("EST_CHARGE_PH74"),
+            "formula": mol.formula(),
+            "canonical_smiles": mol.canonical_smiles(),
+            "output_pdb": pdb_written,
+            "output_svg": svg_written,
+            "svg": svg,
+        }),
+    ))
+}
+
+fn tool_export_3d(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let mol = match resolve_mol_from_args(args) {
+        Ok(m) => m,
+        Err(msg) => return Ok(tool_err(msg)),
+    };
+    let out_str = args
+        .get("output_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required 'output_path'".to_string())?;
+    let fmt = args
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("pdb")
+        .to_ascii_lowercase();
+    let payload = match fmt.as_str() {
+        "pdb" => write_pdb(&mol),
+        "sdf3d" => write_sdf_v2000_3d(&[&mol]),
+        _ => return Err(format!("unsupported 3D format '{fmt}'")),
+    };
+    let (resolved, mut f) = match sandbox.open_write(Path::new(out_str)) {
+        Ok(p) => p,
+        Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+    };
+    f.write_all(payload.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(tool_ok(
+        format!("Exported 3D {fmt} -> {}", resolved.display()),
+        json!({
+            "written_path": resolved.display().to_string(),
+            "format": fmt,
+            "atom_count": mol.atoms.len(),
+            "bytes": payload.len(),
+        }),
+    ))
+}
+
+fn tool_export_chimerax(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let mol = match resolve_mol_from_args(args) {
+        Ok(m) => m,
+        Err(msg) => return Ok(tool_err(msg)),
+    };
+    let raw_stem = args
+        .get("stem")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing required non-empty 'stem'".to_string())?;
+    let safe_stem: String = raw_stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(40)
+        .collect();
+    if safe_stem.is_empty() {
+        return Err("stem contains no safe ASCII characters".to_string());
+    }
+
+    let is_peptide = mol
+        .atoms
+        .iter()
+        .any(|a| a.pdb_meta.as_ref().is_some_and(|m| !m.is_hetatm));
+    let pdb_rel = format!("{safe_stem}.pdb");
+    let sdf_rel = format!("{safe_stem}.sdf");
+    let cxc_rel = format!("{safe_stem}.cxc");
+
+    let (pdb_resolved, mut pdb_f) = match sandbox.open_write(Path::new(&pdb_rel)) {
+        Ok(p) => p,
+        Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+    };
+    pdb_f
+        .write_all(write_pdb(&mol).as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let (sdf_resolved, mut sdf_f) = match sandbox.open_write(Path::new(&sdf_rel)) {
+        Ok(p) => p,
+        Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+    };
+    sdf_f
+        .write_all(write_sdf_v2000_3d(&[&mol]).as_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let cxc = if is_peptide {
+        format!(
+            "# ChemCraft -> UCSF ChimeraX\nopen {pdb_rel}\npreset \"overall look\" publication\ncartoon\nshow atoms\nstyle stick\ncolor byhetero\nhbonds reveal true\nlighting soft\nset bgColor white\nview\n"
+        )
+    } else {
+        format!(
+            "# ChemCraft -> UCSF ChimeraX\nopen {sdf_rel}\npreset \"overall look\" publication\nstyle ball\ncolor byhetero\nlighting soft\nset bgColor white\nview\n"
+        )
+    };
+    let (cxc_resolved, mut cxc_f) = match sandbox.open_write(Path::new(&cxc_rel)) {
+        Ok(p) => p,
+        Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+    };
+    cxc_f.write_all(cxc.as_bytes()).map_err(|e| e.to_string())?;
+
+    Ok(tool_ok(
+        format!("Exported ChimeraX bundle -> {}", cxc_resolved.display()),
+        json!({
+            "script_path": cxc_resolved.display().to_string(),
+            "pdb_path": pdb_resolved.display().to_string(),
+            "sdf_path": sdf_resolved.display().to_string(),
+            "is_peptide": is_peptide,
         }),
     ))
 }

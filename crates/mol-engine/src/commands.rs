@@ -6,7 +6,10 @@ use thiserror::Error;
 use mol_admet_bridge::{
     AdmetCraftProvider, AdmetDelta, AdmetProvider, MoleculeEvaluation, compute_admet_delta,
 };
-use mol_graph::{BondOrder, BondStereo, MolAtom, MolGraph, mutate_molecule, parse_smiles};
+use mol_graph::{
+    BondOrder, BondStereo, MolAtom, MolGraph, SecondaryStructure, build_peptide, mutate_molecule,
+    parse_smiles,
+};
 use mol_sar::{
     ActivityCliff, MatchedMolecularPair, SarFilter, SarTable, find_activity_cliffs,
     find_matched_molecular_pairs,
@@ -37,6 +40,7 @@ pub struct ChemSession {
     pub last_mutation_delta: Option<AdmetDelta>,
     pub cliffs: Vec<ActivityCliff>,
     pub mmps: Vec<MatchedMolecularPair>,
+    pub prefer_external_admet: bool,
     undo_stack: Vec<SessionSnapshot>,
     redo_stack: Vec<SessionSnapshot>,
 }
@@ -59,6 +63,7 @@ impl ChemSession {
             last_mutation_delta: None,
             cliffs: Vec::new(),
             mmps: Vec::new(),
+            prefer_external_admet: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         };
@@ -95,6 +100,12 @@ impl ChemSession {
         let _ = self.refresh_live_admet();
     }
 
+    pub fn admet_provider(&self) -> AdmetCraftProvider {
+        AdmetCraftProvider {
+            prefer_external_cli: self.prefer_external_admet,
+        }
+    }
+
     pub fn refresh_live_admet(&mut self) -> Result<(), String> {
         if self.canvas_mol.atoms.is_empty() {
             self.live_admet = None;
@@ -105,7 +116,8 @@ impl ChemSession {
             self.live_admet = None;
             return Ok(());
         }
-        let eval = AdmetCraftProvider::default()
+        let eval = self
+            .admet_provider()
             .evaluate_smiles(&smi, self.canvas_mol.name.as_deref())
             .map_err(|e| e.to_string())?;
         self.live_admet = Some(eval);
@@ -114,7 +126,7 @@ impl ChemSession {
 
     pub fn recompute_sar_analytics(&mut self) {
         let mut table = (*self.sar_table).clone();
-        table.enrich_with_admet(&AdmetCraftProvider::default());
+        table.enrich_with_admet(&self.admet_provider());
         self.cliffs = find_activity_cliffs(&table.rows, 0.40);
         self.mmps = find_matched_molecular_pairs(&table.rows);
         self.sar_table = Arc::new(table);
@@ -127,6 +139,10 @@ pub enum Command {
     LoadCanvasSmiles {
         smiles: String,
         name: Option<String>,
+    },
+    BuildPeptide {
+        sequence: String,
+        secondary_structure: SecondaryStructure,
     },
     ClearCanvas,
     CleanStructure2D,
@@ -285,11 +301,32 @@ impl CommandRegistry {
                     mol.name = Some(n);
                 }
                 generate_2d_coords(&mut mol);
+                mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
                 session.last_mutation_delta = None;
                 let _ = session.refresh_live_admet();
                 Ok(CommandOutcome {
                     message: format!("Loaded SMILES {}", session.canvas_mol.canonical_smiles()),
+                })
+            }
+            Command::BuildPeptide {
+                sequence,
+                secondary_structure,
+            } => {
+                session.push_undo();
+                let mol = build_peptide(&sequence, secondary_structure)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                let res_count = mol
+                    .properties
+                    .get("PEPTIDE_RESIDUES")
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                let name = mol.name.clone().unwrap_or_else(|| sequence.clone());
+                session.canvas_mol = Arc::new(mol);
+                session.last_mutation_delta = None;
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Built peptide {name} ({res_count} residues, 2D + 3D ready)"),
                 })
             }
             Command::ClearCanvas => {
@@ -388,9 +425,10 @@ impl CommandRegistry {
                 let mut mutated = mutate_molecule(&session.canvas_mol, atom_index, &group)
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 generate_2d_coords(&mut mutated);
+                mol_graph::generate_3d_coords(&mut mutated);
                 let new_smi = mutated.canonical_smiles();
                 let (delta, eval) = compute_admet_delta(
-                    &AdmetCraftProvider::default(),
+                    &session.admet_provider(),
                     &old_smi,
                     &new_smi,
                     mutated.name.as_deref(),
@@ -417,7 +455,7 @@ impl CommandRegistry {
                     mol.name = Some(format!("Drawn_{}", table.rows.len() + 1));
                 }
                 let row_id = table.add_molecule(mol, pic50, Some("Canvas".to_string()));
-                table.enrich_with_admet(&AdmetCraftProvider::default());
+                table.enrich_with_admet(&session.admet_provider());
                 session.selected_sar_idx = Some(row_id);
                 session.sar_table = Arc::new(table);
                 session.recompute_sar_analytics();
@@ -433,6 +471,7 @@ impl CommandRegistry {
                 if let Some(first) = session.sar_table.rows.first() {
                     let mut m = first.mol.clone();
                     generate_2d_coords(&mut m);
+                    mol_graph::ensure_3d_coords(&mut m);
                     session.canvas_mol = Arc::new(m);
                     session.selected_sar_idx = Some(0);
                     let _ = session.refresh_live_admet();
@@ -471,6 +510,7 @@ impl CommandRegistry {
                     (row.mol.clone(), row.name.clone())
                 };
                 generate_2d_coords(&mut m);
+                mol_graph::ensure_3d_coords(&mut m);
                 session.canvas_mol = Arc::new(m);
                 session.selected_sar_idx = Some(idx);
                 session.last_mutation_delta = None;
