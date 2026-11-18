@@ -25,9 +25,9 @@
 | L1 | `crates/mol-vector` | 2D layout generator (fused/spiro/bridged rings + `Clean Structure 2D`), ring-snapping templates, ring-aligned double/triple/aromatic bonds, stereo wedges/hashes/wavy/dative arrows, label collision resolution, and **SVG / EPS / FlateDecode PDF / PNG** export (single or multi-molecule grid) |
 | L2 | `crates/mol-admet-bridge` | Decoupled `AdmetProvider` trait + standalone pure-Rust ADMET preview engine, external `admetcraft-cli` delegation (`eval`/`batch` + BOILED-Egg SVG handoff), and `admetcraft` GUI launcher — zero sibling path dependencies |
 | L2 | `crates/mol-sar` | In-memory SAR compound table, 2048-bit ECFP4 (`MorganFp`) fingerprints, `rayon`-parallel Tanimoto/SMARTS/numeric filtering, deterministic Matched Molecular Pairs (MMP), duplicate detection, Activity Cliffs (`SALI`), and Ligand Efficiency (`LE`, `LLE`) |
-| L3 | `crates/mol-engine` | Session state, Copy-on-Write structural Undo/Redo (`Arc` snapshots), `CommandRegistry` (including `BuildPeptide`), bounded `.chemcraft` ZIP+JSON archives, **ChimeraX `.pdb`/`.sdf`+`.cxc` bundle launcher**, and kernel-confined `PathSandbox` (`openat2` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`) |
-| L4 | `apps/chemcraft-cli` | Headless CLI (`render`, `peptide`, `export3d`, `chimerax`, `filter`, `enrich`, `mmp`, `inspect`) + strict JSON-RPC 2.0 **MCP server** (`stdio` & `--tcp`) |
-| L5 | `apps/chemcraft` | Native `egui` / `eframe` desktop studio with `2D Vector` / `3D Interactive` / `Split 2D + 3D` viewports, Peptide Builder (1- & 3-letter sequences, Alpha-Helix/Beta-Strand/Extended), **"Visualizar en ChimeraX"** button, SAR Explorer, Command Palette (`Ctrl+K`), and AdmetCraft Inspector + handoff |
+| L3 | `crates/mol-engine` | Session state, Copy-on-Write structural Undo/Redo (`Arc` snapshots), `CommandRegistry` (including `BuildPeptide`), bounded `.chemcraft` ZIP+JSON archives, **ChimeraX `.pdb`/`.sdf`+`.cxc` bundle launcher**, **DockCraft 3D SDF/SMILES handoff**, and kernel-confined `PathSandbox` (`openat2` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`) |
+| L4 | `apps/chemcraft-cli` | Headless CLI (`render`, `peptide`, `export3d`, `chimerax`, `dockcraft`, `filter`, `enrich`, `mmp`, `inspect`) + strict JSON-RPC 2.0 **MCP server** (`stdio` & `--tcp`) |
+| L5 | `apps/chemcraft` | Native `egui` / `eframe` desktop studio focused on small-molecule & peptide 2D/3D design (`2D Vector` / `3D Interactive` / `Split 2D + 3D`), optional toggleable **SAR Explorer**, **"Visualizar en ChimeraX"**, **"Enviar a DockCraft"**, Command Palette (`Ctrl+K`), and AdmetCraft Inspector + handoff |
 
 ---
 
@@ -65,6 +65,14 @@ chemcraft-cli export3d "CC(=O)Oc1ccccc1C(=O)O" --out aspirin_3d.pdb --format pdb
 # Export a ChimeraX bundle (.pdb/.sdf + .cxc) and launch ChimeraX
 chemcraft-cli chimerax --peptide "Tyr-Gly-Gly-Phe-Met" --ss beta --launch
 
+# Export 3D ligand or SDF library to DockCraft and optionally launch DockCraft
+chemcraft-cli dockcraft --smiles "CC(C)Cc1ccc(C(C)C(=O)O)cc1" --launch
+chemcraft-cli dockcraft --library hits.sdf --out-dir ./dock_handoff
+
+# Stream, pre-filter (Ro5/Lead-Like/Ro3/BBB/MaxMin), protonate pH 7.4, and prepare 3D SDF libraries
+chemcraft-cli library --preset fragments --funnel ro3 --diverse-n 15 --out frags_3d.sdf --send-dockcraft
+chemcraft-cli library --input ~/.local/share/chemcraft/libraries/zinc_subset.sdf.gz --funnel lead --out lead_hits_3d.sdf
+
 # Hardened MCP Server (stdio or loopback TCP with token)
 chemcraft-cli mcp --read-root ./data --write-root ./exports
 chemcraft-cli mcp --read-root ./data --write-root ./exports --tcp 127.0.0.1:7878 --mcp-token "$TOKEN"
@@ -79,6 +87,7 @@ chemcraft-cli mcp --read-root ./data --write-root ./exports --tcp 127.0.0.1:7878
 - `build_peptide`: Builds 2D+3D peptides (`Beta-Strand`, `Alpha-Helix`, `Extended`) from 1-letter or 3-letter sequences with optional `.pdb`/`.svg` export inside `--write-root`.
 - `export_3d`: Generates 3D conformers from SMILES or peptides and writes PDB or 3D SDF inside `--write-root`.
 - `export_chimerax`: Exports self-contained ChimeraX `.pdb`/`.sdf` + `.cxc` scripts inside `--write-root`.
+- `screen_library`: Streams built-in presets or sandboxed `.sdf`/`.sdf.gz`/`.smi`/`.smi.gz`/`.csv`/`.dwar` chemical libraries through ADMET/SMARTS/MaxMin funnels, ionizes at pH 7.4, generates 3D coordinates, and writes DockCraft-ready 3D SDF files inside `--write-root`.
 
 ## Clean-Room & Scientific Scope Notes
 - Zero third-party proprietary code (`ChemDraw`, `MarvinSketch`, `DataWarrior`).

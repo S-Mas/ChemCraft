@@ -5,6 +5,8 @@
 
 pub mod chimerax;
 pub mod commands;
+pub mod dockcraft;
+pub mod library;
 pub mod project;
 pub mod sandbox;
 
@@ -14,6 +16,17 @@ pub use chimerax::{
 };
 pub use commands::{
     ChemSession, Command, CommandError, CommandInfo, CommandOutcome, CommandRegistry,
+};
+pub use dockcraft::{
+    DockCraftBundle, DockCraftError, default_dockcraft_handoff_dir, is_dockcraft_available,
+    is_dockcraft_cli_available, launch_dockcraft_for_mols, write_dockcraft_bundle,
+};
+pub use library::{
+    BuiltinLibraryPreset, DEFAULT_MAX_LIBRARY_RECORDS, LibraryError, LibraryFilterConfig,
+    LibraryScreeningResult, MAX_LIBRARY_UNCOMPRESSED_BYTES, ScreenedLibraryHit, ScreeningFunnel,
+    default_library_dir, discover_local_libraries, export_library_hits_sdf3d,
+    filter_and_prepare_library, load_builtin_library, materialize_builtin_library,
+    maxmin_diversity_pick, protonate_at_ph74, stream_load_library, stream_load_library_from_file,
 };
 pub use project::{
     ChemCraftDocument, ProjectError, decode_chemcraft_zip, encode_chemcraft_zip,
@@ -210,6 +223,82 @@ mod tests {
         assert!(cxc.contains("cartoon"));
         assert!(cxc.contains("hbonds reveal true"));
         let _ = std::fs::remove_dir_all(&out_dir);
+
+        let dock_dir = std::env::temp_dir().join("chemcraft_dockcraft_unit_test");
+        let _ = std::fs::remove_dir_all(&dock_dir);
+        let d_bundle = write_dockcraft_bundle(&[&session.canvas_mol], &dock_dir, Some("agys_lig"))?;
+        assert_eq!(d_bundle.molecule_count, 1);
+        assert!(d_bundle.sdf_path.exists());
+        assert!(d_bundle.smi_path.exists());
+        assert!(d_bundle.pdb_path.as_ref().is_some_and(|p| p.exists()));
+        let _ = std::fs::remove_dir_all(&dock_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn chemical_library_streaming_gzip_ph74_and_funnel_screening_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_lib_screen_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base)?;
+
+        // 1. Built-in presets parse cleanly with zero empty entries
+        let fda = load_builtin_library(BuiltinLibraryPreset::FdaApprovedMedicines);
+        let frags = load_builtin_library(BuiltinLibraryPreset::FragmentRo3);
+        let kin = load_builtin_library(BuiltinLibraryPreset::KinaseAndGpcrScaffolds);
+        assert!(fda.len() >= 30);
+        assert!(frags.len() >= 25);
+        assert!(kin.len() >= 20);
+
+        // 2. Write a gzipped SMILES library and stream-load it back
+        let smi_path =
+            materialize_builtin_library(BuiltinLibraryPreset::FdaApprovedMedicines, &base)?;
+        let smi_gz = base.join("fda.smi.gz");
+        {
+            use std::io::Write;
+            let raw = std::fs::read(&smi_path)?;
+            let mut enc = flate2::write::GzEncoder::new(
+                std::fs::File::create(&smi_gz)?,
+                flate2::Compression::fast(),
+            );
+            enc.write_all(&raw)?;
+            enc.finish()?;
+        }
+        let discovered = discover_local_libraries(&base);
+        assert!(discovered.len() >= 2);
+        let streamed = stream_load_library(&smi_gz, 100)?;
+        assert_eq!(streamed.len(), fda.len());
+
+        // 3. Parallel screening funnel + pH 7.4 ionization + MaxMin diversity pick + 3D SDF export
+        let cfg = LibraryFilterConfig {
+            funnel: ScreeningFunnel::RuleOf5,
+            diversity_pick_n: Some(12),
+            protonate_ph74: true,
+            generate_3d: true,
+            ..LibraryFilterConfig::default()
+        };
+        let res = filter_and_prepare_library("FDA.smi.gz", streamed, &cfg)?;
+        assert_eq!(res.hits.len(), 12);
+        assert!(
+            res.hits
+                .iter()
+                .all(|h| h.mol.atoms.iter().all(|a| a.coords_3d.is_some()))
+        );
+
+        // Verify Ibuprofen carboxylate ionized at pH 7.4 when unfiltered
+        let mut ibu = mol_graph::parse_smiles("CC(C)Cc1ccc(C(C)C(=O)O)cc1")?;
+        protonate_at_ph74(&mut ibu);
+        assert!(
+            ibu.atoms.iter().any(|a| a.formal_charge == -1),
+            "expected deprotonated carboxylate on Ibuprofen at pH 7.4"
+        );
+
+        let sdf_out = base.join("screen_ready_3d.sdf");
+        let n_written = export_library_hits_sdf3d(&res, &sdf_out)?;
+        assert_eq!(n_written, 12);
+        assert!(sdf_out.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 }

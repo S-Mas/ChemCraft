@@ -18,8 +18,8 @@ pub struct Viewer3dState {
 impl Default for Viewer3dState {
     fn default() -> Self {
         Self {
-            yaw: 0.45,
-            pitch: 0.25,
+            yaw: 0.62,
+            pitch: 0.48,
             zoom: 1.0,
             show_ribbon: true,
             show_labels: true,
@@ -30,8 +30,8 @@ impl Default for Viewer3dState {
 
 impl Viewer3dState {
     pub fn reset(&mut self) {
-        self.yaw = 0.45;
-        self.pitch = 0.25;
+        self.yaw = 0.62;
+        self.pitch = 0.48;
         self.zoom = 1.0;
     }
 }
@@ -478,6 +478,28 @@ pub fn render_3d_viewport(
         egui::FontId::proportional(11.0),
         Color32::from_gray(if dark_mode { 170 } else { 100 }),
     );
+
+    // Bottom-right 3D axis orientation triad (X red, Y green, Z blue)
+    let origin = rect.right_bottom() + Vec2::new(-28.0, -26.0);
+    let axes = [
+        ("X", [1.0_f32, 0.0, 0.0], Color32::from_rgb(220, 72, 72)),
+        ("Y", [0.0, 1.0, 0.0], Color32::from_rgb(64, 185, 86)),
+        ("Z", [0.0, 0.0, 1.0], Color32::from_rgb(66, 138, 240)),
+    ];
+    for (lbl, v, col) in axes {
+        let rx = v[0] * cy + v[2] * sy;
+        let rz1 = -v[0] * sy + v[2] * cy;
+        let ry = v[1] * cp - rz1 * sp;
+        let end = origin + Vec2::new(rx * 16.0, -ry * 16.0);
+        painter.line_segment([origin, end], Stroke::new(1.8_f32, col));
+        painter.text(
+            end + Vec2::new(rx * 4.5, -ry * 4.5),
+            egui::Align2::CENTER_CENTER,
+            lbl,
+            egui::FontId::proportional(9.5),
+            col,
+        );
+    }
 
     resp
 }

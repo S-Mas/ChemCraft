@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat, compute_admet_delta};
-use mol_engine::PathSandbox;
+use mol_engine::{
+    BuiltinLibraryPreset, LibraryFilterConfig, PathSandbox, ScreeningFunnel,
+    filter_and_prepare_library, load_builtin_library, stream_load_library_from_file,
+};
 use mol_graph::{
     MolGraph, SecondaryStructure, SmartsQuery, build_peptide, generate_3d_coords, mutate_molecule,
     parse_smiles, write_pdb, write_sdf_v2000, write_sdf_v2000_3d,
@@ -593,6 +596,22 @@ fn mcp_tool_catalog() -> Value {
                 },
                 "required": ["stem"]
             }
+        },
+        {
+            "name": "screen_library",
+            "description": "Stream/filter a built-in ('fda'|'fragments'|'kinase') or sandboxed --read-root chemical library (.sdf/.sdf.gz/.smi/.smi.gz/.csv/.dwar) using an ADMET/SMARTS/MaxMin funnel, ionize at pH 7.4, generate 3D conformers, and write a DockCraft-ready 3D SDF inside --write-root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "preset": { "type": "string", "enum": ["fda", "fragments", "kinase"] },
+                    "file": { "type": "string" },
+                    "funnel": { "type": "string", "enum": ["all", "ro5", "lead", "ro3", "bbb"] },
+                    "smarts": { "type": "string" },
+                    "diverse_n": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "protonate_ph74": { "type": "boolean" },
+                    "output_sdf": { "type": "string" }
+                }
+            }
         }
     ])
 }
@@ -607,6 +626,7 @@ fn dispatch_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Result<Valu
         "build_peptide" => tool_build_peptide(args, sandbox),
         "export_3d" => tool_export_3d(args, sandbox),
         "export_chimerax" => tool_export_chimerax(args, sandbox),
+        "screen_library" => tool_screen_library(args, sandbox),
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -1209,6 +1229,110 @@ fn tool_export_chimerax(args: &Value, sandbox: &PathSandbox) -> Result<Value, St
             "pdb_path": pdb_resolved.display().to_string(),
             "sdf_path": sdf_resolved.display().to_string(),
             "is_peptide": is_peptide,
+        }),
+    ))
+}
+
+fn tool_screen_library(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let (label, mols) = if let Some(rel_file) = args
+        .get("file")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let (resolved, file) = match sandbox.open_read(Path::new(rel_file)) {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_err(format!("read sandbox error: {e}"))),
+        };
+        let hint = resolved
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| rel_file.to_string());
+        let loaded = match stream_load_library_from_file(file, &hint, 5_000) {
+            Ok(v) => v,
+            Err(e) => return Ok(tool_err(format!("library parse error: {e}"))),
+        };
+        (rel_file.to_string(), loaded)
+    } else {
+        let pre_str = args.get("preset").and_then(Value::as_str).unwrap_or("fda");
+        let preset = BuiltinLibraryPreset::from_str_lossy(pre_str)
+            .ok_or_else(|| format!("unknown library preset '{pre_str}'"))?;
+        (preset.label().to_string(), load_builtin_library(preset))
+    };
+
+    let funnel_str = args.get("funnel").and_then(Value::as_str).unwrap_or("ro5");
+    let funnel = ScreeningFunnel::from_str_lossy(funnel_str)
+        .ok_or_else(|| format!("invalid funnel '{funnel_str}'"))?;
+    let cfg = LibraryFilterConfig {
+        funnel,
+        smarts_substructure: args
+            .get("smarts")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        diversity_pick_n: args
+            .get("diverse_n")
+            .and_then(Value::as_u64)
+            .map(|v| (v as usize).clamp(1, 500)),
+        max_hits: 500,
+        protonate_ph74: args
+            .get("protonate_ph74")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        generate_3d: true,
+        ..LibraryFilterConfig::default()
+    };
+
+    let res = match filter_and_prepare_library(&label, mols, &cfg) {
+        Ok(r) => r,
+        Err(e) => return Ok(tool_err(format!("library screening failed: {e}"))),
+    };
+
+    let mut sdf_written = None;
+    if let Some(out_rel) = args.get("output_sdf").and_then(Value::as_str) {
+        let refs: Vec<&MolGraph> = res.hits.iter().map(|h| &h.mol).collect();
+        let sdf = write_sdf_v2000_3d(&refs);
+        let (resolved, mut f) = match sandbox.open_write(Path::new(out_rel)) {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+        };
+        f.write_all(sdf.as_bytes()).map_err(|e| e.to_string())?;
+        sdf_written = Some(resolved.display().to_string());
+    }
+
+    let hit_summaries: Vec<Value> = res
+        .hits
+        .iter()
+        .take(50)
+        .map(|h| {
+            json!({
+                "name": h.name,
+                "canonical_smiles": h.canonical_smiles,
+                "formula": h.eval.physicochemical.formula,
+                "mw": h.eval.physicochemical.molecular_weight,
+                "clogp": h.eval.lipophilicity.consensus_log_p,
+                "tpsa": h.eval.physicochemical.tpsa,
+                "lipinski_violations": h.eval.druglikeness.lipinski.violations,
+            })
+        })
+        .collect();
+
+    Ok(tool_ok(
+        format!(
+            "Screened '{}': {}/{} passed funnel -> {} selected in {} ms",
+            res.source_label,
+            res.passed_funnel,
+            res.total_loaded,
+            res.hits.len(),
+            res.elapsed_ms
+        ),
+        json!({
+            "source": res.source_label,
+            "total_loaded": res.total_loaded,
+            "passed_funnel": res.passed_funnel,
+            "selected_count": res.hits.len(),
+            "elapsed_ms": res.elapsed_ms,
+            "output_sdf": sdf_written,
+            "hits": hit_summaries,
         }),
     ))
 }

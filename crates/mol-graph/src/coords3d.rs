@@ -91,6 +91,10 @@ fn atom_is_sp(mol: &MolGraph, i: usize) -> bool {
 }
 
 fn atom_is_sp2(mol: &MolGraph, i: usize) -> bool {
+    // Hypervalent sulfur (sulfone/sulfonamide/sulfoxide) & phosphorus (phosphate) are tetrahedral/pyramidal
+    if matches!(mol.atoms[i].symbol.as_str(), "S" | "P") && mol.adj[i].len() >= 3 {
+        return false;
+    }
     if mol.atoms[i].aromatic {
         return true;
     }
@@ -296,15 +300,15 @@ fn generate_3d_vec(mol: &MolGraph) -> Vec<[f64; 3]> {
         })
         .collect();
 
-    // Small deterministic out-of-plane break on any purely planar sp3 atoms so minimization resolves tetrahedra
+    // Authentic out-of-plane pyramidal break on degree >= 3 sp3 atoms so minimization resolves tetrahedra
     for i in 0..n {
         if !atom_is_sp(mol, i) && !atom_is_sp2(mol, i) && mol.adj[i].len() >= 3 {
             let z_var: f64 = mol.adj[i]
                 .iter()
                 .map(|&(nb, _)| (pts[nb][2] - pts[i][2]).abs())
                 .sum();
-            if z_var < 0.05 {
-                let sign = if i % 2 == 0 { 0.35 } else { -0.35 };
+            if z_var < 0.25 {
+                let sign = if i.is_multiple_of(2) { 0.55 } else { -0.55 };
                 pts[i][2] += sign;
             }
         }
@@ -363,11 +367,11 @@ fn place_seed_ring(mol: &MolGraph, ring: &[usize], pos: &mut [Option<[f64; 3]>])
         let z = if planar {
             0.0
         } else if k == 6 {
-            if idx % 2 == 0 { 0.24 } else { -0.24 }
+            if idx % 2 == 0 { 0.30 } else { -0.30 }
         } else if k == 5 && idx == 0 {
-            0.28
+            0.34
         } else if k >= 7 {
-            0.28 * (ang * 2.0).sin()
+            0.34 * (ang * 2.0).sin()
         } else {
             0.0
         };
@@ -629,17 +633,77 @@ fn expand_bfs_3d(mol: &MolGraph, comp: &[usize], pos: &mut [Option<[f64; 3]>]) {
         };
         let (s_t, c_t) = tilt.sin_cos();
 
+        // When 2 neighbors are already placed on a tetrahedral sp3/sulfone atom, span out of their plane!
+        if !is_sp
+            && !is_sp2
+            && placed_nbrs.len() == 2
+            && (k == 1 || k == 2)
+            && let (Some(p1), Some(p2)) = (pos[placed_nbrs[0].0], pos[placed_nbrs[1].0])
+        {
+            let v1 = unit3(sub3(p1, pu), [1.0, 0.0, 0.0]);
+            let v2 = unit3(sub3(p2, pu), [0.0, 1.0, 0.0]);
+            let bis = unit3(scale3(add3(v1, v2), -1.0), fwd_dir);
+            let perp_n = unit3(cross3(v1, v2), ortho_pair(bis).1);
+            // Solve dot(c_in * bis, v1) = -1/3 so angle(new, v1) = angle(new, v2) = 109.47°
+            let d_bv = dot3(bis, v1);
+            let c_in = if d_bv.abs() > 0.15 {
+                ((-1.0 / 3.0) / d_bv).clamp(0.05, 0.90)
+            } else {
+                0.577
+            };
+            let c_perp = (1.0 - c_in * c_in).max(0.0).sqrt();
+            for (idx, &(w, bid)) in unplaced_nbrs.iter().enumerate() {
+                let bl = ideal_bond_length(mol, u, w, mol.bonds[bid].order);
+                let sign = if k == 2 {
+                    if idx == 0 { 1.0 } else { -1.0 }
+                } else if u.is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let dir = add3(scale3(bis, c_in), scale3(perp_n, sign * c_perp));
+                pos[w] = Some(add3(pu, scale3(unit3(dir, fwd_dir), bl)));
+                if !in_q[w] {
+                    q.push_back(w);
+                    in_q[w] = true;
+                }
+            }
+            continue;
+        }
+
         for (idx, &(w, bid)) in unplaced_nbrs.iter().enumerate() {
             let bl = ideal_bond_length(mol, u, w, mol.bonds[bid].order);
             let dir = if k == 1 {
                 if is_sp {
                     fwd_dir
                 } else {
-                    add3(scale3(fwd_dir, c_t), scale3(u_orth, s_t))
+                    // Add authentic non-planar staggered/gauche torsion unless conjugated sp2-sp2
+                    let parent_is_sp2 = placed_nbrs
+                        .first()
+                        .is_some_and(|&(p, _)| atom_is_sp2(mol, p));
+                    let dihedral = if is_sp2 && parent_is_sp2 {
+                        0.0
+                    } else if parent_is_sp2 || is_sp2 {
+                        // Ar-X or sp3-C(=O) out-of-plane twist (~55 deg)
+                        if u.is_multiple_of(2) { 0.96 } else { -0.96 }
+                    } else {
+                        // sp3-sp3 gauche/staggered twist alternating in 3D (~60 deg)
+                        if u.is_multiple_of(2) {
+                            PI / 3.0
+                        } else {
+                            -PI / 3.0
+                        }
+                    };
+                    let rot_orth = add3(
+                        scale3(u_orth, dihedral.cos()),
+                        scale3(v_orth, dihedral.sin()),
+                    );
+                    add3(scale3(fwd_dir, c_t), scale3(rot_orth, s_t))
                 }
             } else if k == 2 && placed_nbrs.len() == 1 && !is_sp2 {
-                // Two remaining substituents on tetrahedral atom: ±60° rotated around axis!
-                let phi = if idx == 0 { PI / 3.0 } else { -PI / 3.0 };
+                // Two remaining substituents on tetrahedral atom: rotate dihedral by ±60° + base twist into 3D
+                let twist = if u.is_multiple_of(2) { 0.45 } else { -0.45 };
+                let phi = twist + if idx == 0 { PI / 3.0 } else { -PI / 3.0 };
                 let rot_perp = add3(scale3(u_orth, phi.cos()), scale3(v_orth, phi.sin()));
                 add3(scale3(fwd_dir, c_t), scale3(rot_perp, s_t))
             } else if placed_nbrs.is_empty() && k >= 3 {

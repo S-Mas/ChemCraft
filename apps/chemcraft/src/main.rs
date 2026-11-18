@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod library_ui;
 mod viewer3d;
 mod widgets;
 
@@ -7,12 +8,14 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use egui::{Color32, Pos2, RichText, Sense, Stroke, Vec2};
+use library_ui::{LibraryAction, LibraryWindowState, render_library_window};
 use mol_admet_bridge::{
     AdmetCraftProvider, AdmetProvider, AdmetReportFormat, launch_admetcraft_gui,
 };
 use mol_engine::{
     ChemCraftDocument, ChemSession, Command, CommandRegistry, MAX_READ_BYTES, PathSandbox,
-    decode_chemcraft_zip, is_chimerax_available, launch_chimerax_for_mol, save_chemcraft_atomic,
+    decode_chemcraft_zip, is_chimerax_available, is_dockcraft_available, launch_chimerax_for_mol,
+    launch_dockcraft_for_mols, save_chemcraft_atomic,
 };
 use mol_graph::{
     BondOrder, BondStereo, SecondaryStructure, canonical_amino_acids, generate_3d_coords,
@@ -60,7 +63,10 @@ struct ChemCraftApp {
     peptide_seq: String,
     peptide_ss: SecondaryStructure,
     peptide_drawer_open: bool,
+    library_win: LibraryWindowState,
+    sar_panel_open: bool,
     chimerax_available: bool,
+    dockcraft_available: bool,
     admet_cli_available: bool,
     admet_gui_available: bool,
     active_element: &'static str,
@@ -82,13 +88,20 @@ struct ChemCraftApp {
 impl ChemCraftApp {
     fn new() -> Self {
         let mut session = ChemSession::new();
-        let _ = CommandRegistry::execute(&mut session, Command::LoadDemo50Sar);
+        let _ = CommandRegistry::execute(
+            &mut session,
+            Command::LoadCanvasSmiles {
+                smiles: "CC(C)Cc1ccc(C(C)C(=O)O)cc1".to_string(),
+                name: Some("Ibuprofen".to_string()),
+            },
+        );
         let export_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .display()
             .to_string();
         let smiles_bar = session.canvas_mol.canonical_smiles();
         let chimerax_available = is_chimerax_available();
+        let dockcraft_available = is_dockcraft_available();
         let admet_cli_available = AdmetCraftProvider::is_external_cli_available();
         let admet_gui_available = AdmetCraftProvider::is_external_gui_available();
         Self {
@@ -99,7 +112,10 @@ impl ChemCraftApp {
             peptide_seq: "Ac-Ala-Gly-Tyr-Ser-NH2".to_string(),
             peptide_ss: SecondaryStructure::AlphaHelix,
             peptide_drawer_open: false,
+            library_win: LibraryWindowState::default(),
+            sar_panel_open: false,
             chimerax_available,
+            dockcraft_available,
             admet_cli_available,
             admet_gui_available,
             active_element: "C",
@@ -122,8 +138,17 @@ impl ChemCraftApp {
     }
 
     fn run_cmd(&mut self, cmd: Command) {
+        let activates_sar = matches!(
+            cmd,
+            Command::LoadDemo50Sar
+                | Command::AddCanvasToSar { .. }
+                | Command::FilterSarByCanvasSubstructure
+        );
         match CommandRegistry::execute(&mut self.session, cmd) {
             Ok(out) => {
+                if activates_sar {
+                    self.sar_panel_open = true;
+                }
                 self.status_msg = out.message;
                 self.smiles_bar = self.session.canvas_mol.canonical_smiles();
             }
@@ -233,6 +258,44 @@ impl ChemCraftApp {
             }
             Err(e) => {
                 self.status_msg = format!("ChimeraX: {e}");
+            }
+        }
+    }
+
+    fn send_to_dockcraft(&mut self, include_sar_library: bool) {
+        let mut owned: Vec<mol_graph::MolGraph> = Vec::new();
+        if include_sar_library && !self.session.sar_table.rows.is_empty() {
+            for r in &self.session.sar_table.rows {
+                let mut m = r.mol.clone();
+                mol_graph::ensure_3d_coords(&mut m);
+                owned.push(m);
+            }
+        } else if !self.session.canvas_mol.atoms.is_empty() {
+            let mut m = (*self.session.canvas_mol).clone();
+            mol_graph::ensure_3d_coords(&mut m);
+            owned.push(m);
+        }
+        if owned.is_empty() {
+            self.status_msg =
+                "No molecule on canvas or SAR library to send to DockCraft".to_string();
+            return;
+        }
+        let refs: Vec<&mol_graph::MolGraph> = owned.iter().collect();
+        let stem = if include_sar_library && owned.len() > 1 {
+            Some("chemcraft_screening_library")
+        } else {
+            None
+        };
+        match launch_dockcraft_for_mols(&refs, None, stem) {
+            Ok(bundle) => {
+                self.status_msg = format!(
+                    "Sent {} 3D molecule(s) to DockCraft -> {}",
+                    bundle.molecule_count,
+                    bundle.sdf_path.display()
+                );
+            }
+            Err(e) => {
+                self.status_msg = format!("DockCraft: {e}");
             }
         }
     }
@@ -749,6 +812,7 @@ impl ChemCraftApp {
             Ok(()) if !table.rows.is_empty() => {
                 self.session.sar_table = std::sync::Arc::new(table);
                 self.session.recompute_sar_analytics();
+                self.sar_panel_open = true;
                 self.status_msg = format!(
                     "Imported {} compounds from {}",
                     self.session.sar_table.rows.len(),
@@ -902,21 +966,48 @@ impl eframe::App for ChemCraftApp {
         self.handle_shortcuts(ctx);
         self.render_palette(ctx);
         self.render_peptide_drawer(ctx);
+        match render_library_window(ctx, &mut self.library_win, &self.export_dir) {
+            LibraryAction::None => {}
+            LibraryAction::LoadHitOnCanvas(mut mol) => {
+                mol_vector::ensure_2d_coords(&mut mol);
+                mol_graph::ensure_3d_coords(&mut mol);
+                self.session.canvas_mol = std::sync::Arc::new(mol);
+                self.smiles_bar = self.session.canvas_mol.canonical_smiles();
+                let _ = self.session.refresh_live_admet();
+                self.viewer_3d.reset();
+                self.status_msg = format!(
+                    "Loaded library hit {} (2D + 3D)",
+                    self.session.canvas_mol.name.as_deref().unwrap_or("Mol")
+                );
+            }
+            LibraryAction::SendResultToSar(table) => {
+                self.session.sar_table = std::sync::Arc::new(table);
+                self.session.recompute_sar_analytics();
+                self.sar_panel_open = true;
+                self.status_msg = format!(
+                    "Loaded {} library hits into SAR Explorer",
+                    self.session.sar_table.rows.len()
+                );
+            }
+            LibraryAction::Status(msg) => {
+                self.status_msg = msg;
+            }
+        }
 
         // 1. Top Toolbar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading(RichText::new("ChemCraft").strong());
-                ui.label(RichText::new("2D/3D + Peptides + SAR + ChimeraX + AdmetCraft").weak());
+                ui.label(RichText::new("2D/3D Mol & Peptide Design + ChimeraX + DockCraft").weak());
                 ui.separator();
-                if ui.button("Demo 50 SAR").clicked() {
-                    self.run_cmd(Command::LoadDemo50Sar);
-                }
                 if ui.button("Clean 2D").clicked() {
                     self.run_cmd(Command::CleanStructure2D);
                 }
                 if ui.button("Peptide Builder").clicked() {
                     self.peptide_drawer_open = !self.peptide_drawer_open;
+                }
+                if ui.button("Libraries (In Silico)").clicked() {
+                    self.library_win.open = !self.library_win.open;
                 }
                 if ui.button("-COOH -> Tetrazole").clicked() {
                     self.run_cmd(Command::MutateBioisostere {
@@ -967,6 +1058,16 @@ impl eframe::App for ChemCraftApp {
                 if cx_btn.clicked() {
                     self.open_in_chimerax();
                 }
+                let dc_btn = ui.button("Enviar a DockCraft").on_hover_text(if self.dockcraft_available {
+                    "Exporta SDF 3D + SMILES y abre DockCraft para docking y virtual screening"
+                } else {
+                    "Exporta bundle SDF 3D + SMILES listo para DockCraft"
+                });
+                if dc_btn.clicked() {
+                    self.send_to_dockcraft(false);
+                }
+                ui.separator();
+                ui.toggle_value(&mut self.sar_panel_open, "SAR Explorer");
                 if ui
                     .button(if self.dark_mode { "Light" } else { "Dark" })
                     .clicked()
@@ -1271,6 +1372,9 @@ impl eframe::App for ChemCraftApp {
                     if ui.button("Visualizar en ChimeraX").clicked() {
                         self.open_in_chimerax();
                     }
+                    if ui.button("Enviar a DockCraft").clicked() {
+                        self.send_to_dockcraft(false);
+                    }
                 }
             });
 
@@ -1282,7 +1386,11 @@ impl eframe::App for ChemCraftApp {
             }
 
             // Center-top interactive viewport (2D Vector / 3D Conformer / Split 2D + 3D)
-            let canvas_h = (ui.available_height() * 0.44).max(220.0);
+            let canvas_h = if self.sar_panel_open {
+                (ui.available_height() * 0.44).max(220.0)
+            } else {
+                ui.available_height().max(320.0)
+            };
             let canvas_w = ui.available_width().max(320.0);
             let (full_rect, _) =
                 ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::hover());
@@ -1324,20 +1432,32 @@ impl eframe::App for ChemCraftApp {
                 }
             }
 
+            if !self.sar_panel_open {
+                return;
+            }
+
             ui.separator();
-            // 5. Center-Bottom Panel: Interactive DataWarrior-Style SAR Explorer
+            // 5. Center-Bottom Panel (Optional): Interactive DataWarrior-Style SAR Explorer
             let matching = self
                 .session
                 .sar_table
                 .matching_indices(&self.session.sar_filter)
                 .unwrap_or_else(|_| (0..self.session.sar_table.rows.len()).collect());
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.strong(format!(
                     "SAR Explorer ({}/{} shown)",
                     matching.len(),
                     self.session.sar_table.rows.len()
                 ));
+                if ui.button("Demo 50 SAR").clicked() {
+                    self.run_cmd(Command::LoadDemo50Sar);
+                }
+                if !self.session.sar_table.rows.is_empty()
+                    && ui.button("Enviar biblioteca a DockCraft").clicked()
+                {
+                    self.send_to_dockcraft(true);
+                }
                 ui.separator();
                 ui.selectable_value(&mut self.sar_tab, SarTab::Table, "SAR Table");
                 ui.selectable_value(&mut self.sar_tab, SarTab::Scatter, "Scatter Plot");
@@ -1570,10 +1690,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_initializes_with_50_sar_and_runs_bioisostere_and_undo() {
+    fn app_starts_clean_with_optional_sar_and_runs_bioisostere_and_undo() {
         let mut app = ChemCraftApp::new();
-        assert_eq!(app.session.sar_table.rows.len(), 50);
+        assert!(!app.sar_panel_open);
+        assert!(app.session.sar_table.rows.is_empty());
         assert!(app.session.live_admet.is_some());
+        app.run_cmd(Command::LoadDemo50Sar);
+        assert_eq!(app.session.sar_table.rows.len(), 50);
         app.run_cmd(Command::MutateBioisostere {
             atom_index: None,
             group: "tetrazole".to_string(),

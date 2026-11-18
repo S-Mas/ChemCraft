@@ -16,6 +16,7 @@ mol-admet-bridge = { path = "../mol-admet-bridge" }
 mol-graph = { path = "../mol-graph" }
 mol-sar = { path = "../mol-sar" }
 mol-vector = { path = "../mol-vector" }
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

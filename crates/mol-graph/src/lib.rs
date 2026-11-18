@@ -506,9 +506,46 @@ $$$$
             .filter_map(|a| a.coords_3d.map(|p| p[2].abs()))
             .fold(0.0, f64::max);
         assert!(
-            z_span > 0.25,
-            "expected non-flat 3D conformer, z_span={z_span}"
+            z_span > 1.0,
+            "expected genuinely 3D conformer, z_span={z_span}"
         );
+
+        // Verify Ibuprofen isobutyl/chiral C(sp3) bond angles and non-planar 3D span
+        let mut ibu = parse_smiles("CC(C)Cc1ccc(C(C)C(=O)O)cc1")?;
+        generate_3d_coords(&mut ibu);
+        let ibu_z: f64 = ibu
+            .atoms
+            .iter()
+            .filter_map(|a| a.coords_3d.map(|p| p[2].abs()))
+            .fold(0.0, f64::max);
+        assert!(ibu_z > 0.85, "expected non-flat Ibuprofen 3D, z={ibu_z}");
+        for (ci, a) in ibu.atoms.iter().enumerate() {
+            if !a.aromatic && a.symbol == "C" && ibu.adj[ci].len() >= 3 {
+                let is_carbonyl = ibu.adj[ci]
+                    .iter()
+                    .any(|&(_, bid)| ibu.bonds[bid].order == BondOrder::Double);
+                if !is_carbonyl {
+                    let pc = a.coords_3d.ok_or(MolError::EmptyInput)?;
+                    let p0 = ibu.atoms[ibu.adj[ci][0].0]
+                        .coords_3d
+                        .ok_or(MolError::EmptyInput)?;
+                    let p1 = ibu.atoms[ibu.adj[ci][1].0]
+                        .coords_3d
+                        .ok_or(MolError::EmptyInput)?;
+                    let u = [p0[0] - pc[0], p0[1] - pc[1], p0[2] - pc[2]];
+                    let v = [p1[0] - pc[0], p1[1] - pc[1], p1[2] - pc[2]];
+                    let du = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+                    let dv = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    let cos_a =
+                        ((u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (du * dv)).clamp(-1.0, 1.0);
+                    let deg = cos_a.acos().to_degrees();
+                    assert!(
+                        (96.0..=120.0).contains(&deg),
+                        "unexpected sp3 angle {deg:.1} on Ibuprofen atom {ci}"
+                    );
+                }
+            }
+        }
 
         for b in &sildenafil.bonds {
             let p1 = sildenafil.atoms[b.u]

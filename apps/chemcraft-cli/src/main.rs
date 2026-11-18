@@ -7,11 +7,15 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat};
 use mol_engine::{
-    PathSandbox, default_chimerax_export_dir, launch_chimerax_for_mol, write_chimerax_bundle,
+    BuiltinLibraryPreset, DEFAULT_MAX_LIBRARY_RECORDS, LibraryFilterConfig, PathSandbox,
+    ScreeningFunnel, default_chimerax_export_dir, default_dockcraft_handoff_dir,
+    export_library_hits_sdf3d, filter_and_prepare_library, launch_chimerax_for_mol,
+    launch_dockcraft_for_mols, load_builtin_library, stream_load_library, write_chimerax_bundle,
+    write_dockcraft_bundle,
 };
 use mol_graph::{
-    SecondaryStructure, build_peptide, generate_3d_coords, parse_smiles, write_pdb,
-    write_sdf_v2000, write_sdf_v2000_3d,
+    MolGraph, SecondaryStructure, build_peptide, ensure_3d_coords, generate_3d_coords,
+    parse_smiles, write_pdb, write_sdf_v2000, write_sdf_v2000_3d,
 };
 use mol_sar::{
     SarFilter, SarTable, find_activity_cliffs, find_duplicate_compounds,
@@ -153,6 +157,50 @@ enum SubCmd {
         out_dir: Option<PathBuf>,
         #[arg(long)]
         launch: bool,
+    },
+    /// Export a 3D ligand or chemical library (.sdf/.smi/.pdb) for DockCraft virtual screening and optionally launch DockCraft.
+    Dockcraft {
+        #[arg(long)]
+        smiles: Option<String>,
+        #[arg(long)]
+        peptide: Option<String>,
+        #[arg(long)]
+        library: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = PeptideSsCli::Beta)]
+        ss: PeptideSsCli,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long)]
+        launch: bool,
+    },
+    /// Stream, pre-filter (Ro5/Lead-Like/Ro3/BBB/SMARTS/MaxMin), protonate (pH 7.4), and prepare a 3D screening library for DockCraft.
+    Library {
+        /// Built-in preset ('fda', 'fragments', 'kinase')
+        #[arg(long)]
+        preset: Option<String>,
+        /// Local library file (.sdf, .sdf.gz, .smi, .smi.gz, .csv, .dwar)
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Funnel ('all', 'ro5', 'lead', 'ro3', 'bbb')
+        #[arg(long, default_value = "ro5")]
+        funnel: String,
+        #[arg(long)]
+        smarts: Option<String>,
+        #[arg(long)]
+        reference: Option<String>,
+        #[arg(long, default_value_t = 0.0)]
+        min_tanimoto: f64,
+        /// Optional MaxMin ECFP4 diversity subset size
+        #[arg(long)]
+        diverse_n: Option<usize>,
+        #[arg(long, default_value_t = 500)]
+        max_hits: usize,
+        #[arg(long, default_value_t = true)]
+        ph74: bool,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        send_dockcraft: bool,
     },
     /// Inspect SMILES structure, key, coordinates, and AdmetCraft profile as JSON.
     Inspect { smiles: String },
@@ -389,6 +437,113 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "launched": launch,
             });
             println!("{}", serde_json::to_string_pretty(&info)?);
+        }
+        SubCmd::Dockcraft {
+            smiles,
+            peptide,
+            library,
+            ss,
+            out_dir,
+            launch,
+        } => {
+            let mut mols: Vec<MolGraph> = if let Some(lib_path) = library {
+                let table = load_table_from_path(&lib_path)?;
+                table
+                    .rows
+                    .into_iter()
+                    .map(|r| {
+                        let mut m = r.mol;
+                        ensure_3d_coords(&mut m);
+                        m
+                    })
+                    .collect()
+            } else if let Some(seq) = peptide {
+                vec![build_peptide(&seq, ss.into())?]
+            } else if let Some(smi) = smiles {
+                let mut m = parse_smiles(&smi)?;
+                generate_3d_coords(&mut m);
+                vec![m]
+            } else {
+                return Err("provide --smiles, --peptide, or --library".into());
+            };
+            for m in &mut mols {
+                ensure_3d_coords(m);
+            }
+            let refs: Vec<&MolGraph> = mols.iter().collect();
+            let target_dir = out_dir.unwrap_or_else(default_dockcraft_handoff_dir);
+            let bundle = if launch {
+                launch_dockcraft_for_mols(&refs, Some(&target_dir), None)?
+            } else {
+                write_dockcraft_bundle(&refs, &target_dir, None)?
+            };
+            let info = serde_json::json!({
+                "dir": bundle.dir.display().to_string(),
+                "sdf_3d": bundle.sdf_path.display().to_string(),
+                "smi": bundle.smi_path.display().to_string(),
+                "pdb": bundle.pdb_path.as_ref().map(|p| p.display().to_string()),
+                "molecule_count": bundle.molecule_count,
+                "launched": launch,
+            });
+            println!("{}", serde_json::to_string_pretty(&info)?);
+        }
+        SubCmd::Library {
+            preset,
+            input,
+            funnel,
+            smarts,
+            reference,
+            min_tanimoto,
+            diverse_n,
+            max_hits,
+            ph74,
+            out,
+            send_dockcraft,
+        } => {
+            let (source_label, mols) = if let Some(p) = input {
+                (
+                    p.display().to_string(),
+                    stream_load_library(&p, DEFAULT_MAX_LIBRARY_RECORDS)?,
+                )
+            } else if let Some(ref pre) = preset {
+                let p = BuiltinLibraryPreset::from_str_lossy(pre).ok_or_else(|| {
+                    format!("unknown library preset '{pre}' (expected fda|fragments|kinase)")
+                })?;
+                (p.label().to_string(), load_builtin_library(p))
+            } else {
+                return Err("provide --preset or --input".into());
+            };
+            let funnel_enum = ScreeningFunnel::from_str_lossy(&funnel).ok_or_else(|| {
+                format!("unknown funnel '{funnel}' (expected all|ro5|lead|ro3|bbb)")
+            })?;
+            let cfg = LibraryFilterConfig {
+                funnel: funnel_enum,
+                smarts_substructure: smarts,
+                reference_smiles: reference,
+                min_tanimoto,
+                diversity_pick_n: diverse_n,
+                max_hits,
+                protonate_ph74: ph74,
+                generate_3d: true,
+            };
+            let res = filter_and_prepare_library(&source_label, mols, &cfg)?;
+            let count = export_library_hits_sdf3d(&res, &out)?;
+            if send_dockcraft {
+                let refs: Vec<&MolGraph> = res.hits.iter().map(|h| &h.mol).collect();
+                let _ = write_dockcraft_bundle(
+                    &refs,
+                    &default_dockcraft_handoff_dir(),
+                    Some("chemcraft_screen_lib"),
+                )?;
+            }
+            let summary = serde_json::json!({
+                "source": res.source_label,
+                "total_loaded": res.total_loaded,
+                "passed_funnel": res.passed_funnel,
+                "selected_count": count,
+                "elapsed_ms": res.elapsed_ms,
+                "out_sdf_3d": out.display().to_string(),
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }
     Ok(())
@@ -840,6 +995,19 @@ mod tests {
                 }
             })
             .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":5,"method":"tools/call",
+                "params":{
+                    "name":"screen_library",
+                    "arguments":{
+                        "preset":"fragments",
+                        "funnel":"ro3",
+                        "diverse_n":8,
+                        "output_sdf":"frags_3d.sdf"
+                    }
+                }
+            })
+            .to_string(),
         ]
         .join("\n")
             + "\n";
@@ -851,16 +1019,19 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .map(serde_json::from_str)
             .collect::<Result<_, _>>()?;
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
         assert_eq!(lines[1]["result"]["isError"], false);
         assert_eq!(lines[2]["result"]["isError"], false);
         assert_eq!(lines[3]["result"]["isError"], false);
         // Path traversal rejected by sandbox
         assert_eq!(lines[4]["result"]["isError"], true);
+        assert_eq!(lines[5]["result"]["isError"], false);
+        assert_eq!(lines[5]["result"]["structuredContent"]["selected_count"], 8);
 
         assert!(wdir.join("pep.pdb").exists());
         assert!(wdir.join("pep.svg").exists());
         assert!(wdir.join("aspirin_3d.sdf").exists());
+        assert!(wdir.join("frags_3d.sdf").exists());
         assert!(wdir.join("enkephalin.cxc").exists());
         assert!(wdir.join("enkephalin.pdb").exists());
         let cxc = std::fs::read_to_string(wdir.join("enkephalin.cxc"))?;

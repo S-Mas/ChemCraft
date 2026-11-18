@@ -1965,6 +1965,7 @@ dependencies = [
  "mol-graph",
  "mol-sar",
  "mol-vector",
+ "rayon",
  "rustix 1.1.6",
  "serde",
  "serde_json",
