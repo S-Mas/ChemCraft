@@ -945,6 +945,9 @@ impl ChemCraftApp {
                 "filter_canvas" => self.run_cmd(Command::FilterSarByCanvasSubstructure),
                 "clear_filter" => self.run_cmd(Command::ClearSarFilter),
                 "clear_canvas" => self.run_cmd(Command::ClearCanvas),
+                "import_dockcraft_results" => {
+                    self.run_cmd(Command::ImportDockCraftResults { path: None });
+                }
                 "undo" => self.run_cmd(Command::Undo),
                 "redo" => self.run_cmd(Command::Redo),
                 _ => {}
@@ -1458,6 +1461,16 @@ impl eframe::App for ChemCraftApp {
                 {
                     self.send_to_dockcraft(true);
                 }
+                if !self.session.sar_table.rows.is_empty() {
+                    let import_btn = ui
+                        .button("Importar resultados de DockCraft")
+                        .on_hover_text(
+                            "Trae el último *.dockcraft.json que DockCraft haya dejado y añade                              sus columnas de acoplamiento junto a las medidas. Se puede deshacer.",
+                        );
+                    if import_btn.clicked() {
+                        self.run_cmd(Command::ImportDockCraftResults { path: None });
+                    }
+                }
                 ui.separator();
                 ui.selectable_value(&mut self.sar_tab, SarTab::Table, "SAR Table");
                 ui.selectable_value(&mut self.sar_tab, SarTab::Scatter, "Scatter Plot");
@@ -1480,6 +1493,7 @@ impl eframe::App for ChemCraftApp {
                                 "Compound",
                                 "Series",
                                 "pIC50",
+                                "Dock",
                                 "LE",
                                 "MW",
                                 "cLogP",
@@ -1506,6 +1520,31 @@ impl eframe::App for ChemCraftApp {
                                 }
                                 ui.label(&row.series);
                                 ui.label(row.pic50.map_or("-".to_string(), |v| format!("{v:.2}")));
+                                // Docking affinity, next to the measured potency rather than
+                                // instead of it: a computed column and an experimental one have
+                                // to stay side by side to be worth anything.
+                                match row.properties.get("DockCraft_affinity_kcal") {
+                                    Some(v) => {
+                                        let label = ui.label(v);
+                                        if let Some(pose) =
+                                            row.properties.get("DockCraft_pose_sdf")
+                                        {
+                                            label.on_hover_text(format!(
+                                                "{} kcal/mol{}\nPose: {pose}",
+                                                v,
+                                                row.properties
+                                                    .get("DockCraft_receptor")
+                                                    .map_or_else(
+                                                        String::new,
+                                                        |r| format!(" vs {r}")
+                                                    )
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("-");
+                                    }
+                                }
                                 ui.label(
                                     row.ligand_efficiency()
                                         .map_or("-".to_string(), |v| format!("{v:.2}")),

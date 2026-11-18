@@ -19,9 +19,10 @@ pub use commands::{
 };
 pub use dockcraft::{
     DockCraftBundle, DockCraftError, DockCraftResultRow, DockCraftResults, DockCraftRun,
-    MergeOutcome, default_dockcraft_handoff_dir, is_dockcraft_available,
-    is_dockcraft_cli_available, launch_dockcraft_for_mols, merge_dockcraft_results,
-    read_dockcraft_results, write_dockcraft_bundle,
+    MergeOutcome, default_dockcraft_handoff_dir, default_dockcraft_results_dir,
+    is_dockcraft_available, is_dockcraft_cli_available, latest_dockcraft_results,
+    launch_dockcraft_for_mols, merge_dockcraft_results, read_dockcraft_results,
+    write_dockcraft_bundle,
 };
 pub use library::{
     BuiltinLibraryPreset, DEFAULT_MAX_LIBRARY_RECORDS, LibraryError, LibraryFilterConfig,

@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -178,6 +179,11 @@ pub enum Command {
     SelectSarRow {
         idx: usize,
     },
+    /// Fold a DockCraft `*.dockcraft.json` results sidecar into the SAR table. `path` picks a
+    /// specific file; `None` takes the most recent one DockCraft left in its results directory.
+    ImportDockCraftResults {
+        path: Option<String>,
+    },
     Undo,
     Redo,
 }
@@ -241,6 +247,11 @@ impl CommandRegistry {
             CommandInfo {
                 id: "clear_canvas",
                 label: "Clear Drawing Canvas",
+                shortcut: None,
+            },
+            CommandInfo {
+                id: "import_dockcraft_results",
+                label: "Import DockCraft Docking Results",
                 shortcut: None,
             },
             CommandInfo {
@@ -462,6 +473,71 @@ impl CommandRegistry {
                 Ok(CommandOutcome {
                     message: format!("Added compound #{} to SAR table", row_id + 1),
                 })
+            }
+            Command::ImportDockCraftResults { path } => {
+                if session.sar_table.rows.is_empty() {
+                    return Err(CommandError::Failed(
+                        "the SAR table is empty; load or build the series before importing results"
+                            .to_string(),
+                    ));
+                }
+                let sidecar_path = match path {
+                    Some(p) => PathBuf::from(p),
+                    None => {
+                        let dir = crate::dockcraft::default_dockcraft_results_dir();
+                        crate::dockcraft::latest_dockcraft_results(&dir).ok_or_else(|| {
+                            CommandError::Failed(format!(
+                                "no *.dockcraft.json found in {}. Run a screening with \
+                                 `dockcraft-cli screen --sidecar` first",
+                                dir.display()
+                            ))
+                        })?
+                    }
+                };
+                let results = crate::dockcraft::read_dockcraft_results(&sidecar_path)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                let pose_dir = sidecar_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+
+                session.push_undo();
+                let mut table = (*session.sar_table).clone();
+                let outcome =
+                    crate::dockcraft::merge_dockcraft_results(&mut table, &results, &pose_dir);
+                session.sar_table = Arc::new(table);
+                session.recompute_sar_analytics();
+
+                let mut message = format!(
+                    "Imported docking results for {} of {} compounds ({} vs {})",
+                    outcome.merged,
+                    results.rows.len(),
+                    if results.run.receptor_name.is_empty() {
+                        "receptor"
+                    } else {
+                        &results.run.receptor_name
+                    },
+                    if results.run.scoring.is_empty() {
+                        "scoring"
+                    } else {
+                        &results.run.scoring
+                    }
+                );
+                if !outcome.unmatched.is_empty() {
+                    // Say which ones did not land. A merge that quietly drops rows is worse than
+                    // one that refuses, because the table still looks complete.
+                    let shown: Vec<&str> = outcome
+                        .unmatched
+                        .iter()
+                        .take(3)
+                        .map(String::as_str)
+                        .collect();
+                    let more = outcome.unmatched.len().saturating_sub(shown.len());
+                    message.push_str(&format!("; no match for {}", shown.join(", ")));
+                    if more > 0 {
+                        message.push_str(&format!(" and {more} more"));
+                    }
+                }
+                Ok(CommandOutcome { message })
             }
             Command::LoadDemo50Sar => {
                 session.push_undo();

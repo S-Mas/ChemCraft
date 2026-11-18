@@ -211,3 +211,69 @@ fn a_file_of_the_wrong_format_is_refused() -> Result<(), Box<dyn std::error::Err
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[test]
+fn a_row_id_from_another_document_cannot_hijack_a_row() -> Result<(), Box<dyn std::error::Error>> {
+    // The hazard this guards: row ids mean something only inside the document they came from.
+    // Pasting a sidecar built for one series onto a different table must not attach every result
+    // to whatever happens to be sitting at that row number.
+    let mut table = series()?;
+    let rows = r#"
+        {"canonical_smiles":"CCO","source_row_id":0,"name":"Ethanol","rank":1,
+         "affinity_kcal":-2.0,"hyde_delta_g_kcal":-1.0,"estimated_ki_nm":1.0,
+         "ligand_efficiency":0.1,"mpo_score":0.1,"measured_pic50":null,"pose_sdf":""},
+        {"canonical_smiles":"CCCC","source_row_id":1,"name":"Butane","rank":2,
+         "affinity_kcal":-3.0,"hyde_delta_g_kcal":-1.5,"estimated_ki_nm":1.0,
+         "ligand_efficiency":0.2,"mpo_score":0.2,"measured_pic50":null,"pose_sdf":""}"#;
+    let results: DockCraftResults = serde_json::from_str(&sidecar_json(rows))?;
+
+    let outcome = merge_dockcraft_results(&mut table, &results, Path::new("/tmp/r"));
+    assert_eq!(
+        outcome.merged, 0,
+        "a sidecar for other structures was applied by row number"
+    );
+    assert_eq!(outcome.unmatched.len(), 2);
+    assert!(
+        table
+            .rows
+            .iter()
+            .all(|r| !r.properties.contains_key("DockCraft_affinity_kcal")),
+        "an unrelated result landed on a compound"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_row_id_breaks_ties_between_duplicate_structures() -> Result<(), Box<dyn std::error::Error>> {
+    // Where the id does earn its keep: two rows holding the same structure.
+    let mut table = series()?;
+    let mut dup = parse_smiles("NC(=N)c1ccccc1")?;
+    dup.name = Some("Benzamidine (resynthesised)".to_string());
+    let dup_id = table.add_molecule(dup, Some(4.80), Some("batch2".to_string()));
+    let smiles = table.rows[dup_id].canonical_smiles.clone();
+
+    let rows = format!(
+        r#"{{"canonical_smiles":"{smiles}","source_row_id":{dup_id},"name":"Benzamidine b2",
+             "rank":1,"affinity_kcal":-5.9,"hyde_delta_g_kcal":-5.2,"estimated_ki_nm":1.0,
+             "ligand_efficiency":0.6,"mpo_score":0.5,"measured_pic50":4.80,"pose_sdf":""}}"#
+    );
+    let results: DockCraftResults = serde_json::from_str(&sidecar_json(&rows))?;
+    let outcome = merge_dockcraft_results(&mut table, &results, Path::new("/tmp/r"));
+
+    assert_eq!(outcome.merged, 1);
+    assert_eq!(
+        table.rows[dup_id]
+            .properties
+            .get("DockCraft_affinity_kcal")
+            .map(String::as_str),
+        Some("-5.900"),
+        "the tiebreaker picked the wrong duplicate"
+    );
+    assert!(
+        !table.rows[0]
+            .properties
+            .contains_key("DockCraft_affinity_kcal"),
+        "the result also landed on the other copy"
+    );
+    Ok(())
+}

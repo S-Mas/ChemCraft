@@ -294,8 +294,13 @@ const KEY_POSE: &str = "DockCraft_pose_sdf";
 const KEY_RECEPTOR: &str = "DockCraft_receptor";
 const KEY_SCORING: &str = "DockCraft_scoring";
 
-/// Folds docking results into a SAR table, matching on the SAR row id first and the canonical
-/// SMILES second.
+/// Folds docking results into a SAR table, matching on chemical identity first.
+///
+/// The join is by canonical SMILES, with the SAR row id used only to choose between rows that
+/// hold the *same* structure, or when the sidecar carries no SMILES at all. Matching by id first
+/// would be a trap: an id means something only inside the document it came from, so pasting an
+/// old sidecar onto a different table -- the fifty-compound demo, say -- would have attached
+/// every result to whatever happened to be sitting at that row number, silently and plausibly.
 ///
 /// The results land in each row's `properties` map under `DockCraft_*` keys, so the SAR explorer
 /// can filter, sort, and compute matched molecular pairs and activity cliffs on a docking score
@@ -311,20 +316,32 @@ pub fn merge_dockcraft_results(
 ) -> MergeOutcome {
     let mut outcome = MergeOutcome::default();
     for row in &results.rows {
-        let by_id = table
-            .rows
-            .iter()
-            .position(|r| row.source_row_id.is_some_and(|id| r.id == id));
-        let idx = by_id.or_else(|| {
-            if row.canonical_smiles.is_empty() {
-                None
-            } else {
-                table
-                    .rows
+        let idx = if row.canonical_smiles.is_empty() {
+            // No structure to go on: the row id is all there is, so take it and hope the caller
+            // handed us a sidecar for this table.
+            table
+                .rows
+                .iter()
+                .position(|r| row.source_row_id.is_some_and(|id| r.id == id))
+        } else {
+            let same_structure: Vec<usize> = table
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.canonical_smiles == row.canonical_smiles)
+                .map(|(i, _)| i)
+                .collect();
+            match same_structure.len() {
+                0 => None,
+                1 => same_structure.first().copied(),
+                // Duplicated structure: now the row id earns its keep as a tiebreaker.
+                _ => same_structure
                     .iter()
-                    .position(|r| r.canonical_smiles == row.canonical_smiles)
+                    .copied()
+                    .find(|&i| row.source_row_id.is_some_and(|id| table.rows[i].id == id))
+                    .or_else(|| same_structure.first().copied()),
             }
-        });
+        };
         let Some(idx) = idx else {
             let label = if row.name.is_empty() {
                 row.canonical_smiles.clone()
@@ -363,4 +380,57 @@ pub fn merge_dockcraft_results(
         outcome.merged += 1;
     }
     outcome
+}
+
+/// Where DockCraft leaves its results for us, the mirror of [`default_dockcraft_handoff_dir`].
+///
+/// ```text
+/// ChemCraft -> DockCraft   $XDG_DATA_HOME/DockCraft/chemcraft_handoff
+/// DockCraft -> ChemCraft   $XDG_DATA_HOME/ChemCraft/dockcraft_results
+/// ```
+pub fn default_dockcraft_results_dir() -> PathBuf {
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME")
+        && !xdg_data.trim().is_empty()
+    {
+        return PathBuf::from(xdg_data)
+            .join("ChemCraft")
+            .join("dockcraft_results");
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("ChemCraft")
+            .join("dockcraft_results");
+    }
+    PathBuf::from("dockcraft_results")
+}
+
+/// Most recently written `*.dockcraft.json` in `dir`.
+///
+/// The desktop app has no file picker, and asking someone to type a path into a text field to
+/// collect a file this program's own sibling just wrote would be busywork. The usual case is
+/// "I just ran a screening, bring it back", so the newest sidecar is the right default; the CLI
+/// stays available when a specific file is wanted.
+pub fn latest_dockcraft_results(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".dockcraft.json"))
+        {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, p)| p)
 }
