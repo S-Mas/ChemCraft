@@ -8,10 +8,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat};
 use mol_engine::{
     BuiltinLibraryPreset, DEFAULT_MAX_LIBRARY_RECORDS, LibraryFilterConfig, PathSandbox,
-    ScreeningFunnel, default_chimerax_export_dir, default_dockcraft_handoff_dir,
-    export_library_hits_sdf3d, filter_and_prepare_library, launch_chimerax_for_mol,
-    launch_dockcraft_for_mols, load_builtin_library, stream_load_library, write_chimerax_bundle,
-    write_dockcraft_bundle,
+    ScreeningFunnel, decode_chemcraft_zip, default_chimerax_export_dir,
+    default_dockcraft_handoff_dir, export_library_hits_sdf3d, filter_and_prepare_library,
+    launch_chimerax_for_mol, launch_dockcraft_for_mols, load_builtin_library,
+    merge_dockcraft_results, read_dockcraft_results, save_chemcraft_atomic, stream_load_library,
+    write_chimerax_bundle, write_dockcraft_bundle,
 };
 use mol_graph::{
     MolGraph, SecondaryStructure, build_peptide, ensure_3d_coords, generate_3d_coords,
@@ -172,6 +173,20 @@ enum SubCmd {
         out_dir: Option<PathBuf>,
         #[arg(long)]
         launch: bool,
+    },
+    /// Fold a DockCraft `*.dockcraft.json` results sidecar back into a .chemcraft project's SAR
+    /// table, so docking scores sit beside the measured ones and MMP / activity cliffs can be
+    /// computed on either.
+    DockResults {
+        /// Project to merge into
+        #[arg(long)]
+        project: PathBuf,
+        /// DockCraft results sidecar (*.dockcraft.json)
+        #[arg(long)]
+        results: PathBuf,
+        /// Where to write the merged project. Defaults to overwriting --project.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Stream, pre-filter (Ro5/Lead-Like/Ro3/BBB/SMARTS/MaxMin), protonate (pH 7.4), and prepare a 3D screening library for DockCraft.
     Library {
@@ -435,6 +450,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "structure": bundle.structure_path.display().to_string(),
                 "is_peptide": bundle.is_peptide,
                 "launched": launch,
+            });
+            println!("{}", serde_json::to_string_pretty(&info)?);
+        }
+        SubCmd::DockResults {
+            project,
+            results,
+            out,
+        } => {
+            let bytes = std::fs::read(&project)?;
+            let mut doc = decode_chemcraft_zip(&bytes)?;
+            let sidecar = read_dockcraft_results(&results)?;
+            let pose_dir = results.parent().unwrap_or_else(|| Path::new("."));
+            let before = doc.sar_table.rows.len();
+            let outcome = merge_dockcraft_results(&mut doc.sar_table, &sidecar, pose_dir);
+            let target = out.unwrap_or(project);
+            save_chemcraft_atomic(&target, &doc)?;
+            let info = serde_json::json!({
+                "project": target.display().to_string(),
+                "sar_rows": before,
+                "merged": outcome.merged,
+                "unmatched": outcome.unmatched,
+                "receptor": sidecar.run.receptor_name,
+                "scoring": sidecar.run.scoring,
             });
             println!("{}", serde_json::to_string_pretty(&info)?);
         }

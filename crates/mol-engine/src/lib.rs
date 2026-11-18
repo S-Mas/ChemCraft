@@ -18,8 +18,10 @@ pub use commands::{
     ChemSession, Command, CommandError, CommandInfo, CommandOutcome, CommandRegistry,
 };
 pub use dockcraft::{
-    DockCraftBundle, DockCraftError, default_dockcraft_handoff_dir, is_dockcraft_available,
-    is_dockcraft_cli_available, launch_dockcraft_for_mols, write_dockcraft_bundle,
+    DockCraftBundle, DockCraftError, DockCraftResultRow, DockCraftResults, DockCraftRun,
+    MergeOutcome, default_dockcraft_handoff_dir, is_dockcraft_available,
+    is_dockcraft_cli_available, launch_dockcraft_for_mols, merge_dockcraft_results,
+    read_dockcraft_results, write_dockcraft_bundle,
 };
 pub use library::{
     BuiltinLibraryPreset, DEFAULT_MAX_LIBRARY_RECORDS, LibraryError, LibraryFilterConfig,
