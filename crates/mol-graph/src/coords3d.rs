@@ -300,16 +300,18 @@ fn generate_3d_vec(mol: &MolGraph) -> Vec<[f64; 3]> {
         })
         .collect();
 
-    // Authentic out-of-plane pyramidal break on degree >= 3 sp3 atoms so minimization resolves tetrahedra
+    // Authentic out-of-plane pyramidal break ONLY on genuinely coplanar degree >= 3 sp3 atoms
     for i in 0..n {
         if !atom_is_sp(mol, i) && !atom_is_sp2(mol, i) && mol.adj[i].len() >= 3 {
-            let z_var: f64 = mol.adj[i]
-                .iter()
-                .map(|&(nb, _)| (pts[nb][2] - pts[i][2]).abs())
-                .sum();
-            if z_var < 0.25 {
-                let sign = if i.is_multiple_of(2) { 0.55 } else { -0.55 };
-                pts[i][2] += sign;
+            let p0 = pts[i];
+            let u1 = unit3(sub3(pts[mol.adj[i][0].0], p0), [1.0, 0.0, 0.0]);
+            let u2 = unit3(sub3(pts[mol.adj[i][1].0], p0), [0.0, 1.0, 0.0]);
+            let u3 = unit3(sub3(pts[mol.adj[i][2].0], p0), [0.0, 0.0, 1.0]);
+            let vol = dot3(cross3(u1, u2), u3).abs();
+            if vol < 0.12 {
+                let n_vec = unit3(cross3(u1, u2), [0.0, 0.0, 1.0]);
+                let sign = if i.is_multiple_of(2) { 0.48 } else { -0.48 };
+                pts[i] = add3(pts[i], scale3(n_vec, sign));
             }
         }
     }
@@ -684,22 +686,30 @@ fn expand_bfs_3d(mol: &MolGraph, comp: &[usize], pos: &mut [Option<[f64; 3]>]) {
                 if is_sp {
                     fwd_dir
                 } else {
-                    // Add authentic non-planar staggered/gauche torsion unless conjugated sp2-sp2
+                    // u_orth points TOWARD grandparent (syn/0 deg); PI points AWAY (trans/anti 180 deg).
                     let parent_is_sp2 = placed_nbrs
                         .first()
                         .is_some_and(|&(p, _)| atom_is_sp2(mol, p));
                     let dihedral = if is_sp2 && parent_is_sp2 {
-                        0.0
-                    } else if parent_is_sp2 || is_sp2 {
-                        // Ar-X or sp3-C(=O) out-of-plane twist (~55 deg)
-                        if u.is_multiple_of(2) { 0.96 } else { -0.96 }
-                    } else {
-                        // sp3-sp3 gauche/staggered twist alternating in 3D (~60 deg)
+                        // Conjugated sp2-sp2 prefers planar trans (180 deg)
+                        PI
+                    } else if parent_is_sp2 && !is_sp2 {
+                        // Ar-CH2-R / Ar-CH(R)-R prefers ~90 deg perpendicular to aromatic plane
                         if u.is_multiple_of(2) {
-                            PI / 3.0
+                            PI * 0.5
                         } else {
-                            -PI / 3.0
+                            -PI * 0.5
                         }
+                    } else if is_sp2 {
+                        // sp3-C(=O) slightly twisted off eclipsed
+                        if u.is_multiple_of(2) {
+                            PI * 0.72
+                        } else {
+                            -PI * 0.72
+                        }
+                    } else {
+                        // sp3-sp3 alkyl chain prefers staggered trans/anti zigzag (180 deg)
+                        PI
                     };
                     let rot_orth = add3(
                         scale3(u_orth, dihedral.cos()),
@@ -708,11 +718,23 @@ fn expand_bfs_3d(mol: &MolGraph, comp: &[usize], pos: &mut [Option<[f64; 3]>]) {
                     add3(scale3(fwd_dir, c_t), scale3(rot_orth, s_t))
                 }
             } else if k == 2 && placed_nbrs.len() == 1 && !is_sp2 {
-                // Two remaining substituents on tetrahedral atom: rotate dihedral by ±60° + base twist into 3D
-                let twist = if u.is_multiple_of(2) { 0.45 } else { -0.45 };
-                let phi = twist + if idx == 0 { PI / 3.0 } else { -PI / 3.0 };
+                // Two remaining substituents on tetrahedral sp3 atom (e.g. isopropyl -CH(CH3)2 or Ar-CH(CH3)COOH):
+                // Place at PI ± 60° (±120° from u_orth): exact 109.47° tetrahedral angle, maximal |sin|=0.866
+                // clearance out of aromatic planes AND cleanly staggered away from alkyl grandparents!
+                let phi = PI + if idx == 0 { PI / 3.0 } else { -PI / 3.0 };
                 let rot_perp = add3(scale3(u_orth, phi.cos()), scale3(v_orth, phi.sin()));
                 add3(scale3(fwd_dir, c_t), scale3(rot_perp, s_t))
+            } else if k == 3 && placed_nbrs.len() == 1 && !is_sp2 {
+                // Three remaining substituents (e.g. -C(CH3)3, -CF3): staggered anti against grandparent
+                let phi = PI + 2.0 * PI * (idx as f64) / 3.0;
+                let rot_perp = add3(scale3(u_orth, phi.cos()), scale3(v_orth, phi.sin()));
+                add3(scale3(fwd_dir, c_t), scale3(rot_perp, s_t))
+            } else if k == 2 && placed_nbrs.len() == 1 && is_sp2 {
+                // Two substituents on trigonal planar sp2 atom (e.g. -C(=O)OH, -NO2):
+                // Place at 0° and 180° (in plane, 120° apart)
+                let phi = if idx == 0 { 0.0 } else { PI };
+                let perp = add3(scale3(u_orth, phi.cos()), scale3(v_orth, phi.sin()));
+                add3(scale3(fwd_dir, c_t), scale3(perp, s_t))
             } else if placed_nbrs.is_empty() && k >= 3 {
                 // Seed center atom
                 let theta = if k == 4 {
@@ -1035,6 +1057,65 @@ pub(crate) fn relax_3d_coords_pinned(
         }
     }
 
+    // Collect planar aromatic / fully-sp2 rings + their directly attached exocyclic atoms
+    // so aromatic rings (benzene, pyridine, indole, naphthalene, caffeine) stay razor-flat!
+    let mut planar_ring_groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+    let planar_rings: Vec<&Vec<usize>> = mol
+        .rings
+        .iter()
+        .filter(|r| {
+            r.len() <= 7
+                && r.iter()
+                    .all(|&a| mol.atoms[a].aromatic || atom_is_sp2(mol, a))
+        })
+        .collect();
+    if !planar_rings.is_empty() {
+        // Merge fused planar rings into shared flat planes (e.g. naphthalene, indole, purine)
+        let mut ring_used = vec![false; planar_rings.len()];
+        for i in 0..planar_rings.len() {
+            if ring_used[i] {
+                continue;
+            }
+            ring_used[i] = true;
+            let mut ring_atoms: Vec<usize> = planar_rings[i].clone();
+            loop {
+                let mut added = false;
+                for j in 0..planar_rings.len() {
+                    if ring_used[j] {
+                        continue;
+                    }
+                    let shared = planar_rings[j]
+                        .iter()
+                        .filter(|a| ring_atoms.contains(a))
+                        .count();
+                    if shared >= 2 {
+                        ring_used[j] = true;
+                        for &a in planar_rings[j] {
+                            if !ring_atoms.contains(&a) {
+                                ring_atoms.push(a);
+                            }
+                        }
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+            // Directly attached neighbors of aromatic/sp2 ring atoms also lie in the ring plane
+            let mut exo_atoms: Vec<usize> = Vec::new();
+            for &ra in &ring_atoms {
+                for &(nb, _) in &mol.adj[ra] {
+                    if !ring_atoms.contains(&nb) && !exo_atoms.contains(&nb) {
+                        exo_atoms.push(nb);
+                    }
+                }
+            }
+            // Keep first ring's ordered vertices to compute a consistent Newell normal
+            planar_ring_groups.push((ring_atoms, exo_atoms));
+        }
+    }
+
     // Collect tetrahedral chiral volume restraints directly from OpenSMILES `chiral_seq`
     let mut chiral_restraints = Vec::new();
     for (ci, atom) in mol.atoms.iter().enumerate() {
@@ -1126,22 +1207,62 @@ pub(crate) fn relax_3d_coords_pinned(
             let d = sub3(pts[b], pts[a]);
             let len = norm3(d);
             if len > 1e-6 {
-                let f = 0.16 * (len - target) / len;
+                let f = 0.24 * (len - target) / len;
                 let df = scale3(d, f);
                 disp[a] = add3(disp[a], df);
                 disp[b] = sub3(disp[b], df);
             }
         }
 
-        // 3. Out-of-plane planarity for degree-3 sp2 centers
+        // 3. Out-of-plane planarity for degree-3 sp2 centers (symmetric distribution)
         for &(c, a, b, d_atm) in &sp2_triples {
             let plane_n = cross3(sub3(pts[b], pts[a]), sub3(pts[d_atm], pts[a]));
             let n_len = norm3(plane_n);
             if n_len > 1e-4 {
                 let u_n = scale3(plane_n, 1.0 / n_len);
                 let h = dot3(sub3(pts[c], pts[a]), u_n);
-                let corr = scale3(u_n, -0.28 * h);
-                disp[c] = add3(disp[c], corr);
+                let corr_c = scale3(u_n, -0.30 * h);
+                let corr_n = scale3(u_n, 0.10 * h);
+                disp[c] = add3(disp[c], corr_c);
+                disp[a] = add3(disp[a], corr_n);
+                disp[b] = add3(disp[b], corr_n);
+                disp[d_atm] = add3(disp[d_atm], corr_n);
+            }
+        }
+
+        // 3b. Exact aromatic & fused planar ring flattening (momentum-conserving around ring centroid;
+        // exocyclic attachments are kept coplanar with zero net force by `sp2_triples` above).
+        for (ring_atoms, _exo_atoms) in &planar_ring_groups {
+            if ring_atoms.len() < 3 {
+                continue;
+            }
+            let mut cent = [0.0; 3];
+            for &a in ring_atoms {
+                cent = add3(cent, pts[a]);
+            }
+            cent = scale3(cent, 1.0 / ring_atoms.len() as f64);
+            let mut normal = [0.0; 3];
+            for &u in ring_atoms {
+                let ru = sub3(pts[u], cent);
+                for &(v, bid) in &mol.adj[u] {
+                    if mol.bonds[bid].in_ring && ring_atoms.contains(&v) {
+                        let rv = sub3(pts[v], cent);
+                        let cr = cross3(ru, rv);
+                        if dot3(cr, normal) >= 0.0 || norm3(normal) < 1e-9 {
+                            normal = add3(normal, cr);
+                        } else {
+                            normal = sub3(normal, cr);
+                        }
+                    }
+                }
+            }
+            let n_len = norm3(normal);
+            if n_len > 1e-5 {
+                let u_n = scale3(normal, 1.0 / n_len);
+                for &a in ring_atoms {
+                    let h = dot3(sub3(pts[a], cent), u_n);
+                    disp[a] = add3(disp[a], scale3(u_n, -0.42 * h));
+                }
             }
         }
 
@@ -1161,7 +1282,7 @@ pub(crate) fn relax_3d_coords_pinned(
                     let vol = dot3(cross3(u1, u2), u3);
                     let target_v = 1.95;
                     if want_sign * vol < target_v {
-                        let k = (0.18 * (target_v - want_sign * vol)).min(0.48) * want_sign;
+                        let k = (0.24 * (target_v - want_sign * vol)).min(0.52) * want_sign;
                         let g1 = cross3(u2, u3);
                         let g2 = cross3(u3, u1);
                         let g3 = cross3(u1, u2);
@@ -1185,7 +1306,7 @@ pub(crate) fn relax_3d_coords_pinned(
                     let vol = dot3(cross3(u1, u2), u3);
                     let target_v = 5.2;
                     if want_sign * vol < target_v {
-                        let k = (0.045 * (target_v - want_sign * vol)).min(0.35) * want_sign;
+                        let k = (0.065 * (target_v - want_sign * vol)).min(0.42) * want_sign;
                         let g1 = cross3(u2, u3);
                         let g2 = cross3(u3, u1);
                         let g3 = cross3(u1, u2);

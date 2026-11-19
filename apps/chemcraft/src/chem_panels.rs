@@ -45,8 +45,8 @@ pub fn pick_open_file_native() -> Option<String> {
     if let Ok(out) = ProcessCommand::new("zenity")
         .args([
             "--file-selection",
-            "--title=Open Chemical Structure or Library",
-            "--file-filter=Chemistry (*.cdxml *.rxn *.sdf *.mol *.smi *.dwar *.csv *.chemcraft) | *.cdxml *.rxn *.sdf *.mol *.smi *.dwar *.csv *.chemcraft",
+            "--title=Open Chemical Structure, Project, or Library",
+            "--file-filter=Chemistry (*.chemcraft *.cdxml *.rxn *.sdf *.mol *.smi *.dwar *.csv) | *.chemcraft *.cdxml *.rxn *.sdf *.mol *.smi *.dwar *.csv",
             "--file-filter=All files | *",
         ])
         .output()
@@ -61,8 +61,76 @@ pub fn pick_open_file_native() -> Option<String> {
         .args([
             "--getopenfilename",
             ".",
-            "*.cdxml *.rxn *.sdf *.mol *.smi *.dwar *.csv *.chemcraft|Chemistry Files",
+            "*.chemcraft *.cdxml *.rxn *.sdf *.mol *.smi *.dwar *.csv|Chemistry Files",
         ])
+        .output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Launch native Linux Save As dialog (`zenity` or `kdialog`).
+pub fn pick_save_file_native(
+    title: &str,
+    default_path: &str,
+    filter_label: &str,
+    filter_glob: &str,
+) -> Option<String> {
+    let title_arg = format!("--title={title}");
+    let fname_arg = format!("--filename={default_path}");
+    let filter_arg = format!("--file-filter={filter_label} ({filter_glob}) | {filter_glob}");
+    if let Ok(out) = ProcessCommand::new("zenity")
+        .args([
+            "--file-selection",
+            "--save",
+            "--confirm-overwrite",
+            &title_arg,
+            &fname_arg,
+            &filter_arg,
+            "--file-filter=All files | *",
+        ])
+        .output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    let kd_filter = format!("{filter_glob}|{filter_label}");
+    if let Ok(out) = ProcessCommand::new("kdialog")
+        .args(["--getsavefilename", default_path, &kd_filter])
+        .output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Launch native Linux directory picker (`zenity` or `kdialog`).
+pub fn pick_folder_native(title: &str, start_dir: &str) -> Option<String> {
+    let title_arg = format!("--title={title}");
+    if let Ok(out) = ProcessCommand::new("zenity")
+        .args(["--file-selection", "--directory", &title_arg])
+        .output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    if let Ok(out) = ProcessCommand::new("kdialog")
+        .args(["--getexistingdirectory", start_dir])
         .output()
         && out.status.success()
     {
@@ -81,20 +149,21 @@ pub fn render_analysis_tab(ui: &mut egui::Ui, mol: &MolGraph) {
         return;
     }
     let a = analyze_molecule(mol);
-    ui.strong("ChemDraw Molecular Analysis");
+    ui.strong("Molecular Analysis");
     ui.separator();
 
     egui::Grid::new("analysis_core_grid")
         .num_columns(2)
+        .spacing([10.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
             ui.label("Formula:");
             ui.strong(&a.formula_with_charge);
             ui.end_row();
-            ui.label("Exact Mass (mono):");
+            ui.label("Exact Mass:");
             ui.monospace(format!("{:.4} Da", a.exact_mass));
             ui.end_row();
-            ui.label("Molecular Weight:");
+            ui.label("Mol. Weight:");
             ui.monospace(format!("{:.2} Da", a.molecular_weight));
             ui.end_row();
             ui.label("DBE (RDB):");
@@ -103,9 +172,9 @@ pub fn render_analysis_tab(ui: &mut egui::Ui, mol: &MolGraph) {
             ui.label("Net Charge:");
             ui.monospace(format!("{:+}", a.net_charge));
             ui.end_row();
-            ui.label("Atoms / Heavy / Rings:");
+            ui.label("Atoms / Rings:");
             ui.monospace(format!(
-                "{} / {} / {} (Chiral: {})",
+                "{} ({} heavy) / {}R (Chiral: {})",
                 a.total_atoms, a.heavy_atoms, a.ring_count, a.chiral_centers
             ));
             ui.end_row();
@@ -113,10 +182,13 @@ pub fn render_analysis_tab(ui: &mut egui::Ui, mol: &MolGraph) {
 
     ui.add_space(6.0);
     ui.strong("Elemental Analysis (%)");
-    ui.label(
-        RichText::new(&a.elemental_analysis_string)
-            .monospace()
-            .small(),
+    ui.add(
+        egui::Label::new(
+            RichText::new(&a.elemental_analysis_string)
+                .monospace()
+                .small(),
+        )
+        .wrap(),
     );
     if ui.small_button("Copy Elemental Analysis").clicked() {
         ui.ctx().copy_text(a.elemental_analysis_string.clone());
@@ -126,6 +198,7 @@ pub fn render_analysis_tab(ui: &mut egui::Ui, mol: &MolGraph) {
     ui.strong("ESI+/ESI- Mass Spec Adducts (m/z)");
     egui::Grid::new("analysis_adducts_grid")
         .num_columns(3)
+        .spacing([10.0, 3.0])
         .striped(true)
         .show(ui, |ui| {
             ui.strong("Ion");

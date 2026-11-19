@@ -1,6 +1,8 @@
 //! Pure-Rust interactive 3D molecular & peptide ball-and-stick + backbone ribbon viewer
 //! rendered directly on `egui::Painter` (zero extra GPU/shader dependencies).
 
+use std::f64::consts::PI;
+
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Response, Sense, Stroke, Vec2};
 use mol_graph::{BondOrder, MolGraph, compute_3d_coords};
@@ -12,17 +14,19 @@ pub struct Viewer3dState {
     pub zoom: f32,
     pub show_ribbon: bool,
     pub show_labels: bool,
+    pub show_hydrogens: bool,
     pub auto_spin: bool,
 }
 
 impl Default for Viewer3dState {
     fn default() -> Self {
         Self {
-            yaw: 0.62,
-            pitch: 0.48,
+            yaw: 0.45,
+            pitch: 0.35,
             zoom: 1.0,
             show_ribbon: true,
             show_labels: true,
+            show_hydrogens: true,
             auto_spin: false,
         }
     }
@@ -30,8 +34,8 @@ impl Default for Viewer3dState {
 
 impl Viewer3dState {
     pub fn reset(&mut self) {
-        self.yaw = 0.62;
-        self.pitch = 0.48;
+        self.yaw = 0.45;
+        self.pitch = 0.35;
         self.zoom = 1.0;
     }
 }
@@ -45,15 +49,21 @@ fn elem_color(symbol: &str, dark_mode: bool) -> Color32 {
                 Color32::from_rgb(76, 82, 92)
             }
         }
-        "N" => Color32::from_rgb(56, 128, 246),
-        "O" => Color32::from_rgb(230, 62, 56),
-        "S" => Color32::from_rgb(232, 188, 42),
-        "P" => Color32::from_rgb(235, 132, 34),
-        "F" => Color32::from_rgb(104, 214, 114),
-        "Cl" => Color32::from_rgb(44, 196, 86),
+        "N" => Color32::from_rgb(52, 122, 240),
+        "O" => Color32::from_rgb(225, 58, 52),
+        "S" => Color32::from_rgb(228, 184, 38),
+        "P" => Color32::from_rgb(232, 128, 30),
+        "F" => Color32::from_rgb(96, 208, 108),
+        "Cl" => Color32::from_rgb(40, 190, 82),
         "Br" => Color32::from_rgb(168, 48, 42),
         "I" => Color32::from_rgb(148, 48, 178),
-        "H" => Color32::from_rgb(225, 228, 232),
+        "H" => {
+            if dark_mode {
+                Color32::from_rgb(230, 234, 240)
+            } else {
+                Color32::from_rgb(242, 245, 250)
+            }
+        }
         "Fe" => Color32::from_rgb(208, 108, 52),
         _ => Color32::from_rgb(190, 120, 215),
     }
@@ -61,12 +71,12 @@ fn elem_color(symbol: &str, dark_mode: bool) -> Color32 {
 
 fn elem_radius(symbol: &str) -> f32 {
     match symbol {
-        "H" => 0.26,
-        "F" | "O" | "N" => 0.37,
-        "C" => 0.40,
-        "S" | "P" | "Cl" => 0.48,
-        "Br" | "I" | "Fe" => 0.54,
-        _ => 0.42,
+        "H" => 0.25,
+        "F" | "O" | "N" => 0.40,
+        "C" => 0.43,
+        "S" | "P" | "Cl" => 0.50,
+        "Br" | "I" | "Fe" => 0.56,
+        _ => 0.44,
     }
 }
 
@@ -90,7 +100,6 @@ fn mix_white(c: Color32, t: f32) -> Color32 {
 
 fn rainbow_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    // Blue -> Cyan -> Green -> Yellow -> Red N-to-C peptide ramp
     let (r, g, b) = if t < 0.25 {
         let u = t / 0.25;
         (45.0, 110.0 + 125.0 * u, 240.0)
@@ -107,6 +116,235 @@ fn rainbow_color(t: f32) -> Color32 {
     Color32::from_rgb(r as u8, g as u8, b as u8)
 }
 
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn scale3(a: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn norm3(a: [f64; 3]) -> f64 {
+    (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+}
+
+fn unit3(a: [f64; 3], fallback: [f64; 3]) -> [f64; 3] {
+    let n = norm3(a);
+    if n > 1e-9 && n.is_finite() {
+        [a[0] / n, a[1] / n, a[2] / n]
+    } else {
+        fallback
+    }
+}
+
+fn ortho_pair(axis: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let ax = unit3(axis, [1.0, 0.0, 0.0]);
+    let ref_v = if ax[2].abs() < 0.8 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let u = unit3(cross3(ax, ref_v), [0.0, 1.0, 0.0]);
+    let v = unit3(cross3(ax, u), [0.0, 0.0, 1.0]);
+    (u, v)
+}
+
+fn is_atom_sp(mol: &MolGraph, i: usize) -> bool {
+    mol.adj[i]
+        .iter()
+        .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Triple)
+        || mol.adj[i]
+            .iter()
+            .filter(|&&(_, bid)| mol.bonds[bid].order == BondOrder::Double)
+            .count()
+            >= 2
+}
+
+fn is_atom_sp2(mol: &MolGraph, i: usize) -> bool {
+    if matches!(mol.atoms[i].symbol.as_str(), "S" | "P") && mol.adj[i].len() >= 3 {
+        return false;
+    }
+    if mol.atoms[i].aromatic {
+        return true;
+    }
+    if mol.adj[i].iter().any(|&(_, bid)| {
+        matches!(
+            mol.bonds[bid].order,
+            BondOrder::Double | BondOrder::Aromatic
+        )
+    }) {
+        return true;
+    }
+    if matches!(mol.atoms[i].symbol.as_str(), "N" | "O" | "S")
+        && mol.adj[i].len() >= 2
+        && mol.adj[i].iter().any(|&(nb, _)| {
+            mol.atoms[nb].aromatic
+                || mol.adj[nb]
+                    .iter()
+                    .any(|&(_, b2)| mol.bonds[b2].order == BondOrder::Double)
+        })
+    {
+        return true;
+    }
+    false
+}
+
+/// Generate clean visual 3D positions `(parent_heavy_idx, xyz)` for implicit hydrogens
+/// so tetrahedral, trigonal-planar, and `-OH`/`-NH` groups display accurately in 3D.
+fn build_visual_hydrogens(mol: &MolGraph, heavy_coords: &[[f64; 3]]) -> Vec<(usize, [f64; 3])> {
+    let mut out = Vec::new();
+    for (i, a) in mol.atoms.iter().enumerate() {
+        let nh = usize::from(a.implicit_h);
+        if nh == 0 || a.symbol == "H" {
+            continue;
+        }
+        let bl = match a.symbol.as_str() {
+            "O" => 0.96,
+            "N" => 1.01,
+            "S" => 1.34,
+            "P" => 1.42,
+            _ => 1.09,
+        };
+        let p = heavy_coords[i];
+        let nbrs: Vec<usize> = mol.adj[i].iter().map(|&(nb, _)| nb).collect();
+        let sp = is_atom_sp(mol, i);
+        let sp2 = is_atom_sp2(mol, i);
+
+        match nbrs.len() {
+            0 => {
+                // Isolated atom (CH4, NH3, H2O)
+                let dirs: &[[f64; 3]] = match nh {
+                    1 => &[[1.0, 0.0, 0.0]],
+                    2 => &[[0.8165, 0.5774, 0.0], [-0.8165, 0.5774, 0.0]],
+                    3 => &[
+                        [0.9428, 0.0, -0.3333],
+                        [-0.4714, 0.8165, -0.3333],
+                        [-0.4714, -0.8165, -0.3333],
+                    ],
+                    _ => &[
+                        [0.5774, 0.5774, 0.5774],
+                        [0.5774, -0.5774, -0.5774],
+                        [-0.5774, 0.5774, -0.5774],
+                        [-0.5774, -0.5774, 0.5774],
+                    ],
+                };
+                for d in dirs.iter().take(nh) {
+                    out.push((i, add3(p, scale3(unit3(*d, [1.0, 0.0, 0.0]), bl))));
+                }
+            }
+            1 => {
+                let par = nbrs[0];
+                let fwd = unit3(sub3(p, heavy_coords[par]), [1.0, 0.0, 0.0]);
+                // Reference vector from grandparent for staggered placement
+                let ref_v = mol.adj[par].iter().find_map(|&(gp, _)| {
+                    if gp != i {
+                        let v = sub3(heavy_coords[gp], heavy_coords[par]);
+                        let perp = sub3(v, scale3(fwd, dot3(v, fwd)));
+                        if norm3(perp) > 1e-4 {
+                            return Some(unit3(perp, [0.0, 1.0, 0.0]));
+                        }
+                    }
+                    None
+                });
+                let (u_o, v_o) = match ref_v {
+                    Some(rv) => {
+                        let uo = unit3(rv, [0.0, 1.0, 0.0]);
+                        let vo = unit3(cross3(fwd, uo), [0.0, 0.0, 1.0]);
+                        (uo, vo)
+                    }
+                    None => ortho_pair(fwd),
+                };
+                if sp && nh == 1 {
+                    out.push((i, add3(p, scale3(fwd, bl))));
+                } else if sp2 {
+                    let (st, ct) = (PI / 3.0).sin_cos();
+                    for k in 0..nh {
+                        let phi = if nh == 1 {
+                            PI
+                        } else if k == 0 {
+                            0.0
+                        } else {
+                            PI
+                        };
+                        let orth = add3(scale3(u_o, phi.cos()), scale3(v_o, phi.sin()));
+                        let dir = unit3(add3(scale3(fwd, ct), scale3(orth, st)), fwd);
+                        out.push((i, add3(p, scale3(dir, bl))));
+                    }
+                } else {
+                    // sp3: -OH (1H), -NH2 (2H), -CH3 (3H), staggered anti to grandparent!
+                    let tilt = 70.529_f64.to_radians();
+                    let (st, ct) = tilt.sin_cos();
+                    for k in 0..nh {
+                        let phi = match nh {
+                            1 => PI,
+                            2 => PI + if k == 0 { PI / 3.0 } else { -PI / 3.0 },
+                            _ => PI + 2.0 * PI * (k as f64) / (nh as f64),
+                        };
+                        let orth = add3(scale3(u_o, phi.cos()), scale3(v_o, phi.sin()));
+                        let dir = unit3(add3(scale3(fwd, ct), scale3(orth, st)), fwd);
+                        out.push((i, add3(p, scale3(dir, bl))));
+                    }
+                }
+            }
+            2 => {
+                let v1 = unit3(sub3(heavy_coords[nbrs[0]], p), [1.0, 0.0, 0.0]);
+                let v2 = unit3(sub3(heavy_coords[nbrs[1]], p), [0.0, 1.0, 0.0]);
+                let bis = unit3(scale3(add3(v1, v2), -1.0), ortho_pair(v1).0);
+                if sp2 || nh == 1 && is_atom_sp2(mol, i) {
+                    out.push((i, add3(p, scale3(bis, bl))));
+                } else {
+                    let perp = unit3(cross3(v1, v2), ortho_pair(bis).1);
+                    let d_bv = dot3(bis, v1);
+                    let c_in = if d_bv.abs() > 0.15 {
+                        ((-1.0 / 3.0) / d_bv).clamp(0.15, 0.88)
+                    } else {
+                        0.577
+                    };
+                    let c_p = (1.0 - c_in * c_in).max(0.0).sqrt();
+                    for k in 0..nh.min(2) {
+                        let sign = if k == 0 { 1.0 } else { -1.0 };
+                        let dir = unit3(add3(scale3(bis, c_in), scale3(perp, sign * c_p)), bis);
+                        out.push((i, add3(p, scale3(dir, bl))));
+                    }
+                }
+            }
+            _ => {
+                // Degree 3 heavy atom with 1 implicit H (e.g. chiral C-H or tertiary C-H)
+                let mut sum = [0.0, 0.0, 0.0];
+                for &nb in &nbrs {
+                    sum = add3(sum, unit3(sub3(heavy_coords[nb], p), [1.0, 0.0, 0.0]));
+                }
+                let fallback = if nbrs.len() >= 2 {
+                    let v1 = sub3(heavy_coords[nbrs[0]], p);
+                    let v2 = sub3(heavy_coords[nbrs[1]], p);
+                    unit3(cross3(v1, v2), [0.0, 0.0, 1.0])
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
+                let dir = unit3(scale3(sum, -1.0), fallback);
+                out.push((i, add3(p, scale3(dir, bl))));
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 enum DrawItem {
     RibbonSeg {
@@ -120,10 +358,13 @@ enum DrawItem {
         z: f32,
         p1: Pos2,
         p2: Pos2,
+        r1: f32,
+        r2: f32,
         order: BondOrder,
         width: f32,
         c1: Color32,
         c2: Color32,
+        inward_dir: Option<Vec2>,
     },
     Atom {
         z: f32,
@@ -132,6 +373,7 @@ enum DrawItem {
         color: Color32,
         label: Option<String>,
         hovered: bool,
+        is_hydrogen: bool,
     },
 }
 
@@ -140,6 +382,23 @@ impl DrawItem {
         match self {
             Self::RibbonSeg { z, .. } | Self::Bond { z, .. } | Self::Atom { z, .. } => *z,
         }
+    }
+}
+
+fn draw_dashed_segment(painter: &egui::Painter, a: Pos2, b: Pos2, stroke: Stroke) {
+    let d = b - a;
+    let len = d.length();
+    if len < 4.0 {
+        return;
+    }
+    let dir = d / len;
+    let dash = 4.2_f32;
+    let gap = 3.2_f32;
+    let mut t = 1.5_f32;
+    while t < len - 1.5 {
+        let t_end = (t + dash).min(len - 1.5);
+        painter.line_segment([a + dir * t, a + dir * t_end], stroke);
+        t += dash + gap;
     }
 }
 
@@ -205,7 +464,13 @@ pub fn render_3d_viewport(
     }
 
     let coords = compute_3d_coords(mol);
-    // Compute centered radius for automatic framing
+    let hydrogens = if state.show_hydrogens && mol.atoms.len() <= 140 {
+        build_visual_hydrogens(mol, &coords)
+    } else {
+        Vec::new()
+    };
+
+    // Compute centered radius over heavy atoms (plus hydrogens for framing)
     let mut cent = [0.0_f64; 3];
     for p in &coords {
         cent[0] += p[0];
@@ -219,25 +484,25 @@ pub fn render_3d_viewport(
 
     let mut max_r = 2.0_f64;
     for p in &coords {
-        let dx = p[0] - cent[0];
-        let dy = p[1] - cent[1];
-        let dz = p[2] - cent[2];
-        max_r = max_r.max((dx * dx + dy * dy + dz * dz).sqrt());
+        let d = sub3(*p, cent);
+        max_r = max_r.max(norm3(d));
+    }
+    for &(_, hp) in &hydrogens {
+        let d = sub3(hp, cent);
+        max_r = max_r.max(norm3(d));
     }
 
     let (sy, cy) = state.yaw.sin_cos();
     let (sp, cp) = state.pitch.sin_cos();
-    let cam_dist = (max_r as f32 * 2.6 + 8.0) / state.zoom;
-    let base_scale = rect.width().min(rect.height()) * 0.39 * state.zoom / (max_r as f32);
+    let cam_dist = (max_r as f32 * 2.8 + 8.5) / state.zoom;
+    let base_scale = rect.width().min(rect.height()) * 0.40 * state.zoom / (max_r as f32);
     let focal = cam_dist;
 
-    let mut proj: Vec<(Pos2, f32, f32)> = Vec::with_capacity(coords.len());
-    for p in &coords {
+    let project_pt = |p: [f64; 3]| -> (Pos2, f32, f32) {
         let x0 = (p[0] - cent[0]) as f32;
         let y0 = (p[1] - cent[1]) as f32;
         let z0 = (p[2] - cent[2]) as f32;
 
-        // Rotate around Y (yaw) then X (pitch)
         let x1 = x0 * cy + z0 * sy;
         let z1 = -x0 * sy + z0 * cy;
         let y2 = y0 * cp - z1 * sp;
@@ -247,21 +512,43 @@ pub fn render_3d_viewport(
         let persp = focal / depth;
         let sx = rect.center().x + x1 * base_scale * persp;
         let sy_scr = rect.center().y - y2 * base_scale * persp;
-        proj.push((Pos2::new(sx, sy_scr), z2, persp));
-    }
+        (Pos2::new(sx, sy_scr), z2, persp)
+    };
 
-    // Hover detection (closest frontmost projected atom)
+    let proj: Vec<(Pos2, f32, f32)> = coords.iter().map(|&p| project_pt(p)).collect();
+    let heavy_radii: Vec<f32> = mol
+        .atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (elem_radius(&a.symbol) * base_scale * 0.50 * proj[i].2).clamp(5.5, 26.0))
+        .collect();
+
+    // Hover detection (closest frontmost projected heavy atom)
     let mut hovered_atom: Option<(usize, f32)> = None;
     if let Some(hp) = resp.hover_pos() {
-        for (i, (pos, z, persp)) in proj.iter().enumerate() {
-            let r = (elem_radius(&mol.atoms[i].symbol) * base_scale * 0.42 * persp).max(7.0);
+        for (i, (pos, z, _)) in proj.iter().enumerate() {
+            let r = heavy_radii[i].max(8.0);
             if pos.distance(hp) <= r + 3.0 && hovered_atom.is_none_or(|(_, best_z)| *z > best_z) {
                 hovered_atom = Some((i, *z));
             }
         }
     }
 
-    let mut items: Vec<DrawItem> = Vec::with_capacity(mol.atoms.len() + mol.bonds.len() + 32);
+    // Precompute ring centroids in 3D so aromatic inner dashed lines always sit inside their ring
+    let ring_centroids: Vec<[f64; 3]> = mol
+        .rings
+        .iter()
+        .map(|r| {
+            let mut c = [0.0; 3];
+            for &a in r {
+                c = add3(c, coords[a]);
+            }
+            scale3(c, 1.0 / r.len().max(1) as f64)
+        })
+        .collect();
+
+    let mut items: Vec<DrawItem> =
+        Vec::with_capacity(mol.atoms.len() + mol.bonds.len() + hydrogens.len() * 2 + 32);
 
     // Optional peptide C-alpha backbone spline ribbon
     if state.show_ribbon {
@@ -295,32 +582,61 @@ pub fn render_3d_viewport(
         }
     }
 
+    // Heavy-atom bonds
     for b in &mol.bonds {
         let (p1, z1, per1) = proj[b.u];
         let (p2, z2, per2) = proj[b.v];
         let avg_z = (z1 + z2) * 0.5;
         let depth_shade =
-            (0.72 + (avg_z / (max_r as f32 * 2.0)).clamp(-0.28, 0.28)).clamp(0.42, 1.0);
+            (0.75 + (avg_z / (max_r as f32 * 2.0)).clamp(-0.26, 0.24)).clamp(0.45, 1.0);
         let c1 = scale_rgb(elem_color(&mol.atoms[b.u].symbol, dark_mode), depth_shade);
         let c2 = scale_rgb(elem_color(&mol.atoms[b.v].symbol, dark_mode), depth_shade);
-        let w = (0.14 * base_scale * (per1 + per2) * 0.5).clamp(1.8, 6.5);
+        let w = (0.14 * base_scale * (per1 + per2) * 0.5).clamp(2.0, 6.2);
+
+        // Compute inward screen direction for aromatic rings or double-bond molecular plane
+        let inward_dir = if b.order == BondOrder::Aromatic {
+            mol.rings
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(&b.u) && r.contains(&b.v))
+                .map(|(ri, _)| {
+                    let (rc_scr, _, _) = project_pt(ring_centroids[ri]);
+                    let mid = p1 + (p2 - p1) * 0.5;
+                    let d = p2 - p1;
+                    let len = d.length().max(1e-3);
+                    let perp = Vec2::new(-d.y / len, d.x / len);
+                    let to_c = rc_scr - mid;
+                    if to_c.x * perp.x + to_c.y * perp.y >= 0.0 {
+                        perp
+                    } else {
+                        -perp
+                    }
+                })
+        } else {
+            None
+        };
+
         items.push(DrawItem::Bond {
             z: avg_z,
             p1,
             p2,
+            r1: heavy_radii[b.u],
+            r2: heavy_radii[b.v],
             order: b.order,
             width: w,
             c1,
             c2,
+            inward_dir,
         });
     }
 
+    // Heavy atoms
     for (i, a) in mol.atoms.iter().enumerate() {
-        let (pos, z, persp) = proj[i];
-        let r = (elem_radius(&a.symbol) * base_scale * 0.42 * persp).clamp(4.0, 24.0);
-        let depth_shade = (0.85 + (z / (max_r as f32 * 2.2)).clamp(-0.30, 0.25)).clamp(0.45, 1.05);
+        let (pos, z, _) = proj[i];
+        let r = heavy_radii[i];
+        let depth_shade = (0.88 + (z / (max_r as f32 * 2.2)).clamp(-0.28, 0.22)).clamp(0.48, 1.05);
         let col = scale_rgb(elem_color(&a.symbol, dark_mode), depth_shade);
-        let label = if state.show_labels && a.symbol != "C" {
+        let label = if state.show_labels && a.symbol != "C" && a.symbol != "H" {
             Some(a.symbol.clone())
         } else {
             None
@@ -332,6 +648,45 @@ pub fn render_3d_viewport(
             color: col,
             label,
             hovered: hovered_atom.is_some_and(|(hi, _)| hi == i),
+            is_hydrogen: a.symbol == "H",
+        });
+    }
+
+    // Visual implicit hydrogens + X-H bonds
+    for &(parent_idx, h_xyz) in &hydrogens {
+        let (p1, z1, per1) = proj[parent_idx];
+        let (p2, z2, per2) = project_pt(h_xyz);
+        let h_rad = (elem_radius("H") * base_scale * 0.44 * per2).clamp(3.2, 13.0);
+        let avg_z = (z1 + z2) * 0.5;
+        let depth_shade =
+            (0.78 + (avg_z / (max_r as f32 * 2.0)).clamp(-0.24, 0.22)).clamp(0.50, 1.0);
+        let c1 = scale_rgb(
+            elem_color(&mol.atoms[parent_idx].symbol, dark_mode),
+            depth_shade,
+        );
+        let c2 = scale_rgb(elem_color("H", dark_mode), depth_shade);
+        let w = (0.095 * base_scale * (per1 + per2) * 0.5).clamp(1.3, 3.8);
+
+        items.push(DrawItem::Bond {
+            z: avg_z,
+            p1,
+            p2,
+            r1: heavy_radii[parent_idx],
+            r2: h_rad,
+            order: BondOrder::Single,
+            width: w,
+            c1,
+            c2,
+            inward_dir: None,
+        });
+        items.push(DrawItem::Atom {
+            z: z2,
+            pos: p2,
+            radius: h_rad,
+            color: c2,
+            label: None,
+            hovered: false,
+            is_hydrogen: true,
         });
     }
 
@@ -339,9 +694,9 @@ pub fn render_3d_viewport(
     items.sort_by(|a, b| a.depth().total_cmp(&b.depth()));
 
     let bond_outline = if dark_mode {
-        Color32::from_rgba_unmultiplied(245, 245, 255, 45)
+        Color32::from_rgba_unmultiplied(245, 245, 255, 50)
     } else {
-        Color32::from_rgba_unmultiplied(30, 35, 45, 55)
+        Color32::from_rgba_unmultiplied(25, 30, 42, 65)
     };
 
     for item in items {
@@ -362,37 +717,79 @@ pub fn render_3d_viewport(
             DrawItem::Bond {
                 p1,
                 p2,
+                r1,
+                r2,
                 order,
                 width,
                 c1,
                 c2,
+                inward_dir,
                 ..
             } => {
                 let d = p2 - p1;
-                let len = d.length().max(1e-3);
-                let perp = Vec2::new(-d.y / len, d.x / len);
-                let mid = p1 + d * 0.5;
+                let len = d.length();
+                if len < 1.5 {
+                    continue;
+                }
+                let unit = d / len;
+                // Clip bond sticks cleanly to sphere surfaces so bonds never pierce over atoms
+                let trim1 = (r1 * 0.68).min(len * 0.42);
+                let trim2 = (r2 * 0.68).min(len * 0.42);
+                let q1 = p1 + unit * trim1;
+                let q2 = p2 - unit * trim2;
+                if (q2 - q1).length() < 1.0 {
+                    continue;
+                }
+                let perp = Vec2::new(-unit.y, unit.x);
+                let mid = q1 + (q2 - q1) * 0.5;
                 match order {
-                    BondOrder::Double | BondOrder::Aromatic => {
-                        let off = perp * (width * 0.72).max(2.1);
-                        painter.line_segment([p1 + off, mid + off], Stroke::new(width * 0.68, c1));
-                        painter.line_segment([mid + off, p2 + off], Stroke::new(width * 0.68, c2));
-                        painter.line_segment([p1 - off, mid - off], Stroke::new(width * 0.68, c1));
-                        painter.line_segment([mid - off, p2 - off], Stroke::new(width * 0.68, c2));
+                    BondOrder::Aromatic => {
+                        // Standard 3D aromatic bond: 1 solid primary stick + 1 dashed inner resonance line
+                        painter.line_segment([q1, q2], Stroke::new(width + 1.0, bond_outline));
+                        painter.line_segment([q1, mid], Stroke::new(width * 0.92, c1));
+                        painter.line_segment([mid, q2], Stroke::new(width * 0.92, c2));
+                        let in_v = inward_dir.unwrap_or(perp);
+                        let off = in_v * (width * 1.05).max(3.2);
+                        let inner_col = if dark_mode {
+                            Color32::from_rgba_unmultiplied(210, 220, 235, 195)
+                        } else {
+                            Color32::from_rgba_unmultiplied(70, 80, 96, 185)
+                        };
+                        draw_dashed_segment(
+                            &painter,
+                            q1 + off + unit * 1.5,
+                            q2 + off - unit * 1.5,
+                            Stroke::new((width * 0.48).max(1.2), inner_col),
+                        );
+                    }
+                    BondOrder::Double => {
+                        let off = perp * (width * 0.65).max(2.0);
+                        painter.line_segment(
+                            [q1 + off, q2 + off],
+                            Stroke::new(width * 0.72 + 0.8, bond_outline),
+                        );
+                        painter.line_segment(
+                            [q1 - off, q2 - off],
+                            Stroke::new(width * 0.72 + 0.8, bond_outline),
+                        );
+                        painter.line_segment([q1 + off, mid + off], Stroke::new(width * 0.66, c1));
+                        painter.line_segment([mid + off, q2 + off], Stroke::new(width * 0.66, c2));
+                        painter.line_segment([q1 - off, mid - off], Stroke::new(width * 0.66, c1));
+                        painter.line_segment([mid - off, q2 - off], Stroke::new(width * 0.66, c2));
                     }
                     BondOrder::Triple => {
                         let off = perp * (width * 0.95).max(2.6);
-                        painter.line_segment([p1, mid], Stroke::new(width * 0.6, c1));
-                        painter.line_segment([mid, p2], Stroke::new(width * 0.6, c2));
-                        painter.line_segment([p1 + off, mid + off], Stroke::new(width * 0.45, c1));
-                        painter.line_segment([mid + off, p2 + off], Stroke::new(width * 0.45, c2));
-                        painter.line_segment([p1 - off, mid - off], Stroke::new(width * 0.45, c1));
-                        painter.line_segment([mid - off, p2 - off], Stroke::new(width * 0.45, c2));
+                        painter.line_segment([q1, mid], Stroke::new(width * 0.58, c1));
+                        painter.line_segment([mid, q2], Stroke::new(width * 0.58, c2));
+                        painter.line_segment([q1 + off, mid + off], Stroke::new(width * 0.44, c1));
+                        painter.line_segment([mid + off, q2 + off], Stroke::new(width * 0.44, c2));
+                        painter.line_segment([q1 - off, mid - off], Stroke::new(width * 0.44, c1));
+                        painter.line_segment([mid - off, q2 - off], Stroke::new(width * 0.44, c2));
                     }
                     _ => {
-                        painter.line_segment([p1, p2], Stroke::new(width + 1.2, bond_outline));
-                        painter.line_segment([p1, mid], Stroke::new(width, c1));
-                        painter.line_segment([mid, p2], Stroke::new(width, c2));
+                        painter.line_segment([q1, q2], Stroke::new(width + 1.1, bond_outline));
+                        painter.line_segment([q1, mid], Stroke::new(width, c1));
+                        painter.line_segment([mid, q2], Stroke::new(width, c2));
                     }
                 }
             }
@@ -402,9 +799,10 @@ pub fn render_3d_viewport(
                 color,
                 label,
                 hovered,
+                is_hydrogen,
                 ..
             } => {
-                // Shaded sphere (ambient base + diffuse offset + specular glint)
+                // Shaded 3D sphere (ambient base + diffuse offset + specular highlight)
                 painter.circle_filled(pos, radius, scale_rgb(color, 0.72));
                 painter.circle_filled(
                     pos + Vec2::new(-radius * 0.16, -radius * 0.16),
@@ -413,36 +811,45 @@ pub fn render_3d_viewport(
                 );
                 painter.circle_filled(
                     pos + Vec2::new(-radius * 0.28, -radius * 0.28),
-                    radius * 0.40,
+                    radius * 0.42,
                     mix_white(color, 0.45),
                 );
                 painter.circle_filled(
                     pos + Vec2::new(-radius * 0.34, -radius * 0.34),
-                    radius * 0.17,
+                    radius * 0.18,
                     mix_white(color, 0.85),
                 );
                 painter.circle_stroke(
                     pos,
                     radius,
                     Stroke::new(
-                        if hovered { 2.2_f32 } else { 0.8_f32 },
+                        if hovered {
+                            2.2_f32
+                        } else if is_hydrogen {
+                            0.75_f32
+                        } else {
+                            0.9_f32
+                        },
                         if hovered {
                             Color32::from_rgb(34, 139, 230)
+                        } else if is_hydrogen {
+                            Color32::from_rgba_unmultiplied(80, 90, 108, 130)
                         } else {
-                            Color32::from_rgba_unmultiplied(15, 18, 25, 110)
+                            Color32::from_rgba_unmultiplied(15, 18, 25, 120)
                         },
                     ),
                 );
-                if let Some(lbl) = label
-                    && radius >= 6.5
-                {
+                if let Some(lbl) = label {
+                    let font = egui::FontId::proportional((radius * 1.02).clamp(9.0, 13.5));
+                    // Subtle dark shadow for crisp readability on any atom sphere color
                     painter.text(
-                        pos,
+                        pos + Vec2::new(0.8, 0.8),
                         egui::Align2::CENTER_CENTER,
-                        lbl,
-                        egui::FontId::proportional((radius * 0.95).clamp(8.0, 12.5)),
-                        Color32::WHITE,
+                        &lbl,
+                        font.clone(),
+                        Color32::from_rgba_unmultiplied(10, 12, 18, 190),
                     );
+                    painter.text(pos, egui::Align2::CENTER_CENTER, lbl, font, Color32::WHITE);
                 }
             }
         }
@@ -469,7 +876,8 @@ pub fn render_3d_viewport(
             )
         }
     } else {
-        "Drag: Orbit | Scroll: Zoom | Double-Click: Reset | 3D Conformer".to_string()
+        let h_note = if !hydrogens.is_empty() { " | +H" } else { "" };
+        format!("Drag: Orbit | Scroll: Zoom | Double-Click: Reset | 3D Conformer{h_note}")
     };
     painter.text(
         rect.left_bottom() + Vec2::new(8.0, -6.0),

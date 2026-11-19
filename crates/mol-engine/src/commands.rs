@@ -42,6 +42,8 @@ pub struct ChemSession {
     pub cliffs: Vec<ActivityCliff>,
     pub mmps: Vec<MatchedMolecularPair>,
     pub prefer_external_admet: bool,
+    /// When `false` (default), ADMET is strictly on-demand instead of auto-computing on every edit.
+    pub auto_refresh_admet: bool,
     undo_stack: Vec<SessionSnapshot>,
     redo_stack: Vec<SessionSnapshot>,
 }
@@ -54,7 +56,7 @@ impl Default for ChemSession {
 
 impl ChemSession {
     pub fn new() -> Self {
-        let mut s = Self {
+        Self {
             canvas_mol: Arc::new(MolGraph::new()),
             reaction_arrows: Arc::new(Vec::new()),
             sar_table: Arc::new(SarTable::new()),
@@ -65,11 +67,10 @@ impl ChemSession {
             cliffs: Vec::new(),
             mmps: Vec::new(),
             prefer_external_admet: false,
+            auto_refresh_admet: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-        };
-        let _ = s.refresh_live_admet();
-        s
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -102,7 +103,16 @@ impl ChemSession {
         self.reaction_arrows = snap.reaction_arrows;
         self.sar_table = snap.sar_table;
         self.selected_sar_idx = snap.selected_sar_idx;
-        let _ = self.refresh_live_admet();
+        self.on_canvas_changed();
+    }
+
+    /// Clear cached ADMET after a canvas change unless live auto-refresh was explicitly opted into.
+    pub fn on_canvas_changed(&mut self) {
+        if self.auto_refresh_admet {
+            let _ = self.refresh_live_admet();
+        } else {
+            self.live_admet = None;
+        }
     }
 
     pub fn admet_provider(&self) -> AdmetCraftProvider {
@@ -358,7 +368,7 @@ impl CommandRegistry {
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
                 session.last_mutation_delta = None;
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Loaded SMILES {}", session.canvas_mol.canonical_smiles()),
                 })
@@ -378,7 +388,7 @@ impl CommandRegistry {
                 let name = mol.name.clone().unwrap_or_else(|| sequence.clone());
                 session.canvas_mol = Arc::new(mol);
                 session.last_mutation_delta = None;
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Built peptide {name} ({res_count} residues, 2D + 3D ready)"),
                 })
@@ -429,7 +439,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Stamped {}", tmpl.label()),
                 })
@@ -456,7 +466,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Added atom {symbol}"),
                 })
@@ -468,7 +478,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Changed atom #{} to {symbol}", atom_idx + 1),
                 })
@@ -484,7 +494,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Updated stereo on bond #{}", bond_idx + 1),
                 })
@@ -499,7 +509,7 @@ impl CommandRegistry {
                 let smi = mol.canonical_smiles();
                 session.canvas_mol = Arc::new(mol);
                 session.last_mutation_delta = None;
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Resolved '{label}' -> {smi}"),
                 })
@@ -515,7 +525,7 @@ impl CommandRegistry {
                 let smi = mol.canonical_smiles();
                 session.canvas_mol = Arc::new(mol);
                 session.last_mutation_delta = None;
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Imported CDXML ({f}, {smi})"),
                 })
@@ -547,7 +557,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Connected atoms #{} and #{}", u + 1, v + 1),
                 })
@@ -567,7 +577,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Atom #{} charge set to {q:+}", atom_idx + 1),
                 })
@@ -593,7 +603,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Bond #{} -> {ord_label}", bond_idx + 1),
                 })
@@ -607,7 +617,7 @@ impl CommandRegistry {
                 let smi = updated.canonical_smiles();
                 session.canvas_mol = Arc::new(updated);
                 session.last_mutation_delta = None;
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Attached {abbr} -> {smi}"),
                 })
@@ -700,7 +710,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Erased atom #{}", atom_idx + 1),
                 })
@@ -712,7 +722,7 @@ impl CommandRegistry {
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
                 mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Erased bond #{}", bond_idx + 1),
                 })
@@ -840,7 +850,7 @@ impl CommandRegistry {
                     mol_graph::ensure_3d_coords(&mut m);
                     session.canvas_mol = Arc::new(m);
                     session.selected_sar_idx = Some(0);
-                    let _ = session.refresh_live_admet();
+                    session.on_canvas_changed();
                 }
                 Ok(CommandOutcome {
                     message: format!(
@@ -880,7 +890,7 @@ impl CommandRegistry {
                 session.canvas_mol = Arc::new(m);
                 session.selected_sar_idx = Some(idx);
                 session.last_mutation_delta = None;
-                let _ = session.refresh_live_admet();
+                session.on_canvas_changed();
                 Ok(CommandOutcome {
                     message: format!("Selected {row_name}"),
                 })

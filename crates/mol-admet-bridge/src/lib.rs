@@ -266,6 +266,7 @@ pub fn launch_admetcraft_gui(
         .map_err(|e| BridgeError::Report(format!("write {}: {e}", smi_path.display())))?;
 
     Command::new("admetcraft")
+        .arg(&smi_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
