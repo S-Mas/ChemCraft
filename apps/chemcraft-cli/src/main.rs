@@ -24,6 +24,9 @@ use mol_sar::{
     SarFilter, SarTable, find_activity_cliffs, find_duplicate_compounds,
     find_matched_molecular_pairs,
 };
+use mol_synth::{
+    RetroConfig, StockCatalog, default_stock_catalog, default_stock_tsv_path, plan_retrosynthesis,
+};
 use mol_vector::{
     DepictionPreset, SceneStyle, build_mol_scene, generate_2d_coords, scene_to_eps,
     scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
@@ -260,6 +263,38 @@ enum SubCmd {
         mmol: f64,
         #[arg(long)]
         actual_mg: Option<f64>,
+    },
+    /// Multi-step Buy-Before-Make + Retro* retrosynthesis planning, stoichiometry, ELN Markdown & MDL `.rxn` export.
+    Retro {
+        /// Target SMILES string (optional if `--init-stock` is used).
+        smiles: Option<String>,
+        /// Target display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Maximum synthetic steps in longest linear sequence (`1..=6`).
+        #[arg(long, default_value_t = 4)]
+        max_steps: usize,
+        /// Top ranked synthetic routes to return (`1..=10`).
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Target synthesis scale in mg for stoichiometry calculations.
+        #[arg(long, default_value_t = 100.0)]
+        scale_mg: f64,
+        /// Optional extra building-block catalog file (`.tsv` or `.smi`) merged on top of default stock.
+        #[arg(long)]
+        stock: Option<PathBuf>,
+        /// Write complete retrosynthesis plan as JSON.
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+        /// Write ELN-ready Markdown lab protocol.
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        /// Export every step of Route #1 as MDL `.rxn` V2000 files inside this directory.
+        #[arg(long)]
+        out_rxn_dir: Option<PathBuf>,
+        /// Initialize/export the default MedChem building-block TSV catalog in CRAFT_DATA_DIR/building_blocks.
+        #[arg(long)]
+        init_stock: bool,
     },
     /// Start the hardened MCP server (stdio or TCP with token + sandbox).
     Mcp {
@@ -755,6 +790,79 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
+        SubCmd::Retro {
+            smiles,
+            name,
+            max_steps,
+            top,
+            scale_mg,
+            stock,
+            out_json,
+            out_md,
+            out_rxn_dir,
+            init_stock,
+        } => {
+            if init_stock {
+                let path = default_stock_tsv_path();
+                let cat = StockCatalog::builtin_medchem();
+                cat.write_tsv(&path)?;
+                eprintln!(
+                    "Initialized {} commercial MedChem building blocks -> {}",
+                    cat.len(),
+                    path.display()
+                );
+                if smiles.is_none() {
+                    return Ok(());
+                }
+            }
+            let smi = smiles
+                .as_deref()
+                .ok_or("provide target SMILES (or pass --init-stock)")?;
+            let mut mol = parse_smiles(smi)?;
+            if let Some(n) = name {
+                mol.name = Some(n);
+            }
+            let cfg = RetroConfig {
+                max_steps: max_steps.clamp(1, 6),
+                max_routes: top.clamp(1, 10),
+                target_scale_mg: scale_mg.max(1.0),
+                ..Default::default()
+            };
+            let plan = if let Some(extra_stock) = stock {
+                let mut cat = StockCatalog::load_default();
+                let added = cat.merge_file(&extra_stock)?;
+                eprintln!(
+                    "Merged {added} custom building block(s) from {}",
+                    extra_stock.display()
+                );
+                plan_retrosynthesis(&mol, &cat, &cfg)
+            } else {
+                plan_retrosynthesis(&mol, default_stock_catalog(), &cfg)
+            };
+
+            if let Some(jp) = out_json {
+                std::fs::write(&jp, serde_json::to_string_pretty(&plan)?)?;
+            }
+            if let Some(mp) = out_md {
+                std::fs::write(&mp, plan.render_markdown())?;
+            }
+            if let Some(rdir) = out_rxn_dir {
+                std::fs::create_dir_all(&rdir)?;
+                if let Some(best) = plan.routes.first() {
+                    for st in &best.steps {
+                        if let Some(rxn_txt) = st.to_rxn_v2000() {
+                            let fname = format!(
+                                "step_{:02}_{}.rxn",
+                                st.step_number,
+                                st.template_id.to_ascii_lowercase()
+                            );
+                            std::fs::write(rdir.join(fname), rxn_txt)?;
+                        }
+                    }
+                }
+            }
+            println!("{}", plan.render_markdown());
+        }
     }
     Ok(())
 }
@@ -1247,6 +1355,71 @@ mod tests {
         let cxc = std::fs::read_to_string(wdir.join("enkephalin.cxc"))?;
         assert!(cxc.contains("open enkephalin.pdb"));
         assert!(cxc.contains("cartoon"));
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_plan_synthesis_exports_eln_markdown_and_enforces_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join("chemcraft_mcp_plan_synthesis_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let wdir = base.join("write");
+        std::fs::create_dir_all(&wdir)?;
+
+        let sb = PathSandbox::new(None, Some(&wdir))?;
+        let req = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}})
+                .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{
+                    "name":"plan_synthesis",
+                    "arguments":{
+                        "smiles":"CC(=O)Nc1ccc(O)cc1",
+                        "name":"Paracetamol",
+                        "max_steps":3,
+                        "scale_mg":250.0,
+                        "out_md_path":"paracetamol_eln.md"
+                    }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{
+                    "name":"plan_synthesis",
+                    "arguments":{
+                        "smiles":"CC(=O)Nc1ccc(O)cc1",
+                        "out_md_path":"../outside_eln.md"
+                    }
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let mut out_buf = Vec::new();
+        mcp::serve_stream_for_test(BufReader::new(req.as_bytes()), &mut out_buf, &sb, None)?;
+        let lines: Vec<serde_json::Value> = String::from_utf8(out_buf)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1]["result"]["isError"], false);
+        let routes = lines[1]["result"]["structuredContent"]["routes"]
+            .as_array()
+            .ok_or("missing routes array")?;
+        assert!(!routes.is_empty());
+        assert_eq!(routes[0]["fully_resolved_in_stock"], true);
+        assert_eq!(lines[2]["result"]["isError"], true);
+
+        let md = std::fs::read_to_string(wdir.join("paracetamol_eln.md"))?;
+        assert!(md.contains("Paracetamol"));
+        assert!(md.contains("Shopping List"));
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

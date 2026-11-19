@@ -17,7 +17,7 @@
 
 ---
 
-## Architecture (7-Crate Cargo Workspace)
+## Architecture (8-Crate Cargo Workspace)
 
 | Layer | Crate / App | Role |
 |---|---|---|
@@ -25,9 +25,10 @@
 | L1 | `crates/mol-vector` | 2D layout generator (fused/spiro/bridged rings + `Clean Structure 2D`), **ACS Document 1996** (`B&W` / `Color`) & Modern depiction presets with optional terminal `CH3`, ring-snapping templates, ring-aligned double/triple/aromatic bonds, stereo wedges/hashes/wavy/dative arrows, label collision resolution, and **SVG / EPS / FlateDecode PDF / PNG** export (single or multi-molecule grid) |
 | L2 | `crates/mol-admet-bridge` | Decoupled `AdmetProvider` trait + standalone pure-Rust ADMET preview engine (**exact Ertl 2000 TPSA**, **Wildman-Crippen 1999 WLOGP/MR**, strict rotatable bonds), **`1H` & `13C` NMR chemical shift/multiplicity predictor**, external `admetcraft-cli` delegation (`eval`/`batch` + BOILED-Egg SVG handoff), and `admetcraft` GUI launcher — zero sibling path dependencies |
 | L2 | `crates/mol-sar` | In-memory SAR compound table, 2048-bit ECFP4 (`MorganFp`) fingerprints, `rayon`-parallel Tanimoto/SMARTS/numeric filtering, deterministic Matched Molecular Pairs (MMP), duplicate detection, Activity Cliffs (`SALI`), and Ligand Efficiency (`LE`, `LLE`) |
+| L2 | `crates/mol-synth` | **Buy-Before-Make & Retro* Multi-Step Retrosynthesis Engine** (`v0.3.0`): curated commercial MedChem building-block index (172 built-in BBs + auto-loaded `.tsv`/`.smi` catalogs in `CRAFT_DATA_DIR/building_blocks`, default `/home/acs/Datos/CraftBio/building_blocks/`), ECFP4 Tanimoto nearest-stock analog finder, 25+ graph-level MedChem disconnections (Amide/Macrolactam, Urea/Carbamate CDI, Ester/Macrolactone, Sulfonamide, SNAr, Buchwald-Hartwig, Williamson/Macroether, Indole/Heterocycle N-Alkylation & Macrocyclization, Reductive Amination, Suzuki-Miyaura, Sonogashira, Heck, Grignard, Friedel-Crafts, BHC Pd-Carbonylation, Tetrazole & CuAAC Click, Ketone/Nitro Reduction, Sulfone Oxidation), chemoselectivity & protecting-group alerts, memoized Retro* AND-OR search, backward-propagated forward stoichiometry (`mg`/`mmol`), MDL `.rxn` V2000 & ELN Markdown protocol export |
 | L3 | `crates/mol-engine` | Session state, Copy-on-Write structural Undo/Redo (`Arc` snapshots), `CommandRegistry` (including click-and-drag `ConnectAtoms`, `CycleBondOrder`, `AdjustAtomCharge`, `AttachSuperatomGroup`, `FlipCanvas2D`, `RotateCanvas2D`, `LoadChemicalName`, `LoadCdxml`, `BuildPeptide`), bounded `.chemcraft` ZIP+JSON archives (`O_EXCL` atomic save), **ChimeraX `.pdb`/`.sdf`+`.cxc` bundle launcher**, **DockCraft 3D SDF/SMILES handoff & pH 7.4-aware sidecar merger**, and kernel-confined `PathSandbox` (`openat2` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`) |
-| L4 | `apps/chemcraft-cli` | Headless CLI (`render --acs1996`, `analyze`, `nmr`, `name`, `group`, `cdxml`, `rxn`, `peptide`, `export3d`, `chimerax`, `dockcraft`, `dock-results`, `library`, `filter`, `enrich`, `mmp`, `inspect`) + strict JSON-RPC 2.0 **MCP server** (`stdio` & `--tcp` with constant-time bearer auth) |
-| L5 | `apps/chemcraft` | Native `egui` / `eframe` ChemDraw-grade desktop studio: click-and-drag 30°-snapped bond drawing & ring closing, click bond to cycle order, `+`/`-` formal charges, 24 superatom stamps, `Flip H/V` & `Rot 30°`, `ACS 1996` toggle, Name-to-Structure bar, `.cdxml`/`.rxn`/native file picker (`Browse...`), Tabbed Inspector (`ADMET` \| `Analysis` \| `1H/13C NMR` \| `Reaction`), `2D / 3D / Split 2D+3D` viewports, optional **SAR Explorer**, and **ChimeraX / DockCraft / AdmetCraft** launchers |
+| L4 | `apps/chemcraft-cli` | Headless CLI (`render --acs1996`, `analyze`, `nmr`, `name`, `group`, `cdxml`, `rxn`, `retro`, `peptide`, `export3d`, `chimerax`, `dockcraft`, `dock-results`, `library`, `filter`, `enrich`, `mmp`, `inspect`) + strict JSON-RPC 2.0 **MCP server** (`stdio` & `--tcp` with constant-time bearer auth) |
+| L5 | `apps/chemcraft` | Native `egui` / `eframe` ChemDraw-grade desktop studio: click-and-drag 30°-snapped bond drawing & ring closing, click bond to cycle order, `+`/`-` formal charges, 24 superatom stamps, `Flip H/V` & `Rot 30°`, `ACS 1996` toggle, Name-to-Structure bar, `.cdxml`/`.rxn`/native file picker (`Browse...`), Tabbed Inspector (`Analysis` \| `1H/13C NMR` \| `Reaction` \| `ADMET`), `2D / 3D / Split 2D+3D` viewports, optional **SAR Explorer**, on-demand **`Synth Module`** panel (hidden by default; opened via top `Synth Module` toggle or `Tools -> Synth Module...`), and **ChimeraX / DockCraft / AdmetCraft** launchers |
 
 ---
 
@@ -86,6 +87,10 @@ chemcraft-cli dockcraft --library hits.sdf --out-dir ./dock_handoff
 chemcraft-cli library --preset fragments --funnel ro3 --diverse-n 15 --out frags_3d.sdf --send-dockcraft
 chemcraft-cli library --input ~/.local/share/chemcraft/libraries/zinc_subset.sdf.gz --funnel lead --out lead_hits_3d.sdf
 
+# Retrosynthesis & Buy-Before-Make (Synth Module CLI)
+chemcraft-cli retro --init-stock
+chemcraft-cli retro "CC(=O)Nc1ccc(O)cc1" --name Paracetamol --scale-mg 250 --out-md paracetamol_eln.md --out-rxn-dir ./rxn_steps
+
 # Hardened MCP Server (stdio or loopback TCP with token)
 chemcraft-cli mcp --read-root ./data --write-root ./exports
 chemcraft-cli mcp --read-root ./data --write-root ./exports --tcp 127.0.0.1:7878 --mcp-token "$TOKEN"
@@ -101,6 +106,7 @@ chemcraft-cli mcp --read-root ./data --write-root ./exports --tcp 127.0.0.1:7878
 - `export_3d`: Generates 3D conformers from SMILES or peptides and writes PDB or 3D SDF inside `--write-root`.
 - `export_chimerax`: Exports self-contained ChimeraX `.pdb`/`.sdf` + `.cxc` scripts inside `--write-root`.
 - `screen_library`: Streams built-in presets or sandboxed `.sdf`/`.sdf.gz`/`.smi`/`.smi.gz`/`.csv`/`.dwar` chemical libraries through ADMET/SMARTS/MaxMin funnels, ionizes at pH 7.4, generates 3D coordinates, and writes DockCraft-ready 3D SDF files inside `--write-root`.
+- `plan_synthesis`: Runs Buy-Before-Make commercial stock lookup + Retro* multi-step retrosynthesis planning with reagents, backward-propagated stoichiometry, chemoselectivity/PG alerts, and optional ELN Markdown export inside `--write-root`.
 
 ## Clean-Room & Scientific Scope Notes
 - Zero third-party proprietary code (`ChemDraw`, `MarvinSketch`, `DataWarrior`).

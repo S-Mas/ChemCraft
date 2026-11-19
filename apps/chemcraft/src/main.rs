@@ -2,6 +2,7 @@
 
 mod chem_panels;
 mod library_ui;
+mod synth_ui;
 mod viewer3d;
 mod widgets;
 
@@ -31,6 +32,7 @@ use mol_vector::{
     DepictionPreset, ReactionArrow, RingTemplate, STANDARD_BOND_LEN, SceneStyle, VectorScene,
     build_mol_scene, scene_to_eps, scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
+use synth_ui::{SynthAction, SynthModuleState, render_synth_module};
 use viewer3d::{Viewer3dState, render_3d_viewport};
 use widgets::{
     ScatterXAxis, draw_admet_radar, draw_sar_scatter, paint_mol_thumbnail, paint_vector_scene,
@@ -77,6 +79,7 @@ struct ChemCraftApp {
     peptide_ss: SecondaryStructure,
     peptide_drawer_open: bool,
     library_win: LibraryWindowState,
+    synth_module: SynthModuleState,
     sar_panel_open: bool,
     chimerax_available: bool,
     dockcraft_available: bool,
@@ -136,6 +139,7 @@ impl ChemCraftApp {
             peptide_ss: SecondaryStructure::AlphaHelix,
             peptide_drawer_open: false,
             library_win: LibraryWindowState::default(),
+            synth_module: SynthModuleState::default(),
             sar_panel_open: false,
             chimerax_available,
             dockcraft_available,
@@ -1400,6 +1404,32 @@ impl eframe::App for ChemCraftApp {
                 self.status_msg = msg;
             }
         }
+        match render_synth_module(
+            ctx,
+            &mut self.synth_module,
+            &self.session.canvas_mol,
+            &self.export_dir,
+            self.dark_mode,
+        ) {
+            SynthAction::None => {}
+            SynthAction::LoadSmiles { smiles, name } => {
+                self.run_cmd(Command::LoadCanvasSmiles {
+                    smiles,
+                    name: Some(name.clone()),
+                });
+                self.viewer_3d.reset();
+                self.status_msg = format!("Synth Module: loaded {name} into 2D/3D canvas");
+            }
+            SynthAction::OpenReactionSmiles { reaction_smiles } => {
+                self.reaction_state.rsmiles = reaction_smiles;
+                self.inspector_tab = InspectorTab::Reaction;
+                self.status_msg =
+                    "Synth Module: sent reaction step to Reaction & Stoichiometry tab".to_string();
+            }
+            SynthAction::Status(msg) => {
+                self.status_msg = msg;
+            }
+        }
 
         // 1. Craft-Standard Top Menu Bar + Single-Row Quick Action Toolbar
         egui::TopBottomPanel::top("craft_menu_bar").show(ctx, |ui| {
@@ -1597,6 +1627,13 @@ impl eframe::App for ChemCraftApp {
                         self.library_win.open = true;
                         ui.close_menu();
                     }
+                    if ui
+                        .button("Synth Module (Retrosynthesis & Buy-Before-Make)...")
+                        .clicked()
+                    {
+                        self.synth_module.open = true;
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui.button("Add Canvas Molecule to SAR Table").clicked() {
                         self.run_cmd(Command::AddCanvasToSar { pic50: None });
@@ -1713,6 +1750,8 @@ impl eframe::App for ChemCraftApp {
                 ui.toggle_value(&mut self.peptide_drawer_open, "Peptides");
                 ui.toggle_value(&mut self.library_win.open, "Libraries");
                 ui.toggle_value(&mut self.sar_panel_open, "SAR");
+                ui.toggle_value(&mut self.synth_module.open, "Synth Module")
+                    .on_hover_text("Abrir/ocultar panel de retrosíntesis (Buy-Before-Make + Retro*)");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -2514,6 +2553,18 @@ mod tests {
     fn app_starts_clean_with_optional_sar_and_runs_bioisostere_and_undo() {
         let mut app = ChemCraftApp::new();
         assert!(!app.sar_panel_open);
+        assert!(!app.synth_module.open);
+        assert!(app.synth_module.last_plan.is_none());
+        app.synth_module.run_for_molecule(&app.session.canvas_mol);
+        assert!(
+            app.synth_module
+                .last_plan
+                .as_ref()
+                .is_some_and(|p| !p.routes.is_empty()),
+            "expected Synth Module to solve default canvas molecule on demand"
+        );
+        assert!(!app.synth_module.thumb_cache.is_empty());
+        assert!(!app.synth_module.open);
         assert!(app.session.sar_table.rows.is_empty());
         // ADMET is strictly on-demand at startup (not auto-computed)
         assert!(app.session.live_admet.is_none());

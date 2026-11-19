@@ -693,6 +693,22 @@ fn mcp_tool_catalog() -> Value {
                 },
                 "required": ["smiles", "group"]
             }
+        },
+        {
+            "name": "plan_synthesis",
+            "description": "Run Buy-Before-Make commercial building-block lookup + Retro* multi-step retrosynthesis planning with reagents, stoichiometry, chemoselectivity warnings, and optional ELN Markdown export.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "name": { "type": "string" },
+                    "max_steps": { "type": "integer", "minimum": 1, "maximum": 6 },
+                    "top": { "type": "integer", "minimum": 1, "maximum": 10 },
+                    "scale_mg": { "type": "number", "minimum": 1.0 },
+                    "out_md_path": { "type": "string" }
+                },
+                "required": ["smiles"]
+            }
         }
     ])
 }
@@ -714,6 +730,7 @@ fn dispatch_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Result<Valu
         "cdxml_io" => tool_cdxml_io(args, sandbox),
         "rxn_stoichiometry" => tool_rxn_stoichiometry(args, sandbox),
         "attach_superatom" => tool_attach_superatom(args),
+        "plan_synthesis" => tool_plan_synthesis(args, sandbox),
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -1587,4 +1604,59 @@ fn tool_attach_superatom(args: &Value) -> Result<Value, String> {
             "analysis": analysis,
         }),
     ))
+}
+
+fn tool_plan_synthesis(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let smiles = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'smiles'".to_string())?;
+    let name = args.get("name").and_then(Value::as_str);
+    let max_steps = args
+        .get("max_steps")
+        .and_then(Value::as_u64)
+        .unwrap_or(4)
+        .clamp(1, 6) as usize;
+    let top = args
+        .get("top")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .clamp(1, 10) as usize;
+    let scale_mg = args
+        .get("scale_mg")
+        .and_then(Value::as_f64)
+        .unwrap_or(100.0)
+        .max(1.0);
+    let cfg = mol_synth::RetroConfig {
+        max_steps,
+        max_routes: top,
+        target_scale_mg: scale_mg,
+        ..Default::default()
+    };
+    let plan = mol_synth::plan_retrosynthesis_smiles(smiles, name, &cfg)
+        .map_err(|e| format!("invalid SMILES: {e}"))?;
+    let mut out_md_written = None;
+    if let Some(out_rel) = args.get("out_md_path").and_then(Value::as_str) {
+        let md = plan.render_markdown();
+        let (resolved, mut f) = match sandbox.open_write(Path::new(out_rel)) {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+        };
+        f.write_all(md.as_bytes()).map_err(|e| e.to_string())?;
+        out_md_written = Some(resolved.display().to_string());
+    }
+    let summary = format!(
+        "Planned {} synthetic route(s) for {} ({} nodes, {} ms)",
+        plan.routes.len(),
+        plan.target_name,
+        plan.nodes_expanded,
+        plan.elapsed_ms
+    );
+    let mut payload = serde_json::to_value(&plan).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = payload.as_object_mut()
+        && let Some(p) = out_md_written
+    {
+        obj.insert("written_md_path".to_string(), json!(p));
+    }
+    Ok(tool_ok(summary, payload))
 }
