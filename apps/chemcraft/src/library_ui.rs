@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::RichText;
@@ -14,6 +16,11 @@ use mol_engine::{
 };
 use mol_graph::MolGraph;
 use mol_sar::SarTable;
+
+struct DockingJobHandle {
+    rx: mpsc::Receiver<Result<String, String>>,
+    started_at: Instant,
+}
 
 pub struct LibraryWindowState {
     pub open: bool,
@@ -28,6 +35,8 @@ pub struct LibraryWindowState {
     pub box_center: [f64; 3],
     pub box_size: [f64; 3],
     pub dockcraft_cli_available: bool,
+    docking_job: Option<DockingJobHandle>,
+    pub last_docking_ready: bool,
 }
 
 impl Default for LibraryWindowState {
@@ -47,6 +56,8 @@ impl Default for LibraryWindowState {
             box_center: [0.0, 0.0, 0.0],
             box_size: [22.0, 22.0, 22.0],
             dockcraft_cli_available: is_dockcraft_cli_available(),
+            docking_job: None,
+            last_docking_ready: false,
         }
     }
 }
@@ -55,6 +66,7 @@ pub enum LibraryAction {
     None,
     LoadHitOnCanvas(MolGraph),
     SendResultToSar(SarTable),
+    ImportLatestDockCraft,
     Status(String),
 }
 
@@ -63,11 +75,35 @@ pub fn render_library_window(
     state: &mut LibraryWindowState,
     export_dir: &str,
 ) -> LibraryAction {
-    if !state.open {
-        return LibraryAction::None;
+    let mut action = LibraryAction::None;
+
+    // Poll non-blocking background DockCraft screening job even if window is closed
+    if let Some(ref job) = state.docking_job {
+        match job.rx.try_recv() {
+            Ok(Ok(msg)) => {
+                state.docking_job = None;
+                state.last_docking_ready = true;
+                action = LibraryAction::Status(msg);
+            }
+            Ok(Err(err)) => {
+                state.docking_job = None;
+                action = LibraryAction::Status(err);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.docking_job = None;
+                action =
+                    LibraryAction::Status("DockCraft background worker terminated".to_string());
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(120));
+            }
+        }
     }
 
-    let mut action = LibraryAction::None;
+    if !state.open {
+        return action;
+    }
+
     let mut open = state.open;
 
     egui::Window::new("Screening Libraries (In Silico Pipeline)")
@@ -290,65 +326,99 @@ pub fn render_library_window(
                         for s in &mut state.box_size {
                             ui.add(egui::DragValue::new(s).range(6.0..=60.0).speed(0.2));
                         }
-                        if ui.button("Run Screening").clicked()
-                            && !state.receptor_path.trim().is_empty()
+                        let running = state.docking_job.is_some();
+                        if ui
+                            .add_enabled(
+                                !running && !state.receptor_path.trim().is_empty(),
+                                egui::Button::new(if running {
+                                    "Running Screening..."
+                                } else {
+                                    "Run Screening"
+                                }),
+                            )
+                            .clicked()
                             && let Some(ref res) = state.last_result
                         {
                             let handoff_dir = default_dockcraft_handoff_dir();
-                                let lib_sdf = handoff_dir.join("chemcraft_screen_input_3d.sdf");
-                                let out_csv = PathBuf::from(export_dir).join("dockcraft_screening_hits.csv");
-                                match export_library_hits_sdf3d(res, &lib_sdf) {
-                                    Ok(_) => {
-                                        let center_arg = format!(
-                                            "{},{},{}",
-                                            state.box_center[0], state.box_center[1], state.box_center[2]
-                                        );
-                                        let size_arg = format!(
-                                            "{},{},{}",
-                                            state.box_size[0], state.box_size[1], state.box_size[2]
-                                        );
-                                        match Command::new("dockcraft-cli")
+                            let lib_sdf = handoff_dir.join("chemcraft_screen_input_3d.sdf");
+                            let out_csv = PathBuf::from(export_dir).join("dockcraft_screening_hits.csv");
+                            match export_library_hits_sdf3d(res, &lib_sdf) {
+                                Ok(count) => {
+                                    let receptor = state.receptor_path.trim().to_string();
+                                    let center_arg = format!(
+                                        "{},{},{}",
+                                        state.box_center[0], state.box_center[1], state.box_center[2]
+                                    );
+                                    let size_arg = format!(
+                                        "{},{},{}",
+                                        state.box_size[0], state.box_size[1], state.box_size[2]
+                                    );
+                                    let (tx, rx) = mpsc::channel();
+                                    let ctx_clone = ctx.clone();
+                                    std::thread::spawn(move || {
+                                        let result = match Command::new("dockcraft-cli")
                                             .args([
                                                 "screen",
                                                 "--receptor",
-                                                state.receptor_path.trim(),
+                                                &receptor,
                                                 "--library",
                                             ])
                                             .arg(&lib_sdf)
                                             .arg("--out")
                                             .arg(&out_csv)
-                                            .args(["--center", &center_arg, "--size", &size_arg])
+                                            .args([
+                                                "--center",
+                                                &center_arg,
+                                                "--size",
+                                                &size_arg,
+                                                "--sidecar",
+                                            ])
                                             .stdin(Stdio::null())
                                             .stdout(Stdio::piped())
                                             .stderr(Stdio::piped())
                                             .output()
                                         {
-                                            Ok(o) if o.status.success() => {
-                                                action = LibraryAction::Status(format!(
-                                                    "DockCraft screening complete -> {}",
-                                                    out_csv.display()
-                                                ));
-                                            }
+                                            Ok(o) if o.status.success() => Ok(format!(
+                                                "DockCraft screening complete ({count} ligands) -> {} (sidecar ready)",
+                                                out_csv.display()
+                                            )),
                                             Ok(o) => {
                                                 let err = String::from_utf8_lossy(&o.stderr);
-                                                action = LibraryAction::Status(format!(
+                                                Err(format!(
                                                     "dockcraft-cli screen failed: {}",
                                                     err.trim()
-                                                ));
+                                                ))
                                             }
                                             Err(e) => {
-                                                action = LibraryAction::Status(format!(
-                                                    "dockcraft-cli spawn failed: {e}"
-                                                ));
+                                                Err(format!("dockcraft-cli spawn failed: {e}"))
                                             }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        action = LibraryAction::Status(format!("Library write error: {e}"));
-                                    }
+                                        };
+                                        let _ = tx.send(result);
+                                        ctx_clone.request_repaint();
+                                    });
+                                    state.last_docking_ready = false;
+                                    state.docking_job = Some(DockingJobHandle {
+                                        rx,
+                                        started_at: Instant::now(),
+                                    });
+                                    action = LibraryAction::Status(format!(
+                                        "Started background DockCraft screening ({count} ligands)..."
+                                    ));
+                                }
+                                Err(e) => {
+                                    action =
+                                        LibraryAction::Status(format!("Library write error: {e}"));
                                 }
                             }
-                        });
+                        }
+                        if let Some(ref job) = state.docking_job {
+                            ui.label(format!("({:.1}s)", job.started_at.elapsed().as_secs_f32()));
+                        } else if state.last_docking_ready
+                            && ui.button("Importar sidecar al SAR").clicked()
+                        {
+                            action = LibraryAction::ImportLatestDockCraft;
+                        }
+                    });
                 });
             }
 

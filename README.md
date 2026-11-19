@@ -21,13 +21,13 @@
 
 | Layer | Crate / App | Role |
 |---|---|---|
-| L0 | `crates/mol-graph` | Clean-room editable `MolGraph`, SSSR ring basis, iterative Hückel aromaticity, valence diagnostics, Cahn-Ingold-Prelog `R/S` & `E/Z` stereo, canonical SMILES, SMARTS subgraph matching, SDF **V2000 & V3000**, DataWarrior `.dwar`, CSV, bioisostere mutation, pure-Rust **3D conformer generator & PDB/3D-SDF writer**, and **20-AA 2D+3D Peptide Builder** |
-| L1 | `crates/mol-vector` | 2D layout generator (fused/spiro/bridged rings + `Clean Structure 2D`), ring-snapping templates, ring-aligned double/triple/aromatic bonds, stereo wedges/hashes/wavy/dative arrows, label collision resolution, and **SVG / EPS / FlateDecode PDF / PNG** export (single or multi-molecule grid) |
-| L2 | `crates/mol-admet-bridge` | Decoupled `AdmetProvider` trait + standalone pure-Rust ADMET preview engine, external `admetcraft-cli` delegation (`eval`/`batch` + BOILED-Egg SVG handoff), and `admetcraft` GUI launcher — zero sibling path dependencies |
+| L0 | `crates/mol-graph` | Clean-room editable `MolGraph`, SSSR ring basis, iterative Hückel aromaticity, valence diagnostics, Cahn-Ingold-Prelog `R/S` & `E/Z` stereo, canonical SMILES, SMARTS subgraph matching, SDF **V2000 & V3000**, **ChemDraw `.cdxml`** bidirectional reader/writer, **MDL `.rxn` V2000** reaction & stoichiometry/yield engine, **Analysis Window** (exact monoisotopic mass, elemental analysis `%C/%H/...`, DBE, ESI+/ESI- MS adducts), **30 Superatom/Protecting Groups** (`Boc`, `Fmoc`, `Cbz`, `Ph`, `Bn`, `CF3`, `CO2Me`, `SO2Me`, ...), **Name-to-Structure** (110+ drugs/solvents + systematic IUPAC parser), DataWarrior `.dwar`, CSV, bioisostere mutation, pure-Rust **3D conformer generator** (chiral-volume & Jacobi MDS cage embedding, PDB/3D-SDF V2000+V3000), and **20-AA 2D+3D Peptide Builder** |
+| L1 | `crates/mol-vector` | 2D layout generator (fused/spiro/bridged rings + `Clean Structure 2D`), **ACS Document 1996** (`B&W` / `Color`) & Modern depiction presets with optional terminal `CH3`, ring-snapping templates, ring-aligned double/triple/aromatic bonds, stereo wedges/hashes/wavy/dative arrows, label collision resolution, and **SVG / EPS / FlateDecode PDF / PNG** export (single or multi-molecule grid) |
+| L2 | `crates/mol-admet-bridge` | Decoupled `AdmetProvider` trait + standalone pure-Rust ADMET preview engine (**exact Ertl 2000 TPSA**, **Wildman-Crippen 1999 WLOGP/MR**, strict rotatable bonds), **`1H` & `13C` NMR chemical shift/multiplicity predictor**, external `admetcraft-cli` delegation (`eval`/`batch` + BOILED-Egg SVG handoff), and `admetcraft` GUI launcher — zero sibling path dependencies |
 | L2 | `crates/mol-sar` | In-memory SAR compound table, 2048-bit ECFP4 (`MorganFp`) fingerprints, `rayon`-parallel Tanimoto/SMARTS/numeric filtering, deterministic Matched Molecular Pairs (MMP), duplicate detection, Activity Cliffs (`SALI`), and Ligand Efficiency (`LE`, `LLE`) |
-| L3 | `crates/mol-engine` | Session state, Copy-on-Write structural Undo/Redo (`Arc` snapshots), `CommandRegistry` (including `BuildPeptide`), bounded `.chemcraft` ZIP+JSON archives, **ChimeraX `.pdb`/`.sdf`+`.cxc` bundle launcher**, **DockCraft 3D SDF/SMILES handoff**, and kernel-confined `PathSandbox` (`openat2` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`) |
-| L4 | `apps/chemcraft-cli` | Headless CLI (`render`, `peptide`, `export3d`, `chimerax`, `dockcraft`, `filter`, `enrich`, `mmp`, `inspect`) + strict JSON-RPC 2.0 **MCP server** (`stdio` & `--tcp`) |
-| L5 | `apps/chemcraft` | Native `egui` / `eframe` desktop studio focused on small-molecule & peptide 2D/3D design (`2D Vector` / `3D Interactive` / `Split 2D + 3D`), optional toggleable **SAR Explorer**, **"Visualizar en ChimeraX"**, **"Enviar a DockCraft"**, Command Palette (`Ctrl+K`), and AdmetCraft Inspector + handoff |
+| L3 | `crates/mol-engine` | Session state, Copy-on-Write structural Undo/Redo (`Arc` snapshots), `CommandRegistry` (including click-and-drag `ConnectAtoms`, `CycleBondOrder`, `AdjustAtomCharge`, `AttachSuperatomGroup`, `FlipCanvas2D`, `RotateCanvas2D`, `LoadChemicalName`, `LoadCdxml`, `BuildPeptide`), bounded `.chemcraft` ZIP+JSON archives (`O_EXCL` atomic save), **ChimeraX `.pdb`/`.sdf`+`.cxc` bundle launcher**, **DockCraft 3D SDF/SMILES handoff & pH 7.4-aware sidecar merger**, and kernel-confined `PathSandbox` (`openat2` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`) |
+| L4 | `apps/chemcraft-cli` | Headless CLI (`render --acs1996`, `analyze`, `nmr`, `name`, `group`, `cdxml`, `rxn`, `peptide`, `export3d`, `chimerax`, `dockcraft`, `dock-results`, `library`, `filter`, `enrich`, `mmp`, `inspect`) + strict JSON-RPC 2.0 **MCP server** (`stdio` & `--tcp` with constant-time bearer auth) |
+| L5 | `apps/chemcraft` | Native `egui` / `eframe` ChemDraw-grade desktop studio: click-and-drag 30°-snapped bond drawing & ring closing, click bond to cycle order, `+`/`-` formal charges, 24 superatom stamps, `Flip H/V` & `Rot 30°`, `ACS 1996` toggle, Name-to-Structure bar, `.cdxml`/`.rxn`/native file picker (`Browse...`), Tabbed Inspector (`ADMET` \| `Analysis` \| `1H/13C NMR` \| `Reaction`), `2D / 3D / Split 2D+3D` viewports, optional **SAR Explorer**, and **ChimeraX / DockCraft / AdmetCraft** launchers |
 
 ---
 
@@ -46,9 +46,22 @@ chemcraft
 
 ### CLI & MCP Examples
 ```bash
-# Render vector SVG, PDF, EPS, or PNG
-chemcraft-cli render "CC12CCC3C(C1CCC2O)CCC4=CC(=O)CCC34C" --out testosterone.svg --format svg
+# Render vector SVG, PDF, EPS, or PNG (including ACS Document 1996 B&W preset)
+chemcraft-cli render "CC12CCC3C(C1CCC2O)CCC4=CC(=O)CCC34C" --out testosterone.svg --format svg --acs1996 --monochrome
 chemcraft-cli render "CCCc1nn(C)c2c(=O)[nH]c(-c3cc(S(=O)(=O)N4CCN(C)CC4)ccc3OCC)nc12" --out sildenafil.pdf --format pdf
+
+# ChemDraw Analysis Window (exact mass, elemental analysis, DBE, ESI+/ESI- adducts) & 1H/13C NMR
+chemcraft-cli analyze "CC(=O)Oc1ccccc1C(=O)O"
+chemcraft-cli nmr "CC(=O)Oc1ccccc1C(=O)O"
+
+# Name-to-Structure & Superatom / Protecting Group Attachment
+chemcraft-cli name "2-methylpropan-1-ol"
+chemcraft-cli group "Nc1ccccc1" --attach Boc --atom 0
+
+# ChemDraw .cdxml bidirectional I/O & MDL .rxn V2000 + stoichiometry/yield
+chemcraft-cli cdxml --smiles "CC(C)Cc1ccc([C@@H](C)C(=O)O)cc1" --out ibuprofen.cdxml
+chemcraft-cli cdxml --input ibuprofen.cdxml
+chemcraft-cli rxn --rsmiles "CC(=O)O.CCO>>CC(=O)OCC.O" --mmol 2.0 --actual-mg 140 --out ester.rxn
 
 # Substructure + Lipinski filter
 chemcraft-cli filter library.sdf --substructure "c1ccccc1" --lipinski-only --out hits.sdf

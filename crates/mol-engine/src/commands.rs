@@ -8,8 +8,8 @@ use mol_admet_bridge::{
     AdmetCraftProvider, AdmetDelta, AdmetProvider, MoleculeEvaluation, compute_admet_delta,
 };
 use mol_graph::{
-    BondOrder, BondStereo, MolAtom, MolGraph, SecondaryStructure, build_peptide, mutate_molecule,
-    parse_smiles,
+    BondOrder, BondStereo, MolAtom, MolGraph, SecondaryStructure, attach_superatom_group,
+    build_peptide, mutate_molecule, parse_cdxml, parse_smiles, resolve_chemical_name,
 };
 use mol_sar::{
     ActivityCliff, MatchedMolecularPair, SarFilter, SarTable, find_activity_cliffs,
@@ -80,6 +80,10 @@ impl ChemSession {
         !self.redo_stack.is_empty()
     }
 
+    pub fn push_undo_checkpoint(&mut self) {
+        self.push_undo();
+    }
+
     fn push_undo(&mut self) {
         self.undo_stack.push(SessionSnapshot {
             canvas_mol: Arc::clone(&self.canvas_mol),
@@ -141,6 +145,12 @@ pub enum Command {
         smiles: String,
         name: Option<String>,
     },
+    LoadChemicalName {
+        name: String,
+    },
+    LoadCdxml {
+        xml: String,
+    },
     BuildPeptide {
         sequence: String,
         secondary_structure: SecondaryStructure,
@@ -162,9 +172,42 @@ pub enum Command {
         order: BondOrder,
         stereo: BondStereo,
     },
+    ConnectAtoms {
+        u: usize,
+        v: usize,
+        order: BondOrder,
+        stereo: BondStereo,
+    },
     SetAtomElement {
         atom_idx: usize,
         symbol: String,
+    },
+    AdjustAtomCharge {
+        atom_idx: usize,
+        delta: i8,
+    },
+    CycleBondOrder {
+        bond_idx: usize,
+    },
+    SetBondStereo {
+        bond_idx: usize,
+        stereo: BondStereo,
+    },
+    AttachSuperatomGroup {
+        atom_idx: Option<usize>,
+        abbr: String,
+    },
+    FlipCanvas2D {
+        horizontal: bool,
+    },
+    RotateCanvas2D {
+        degrees: f64,
+    },
+    EraseAtom {
+        atom_idx: usize,
+    },
+    EraseBond {
+        bond_idx: usize,
     },
     MutateBioisostere {
         atom_index: Option<usize>,
@@ -384,6 +427,7 @@ impl CommandRegistry {
                 };
                 stamp_ring_template(&mut mol, tmpl, target)
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
                 let _ = session.refresh_live_admet();
                 Ok(CommandOutcome {
@@ -410,6 +454,7 @@ impl CommandRegistry {
                 }
                 mol.perceive()
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
                 let _ = session.refresh_live_admet();
                 Ok(CommandOutcome {
@@ -421,10 +466,255 @@ impl CommandRegistry {
                 let mut mol = (*session.canvas_mol).clone();
                 mol.set_atom_element(atom_idx, &symbol)
                     .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
                 session.canvas_mol = Arc::new(mol);
                 let _ = session.refresh_live_admet();
                 Ok(CommandOutcome {
                     message: format!("Changed atom #{} to {symbol}", atom_idx + 1),
+                })
+            }
+            Command::SetBondStereo { bond_idx, stereo } => {
+                let mut mol = (*session.canvas_mol).clone();
+                let b = mol.bonds.get_mut(bond_idx).ok_or_else(|| {
+                    CommandError::Failed(format!("invalid bond index {bond_idx}"))
+                })?;
+                session.push_undo();
+                b.stereo = stereo;
+                mol.perceive()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
+                session.canvas_mol = Arc::new(mol);
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Updated stereo on bond #{}", bond_idx + 1),
+                })
+            }
+            Command::LoadChemicalName { name } => {
+                let mut mol = resolve_chemical_name(&name)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                generate_2d_coords(&mut mol);
+                mol_graph::generate_3d_coords(&mut mol);
+                session.push_undo();
+                let label = mol.name.clone().unwrap_or_else(|| mol.formula());
+                let smi = mol.canonical_smiles();
+                session.canvas_mol = Arc::new(mol);
+                session.last_mutation_delta = None;
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Resolved '{label}' -> {smi}"),
+                })
+            }
+            Command::LoadCdxml { xml } => {
+                let mut mol = parse_cdxml(&xml).map_err(|e| CommandError::Failed(e.to_string()))?;
+                if mol.atoms.iter().any(|a| a.coords_2d.is_none()) {
+                    generate_2d_coords(&mut mol);
+                }
+                mol_graph::generate_3d_coords(&mut mol);
+                session.push_undo();
+                let f = mol.formula();
+                let smi = mol.canonical_smiles();
+                session.canvas_mol = Arc::new(mol);
+                session.last_mutation_delta = None;
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Imported CDXML ({f}, {smi})"),
+                })
+            }
+            Command::ConnectAtoms {
+                u,
+                v,
+                order,
+                stereo,
+            } => {
+                if u == v {
+                    return Err(CommandError::Failed(
+                        "cannot connect an atom to itself".to_string(),
+                    ));
+                }
+                let mut mol = (*session.canvas_mol).clone();
+                if u >= mol.atoms.len() || v >= mol.atoms.len() {
+                    return Err(CommandError::Failed("atom index out of range".to_string()));
+                }
+                session.push_undo();
+                if let Some((_, bid)) = mol.adj[u].iter().copied().find(|&(nb, _)| nb == v) {
+                    mol.bonds[bid].order = order;
+                    mol.bonds[bid].stereo = stereo;
+                } else {
+                    mol.add_bond(u, v, order, stereo)
+                        .map_err(|e| CommandError::Failed(e.to_string()))?;
+                }
+                mol.perceive()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
+                session.canvas_mol = Arc::new(mol);
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Connected atoms #{} and #{}", u + 1, v + 1),
+                })
+            }
+            Command::AdjustAtomCharge { atom_idx, delta } => {
+                let mut mol = (*session.canvas_mol).clone();
+                let a = mol.atoms.get_mut(atom_idx).ok_or_else(|| {
+                    CommandError::Failed(format!("invalid atom index {atom_idx}"))
+                })?;
+                session.push_undo();
+                a.formal_charge =
+                    (i16::from(a.formal_charge) + i16::from(delta)).clamp(-4, 4) as i8;
+                a.from_bracket = false;
+                a.explicit_h = 0;
+                let q = a.formal_charge;
+                mol.perceive()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
+                session.canvas_mol = Arc::new(mol);
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Atom #{} charge set to {q:+}", atom_idx + 1),
+                })
+            }
+            Command::CycleBondOrder { bond_idx } => {
+                let mut mol = (*session.canvas_mol).clone();
+                let b = mol.bonds.get_mut(bond_idx).ok_or_else(|| {
+                    CommandError::Failed(format!("invalid bond index {bond_idx}"))
+                })?;
+                session.push_undo();
+                b.order = match b.order {
+                    BondOrder::Single => BondOrder::Double,
+                    BondOrder::Double => BondOrder::Triple,
+                    BondOrder::Triple | BondOrder::Aromatic | BondOrder::Dative => {
+                        BondOrder::Single
+                    }
+                };
+                if b.order != BondOrder::Single {
+                    b.stereo = BondStereo::None;
+                }
+                let ord_label = format!("{:?}", b.order);
+                mol.perceive()
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
+                session.canvas_mol = Arc::new(mol);
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Bond #{} -> {ord_label}", bond_idx + 1),
+                })
+            }
+            Command::AttachSuperatomGroup { atom_idx, abbr } => {
+                session.push_undo();
+                let mut updated = attach_superatom_group(&session.canvas_mol, atom_idx, &abbr)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                generate_2d_coords(&mut updated);
+                mol_graph::generate_3d_coords(&mut updated);
+                let smi = updated.canonical_smiles();
+                session.canvas_mol = Arc::new(updated);
+                session.last_mutation_delta = None;
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Attached {abbr} -> {smi}"),
+                })
+            }
+            Command::FlipCanvas2D { horizontal } => {
+                if session.canvas_mol.atoms.is_empty() {
+                    return Err(CommandError::Failed("canvas is empty".to_string()));
+                }
+                session.push_undo();
+                let mut mol = (*session.canvas_mol).clone();
+                let mut cx = 0.0_f64;
+                let mut cy = 0.0_f64;
+                let mut cnt = 0usize;
+                for a in &mol.atoms {
+                    if let Some([x, y]) = a.coords_2d {
+                        cx += x;
+                        cy += y;
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    cx /= cnt as f64;
+                    cy /= cnt as f64;
+                    for a in &mut mol.atoms {
+                        if let Some([x, y]) = &mut a.coords_2d {
+                            if horizontal {
+                                *x = 2.0 * cx - *x;
+                            } else {
+                                *y = 2.0 * cy - *y;
+                            }
+                        }
+                    }
+                    // Flip Up <-> Down stereo wedges so physical 3D chirality is preserved on 2D reflection!
+                    for b in &mut mol.bonds {
+                        b.stereo = match b.stereo {
+                            BondStereo::Up => BondStereo::Down,
+                            BondStereo::Down => BondStereo::Up,
+                            other => other,
+                        };
+                    }
+                }
+                session.canvas_mol = Arc::new(mol);
+                Ok(CommandOutcome {
+                    message: if horizontal {
+                        "Flipped structure horizontally (chirality preserved)".to_string()
+                    } else {
+                        "Flipped structure vertically (chirality preserved)".to_string()
+                    },
+                })
+            }
+            Command::RotateCanvas2D { degrees } => {
+                if session.canvas_mol.atoms.is_empty() {
+                    return Err(CommandError::Failed("canvas is empty".to_string()));
+                }
+                session.push_undo();
+                let mut mol = (*session.canvas_mol).clone();
+                let rad = degrees.to_radians();
+                let (s, c) = rad.sin_cos();
+                let mut cx = 0.0_f64;
+                let mut cy = 0.0_f64;
+                let mut cnt = 0usize;
+                for a in &mol.atoms {
+                    if let Some([x, y]) = a.coords_2d {
+                        cx += x;
+                        cy += y;
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    cx /= cnt as f64;
+                    cy /= cnt as f64;
+                    for a in &mut mol.atoms {
+                        if let Some([x, y]) = &mut a.coords_2d {
+                            let dx = *x - cx;
+                            let dy = *y - cy;
+                            *x = cx + dx * c - dy * s;
+                            *y = cy + dx * s + dy * c;
+                        }
+                    }
+                }
+                session.canvas_mol = Arc::new(mol);
+                Ok(CommandOutcome {
+                    message: format!("Rotated structure by {degrees:+.0}°"),
+                })
+            }
+            Command::EraseAtom { atom_idx } => {
+                session.push_undo();
+                let mut mol = (*session.canvas_mol).clone();
+                mol.remove_atom(atom_idx)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
+                session.canvas_mol = Arc::new(mol);
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Erased atom #{}", atom_idx + 1),
+                })
+            }
+            Command::EraseBond { bond_idx } => {
+                session.push_undo();
+                let mut mol = (*session.canvas_mol).clone();
+                mol.remove_bond(bond_idx)
+                    .map_err(|e| CommandError::Failed(e.to_string()))?;
+                mol_graph::generate_3d_coords(&mut mol);
+                session.canvas_mol = Arc::new(mol);
+                let _ = session.refresh_live_admet();
+                Ok(CommandOutcome {
+                    message: format!("Erased bond #{}", bond_idx + 1),
                 })
             }
             Command::MutateBioisostere { atom_index, group } => {

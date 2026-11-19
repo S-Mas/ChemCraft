@@ -3,17 +3,26 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analysis;
+pub mod cdxml;
 pub mod coords3d;
 pub mod dwar;
 pub mod element;
 pub mod error;
+pub mod groups;
 pub mod mol;
 pub mod mutate;
+pub mod names;
 pub mod peptide;
+pub mod rxn;
 pub mod sdf;
 pub mod smarts;
 pub mod smiles;
 
+pub use analysis::{
+    ElementPercent, MassAdduct, MolecularAnalysis, analyze_molecule, monoisotopic_mass,
+};
+pub use cdxml::{parse_cdxml, write_cdxml};
 pub use coords3d::{
     compute_3d_coords, covalent_radius, ensure_3d_coords, generate_3d_coords, ideal_bond_length,
     write_pdb, write_sdf_v2000_3d,
@@ -24,6 +33,10 @@ pub use dwar::{
 };
 pub use element::{ElementMeta, element_by_number, element_by_symbol, max_neutral_valence};
 pub use error::MolError;
+pub use groups::{
+    SUPERATOM_GROUPS, SuperatomGroup, attach_superatom_group, build_superatom_fragment,
+    find_superatom_group,
+};
 pub use mol::{
     BondCisTrans, BondOrder, BondStereo, ChiralTag, MolAtom, MolBond, MolGraph, PdbAtomMeta,
     highest_cip_end_nbr,
@@ -31,11 +44,19 @@ pub use mol::{
 pub use mutate::{
     SubstituentKind, attach_fragment_at, mutate_molecule, replace_carboxyl_with_tetrazole,
 };
+pub use names::{known_chemical_names, resolve_chemical_name};
 pub use peptide::{
     MAX_PEPTIDE_RESIDUES, ParsedPeptide, SecondaryStructure, build_peptide, canonical_amino_acids,
     parse_peptide_sequence,
 };
-pub use sdf::{parse_mol_block, parse_sdf, parse_sdf_with_limit, write_sdf_v2000, write_sdf_v3000};
+pub use rxn::{
+    ReactionRole, ReactionScheme, ReactionStoichiometry, StoichRow, compute_stoichiometry,
+    parse_reaction_smiles, parse_rxn_v2000, write_rxn_v2000,
+};
+pub use sdf::{
+    parse_mol_block, parse_sdf, parse_sdf_with_limit, write_mol_v2000_block, write_sdf_v2000,
+    write_sdf_v3000,
+};
 pub use smarts::SmartsQuery;
 pub use smiles::{DEFAULT_MAX_ATOMS, parse_smiles, parse_smiles_line, parse_smiles_with_limit};
 
@@ -572,8 +593,33 @@ $$$$
             .into_iter()
             .next()
             .ok_or(MolError::EmptyInput)??;
-        assert_eq!(parsed3d.atoms.len(), sildenafil.atoms.len());
+        assert_eq!(parsed3d.formula(), sildenafil.formula());
+        assert_eq!(parsed3d.structural_key(), sildenafil.structural_key());
         assert!(parsed3d.atoms.iter().any(|a| a.coords_3d.is_some()));
+
+        // Aromatic [nH] preserved through 3D SDF roundtrip (Indole)
+        let mut indole = parse_smiles("c1ccc2[nH]ccc2c1")?;
+        generate_3d_coords(&mut indole);
+        let indole_sdf = write_sdf_v2000_3d(&[&indole]);
+        let indole_back = parse_sdf(&indole_sdf)
+            .into_iter()
+            .next()
+            .ok_or(MolError::EmptyInput)??;
+        assert_eq!(indole_back.formula(), "C8H7N");
+        assert_eq!(indole_back.structural_key(), indole.structural_key());
+
+        // >999 atoms automatically switches to valid CTAB V3000 3D
+        let mut big_mol = MolGraph::new();
+        for i in 0..1005 {
+            let mut a = MolAtom::new(i, "C")?;
+            a.coords_3d = Some([i as f64 * 1.5, 0.0, 0.25]);
+            big_mol.add_atom(a);
+            if i > 0 {
+                big_mol.add_bond(i - 1, i, BondOrder::Single, BondStereo::None)?;
+            }
+        }
+        let big_sdf = write_sdf_v2000_3d(&[&big_mol]);
+        assert!(big_sdf.contains("999 V3000") && big_sdf.contains("M  V30 COUNTS 1005 1004"));
 
         // 2. Peptide sequence parsing (1-letter, 3-letter, caps, errors)
         let p_3 = parse_peptide_sequence("Ac-Ala-Gly-Cys-Pro-Tyr-NH2")?;
@@ -622,6 +668,77 @@ $$$$
         assert!(build_peptide("AXG", SecondaryStructure::BetaStrand).is_err());
         let too_long = "A".repeat(MAX_PEPTIDE_RESIDUES + 1);
         assert!(build_peptide(&too_long, SecondaryStructure::BetaStrand).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn chemdraw_parity_analysis_cdxml_rxn_superatoms_and_names() -> Result<(), MolError> {
+        // 1. Exact mass, DBE, charge-annotated formula, elemental analysis, ESI adducts
+        let aspirin = parse_smiles("CC(=O)Oc1ccccc1C(=O)O")?;
+        let an = analyze_molecule(&aspirin);
+        assert_eq!(an.formula_with_charge, "C9H8O4");
+        assert!(
+            (an.exact_mass - 180.0423).abs() < 0.001,
+            "exact_mass={}",
+            an.exact_mass
+        );
+        assert!((an.dbe - 6.0).abs() < 0.01);
+        assert!(
+            an.adducts
+                .iter()
+                .any(|a| a.label == "[M+H]+" && (a.mz - 181.0495).abs() < 0.002)
+        );
+        assert!(an.elemental_analysis_string.contains("C, 60.0"));
+
+        let acetate = parse_smiles("CC(=O)[O-]")?;
+        assert_eq!(analyze_molecule(&acetate).formula_with_charge, "C2H3O2-");
+
+        // 2. CDXML roundtrip preserving chirality and aromatic [nH]
+        let ibu_r = parse_smiles("CC(C)Cc1ccc([C@@H](C)C(=O)O)cc1")?;
+        let cdxml = write_cdxml(&ibu_r);
+        assert!(cdxml.contains("<CDXML") && cdxml.contains("Wedge"));
+        let ibu_back = parse_cdxml(&cdxml)?;
+        assert_eq!(ibu_back.formula(), ibu_r.formula());
+        assert_eq!(ibu_back.structural_key(), ibu_r.structural_key());
+
+        let indole = parse_smiles("c1ccc2[nH]ccc2c1")?;
+        let indole_back = parse_cdxml(&write_cdxml(&indole))?;
+        assert_eq!(indole_back.formula(), "C8H7N");
+        assert_eq!(indole_back.structural_key(), indole.structural_key());
+
+        // 3. MDL .rxn V2000 + stoichiometry / atom economy / yield
+        let rxn = parse_reaction_smiles("CC(=O)O.CCO>>CC(=O)OCC.O")?;
+        let rxn_v2000 = write_rxn_v2000(&rxn);
+        assert!(rxn_v2000.starts_with("$RXN"));
+        let rxn_back = parse_rxn_v2000(&rxn_v2000)?;
+        assert_eq!(rxn_back.reactants.len(), 2);
+        assert_eq!(rxn_back.products.len(), 2);
+        let stoich = compute_stoichiometry(&rxn_back, 1.0, Some(70.48));
+        assert!((stoich.atom_economy_pct - 83.0).abs() < 1.0);
+        assert!((stoich.theoretical_yield_mg - 88.11).abs() < 0.5);
+        assert!(
+            stoich
+                .isolated_yield_pct
+                .is_some_and(|y| (y - 80.0).abs() < 1.0)
+        );
+
+        // 4. Superatoms & protecting groups
+        let aniline = parse_smiles("Nc1ccccc1")?;
+        let boc_aniline = attach_superatom_group(&aniline, Some(0), "Boc")?;
+        assert_eq!(boc_aniline.formula(), "C11H15NO2");
+
+        // 5. Name-to-Structure (dictionary + IUPAC systematic parser)
+        assert_eq!(resolve_chemical_name("Aspirin")?.formula(), "C9H8O4");
+        assert_eq!(
+            resolve_chemical_name("4-chlorophenol")?.formula(),
+            "C6H5ClO"
+        );
+        assert_eq!(
+            resolve_chemical_name("2-methylpropan-1-ol")?.formula(),
+            "C4H10O"
+        );
+        assert_eq!(resolve_chemical_name("cyclopentanone")?.formula(), "C5H8O");
+        assert_eq!(resolve_chemical_name("hexanoic acid")?.formula(), "C6H12O2");
         Ok(())
     }
 }

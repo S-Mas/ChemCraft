@@ -6,7 +6,16 @@ use mol_graph::{BondOrder, BondStereo, MolAtom, MolGraph};
 
 use crate::layout::ensure_2d_coords;
 
-/// Palette configuration for vector chemical rendering (light/dark publication themes).
+/// Standard publication depiction presets (ChemDraw ACS Document 1996 vs modern heteroatom color).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DepictionPreset {
+    #[default]
+    ModernColor,
+    Acs1996Bw,
+    Acs1996Color,
+}
+
+/// Palette configuration for vector chemical rendering (light/dark & ACS 1996 publication themes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneStyle {
     pub width: f64,
@@ -16,6 +25,10 @@ pub struct SceneStyle {
     pub font_size: f64,
     pub dark_mode: bool,
     pub show_stereo_labels: bool,
+    #[serde(default)]
+    pub monochrome: bool,
+    #[serde(default)]
+    pub show_terminal_methyls: bool,
 }
 
 impl Default for SceneStyle {
@@ -28,6 +41,44 @@ impl Default for SceneStyle {
             font_size: 13.5,
             dark_mode: false,
             show_stereo_labels: true,
+            monochrome: false,
+            show_terminal_methyls: false,
+        }
+    }
+}
+
+impl SceneStyle {
+    /// ACS Document 1996 publication style (crisp 1.15 pt bonds, 10.5 pt sans-serif labels).
+    pub fn acs_1996(width: f64, height: f64, monochrome: bool) -> Self {
+        Self {
+            width,
+            height,
+            padding: 26.0,
+            stroke_width: 1.25,
+            font_size: 11.5,
+            dark_mode: false,
+            show_stereo_labels: true,
+            monochrome,
+            show_terminal_methyls: false,
+        }
+    }
+
+    pub fn from_preset(preset: DepictionPreset, width: f64, height: f64, dark_mode: bool) -> Self {
+        match preset {
+            DepictionPreset::ModernColor => Self {
+                width,
+                height,
+                dark_mode,
+                ..Self::default()
+            },
+            DepictionPreset::Acs1996Bw => Self {
+                dark_mode,
+                ..Self::acs_1996(width, height, true)
+            },
+            DepictionPreset::Acs1996Color => Self {
+                dark_mode,
+                ..Self::acs_1996(width, height, false)
+            },
         }
     }
 }
@@ -232,13 +283,17 @@ pub fn build_mol_scene(
     type PendingLabel = (String, Rgba, [f64; 2], Rect2);
     let mut visible_labels: Vec<Option<PendingLabel>> = vec![None; mol.atoms.len()];
     for (idx, a) in mol.atoms.iter().enumerate() {
-        let Some(text) = format_atom_label(a, &mol, &atom_pos) else {
+        let Some(text) = format_atom_label(a, &mol, &atom_pos, style.show_terminal_methyls) else {
             continue;
         };
         let p = atom_pos[idx];
         let est_w = (text.len() as f64) * eff_font * 0.62 + 3.0;
         let est_h = eff_font + 3.0;
-        let color = element_color(&a.symbol, style.dark_mode);
+        let color = if style.monochrome {
+            fg
+        } else {
+            element_color(&a.symbol, style.dark_mode)
+        };
         let bbox = Rect2 {
             x: p[0] - est_w * 0.5,
             y: p[1] - est_h * 0.5,
@@ -615,8 +670,24 @@ pub fn build_mol_scene(
     }
 }
 
-fn format_atom_label(a: &MolAtom, mol: &MolGraph, pos: &[[f64; 2]]) -> Option<String> {
-    let show_carbon = mol.adj[a.id].is_empty() || a.formal_charge != 0 || a.isotope.is_some();
+fn format_atom_label(
+    a: &MolAtom,
+    mol: &MolGraph,
+    pos: &[[f64; 2]],
+    show_terminal_methyls: bool,
+) -> Option<String> {
+    let is_terminal_methyl = show_terminal_methyls
+        && a.symbol == "C"
+        && !a.aromatic
+        && mol.adj[a.id].len() == 1
+        && a.total_h() == 3
+        && mol.adj[a.id]
+            .first()
+            .is_some_and(|&(_, bid)| mol.bonds[bid].order == BondOrder::Single);
+    let show_carbon = mol.adj[a.id].is_empty()
+        || a.formal_charge != 0
+        || a.isotope.is_some()
+        || is_terminal_methyl;
     if a.symbol == "C" && !show_carbon {
         return None;
     }

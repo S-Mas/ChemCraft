@@ -137,6 +137,7 @@ pub fn paint_mol_thumbnail(
         font_size: 10.0,
         dark_mode,
         show_stereo_labels: true,
+        ..SceneStyle::default()
     };
     let mut scene = build_mol_scene(mol, &style, arrows);
     scene.background = None;

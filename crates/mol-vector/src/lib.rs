@@ -16,7 +16,8 @@ pub use layout::{
     ensure_2d_coords, generate_2d_coords, stamp_ring_template,
 };
 pub use scene::{
-    ReactionArrow, Rect2, Rgba, SceneStyle, VectorElement, VectorScene, build_mol_scene,
+    DepictionPreset, ReactionArrow, Rect2, Rgba, SceneStyle, VectorElement, VectorScene,
+    build_mol_scene,
 };
 
 #[cfg(test)]

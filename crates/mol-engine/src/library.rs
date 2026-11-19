@@ -775,6 +775,8 @@ pub fn filter_and_prepare_library(
             if !passes_funnel(&eval, cfg.funnel) {
                 return None;
             }
+            mol.properties
+                .insert("CHEMCRAFT_PARENT_SMILES".to_string(), can.clone());
             if cfg.protonate_ph74 {
                 protonate_at_ph74(&mut mol);
             }

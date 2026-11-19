@@ -373,7 +373,7 @@ fn away_2d_dir(u: usize, mol: &MolGraph, coords: &[[f64; 2]]) -> [f64; 2] {
 
 /// Reconstruct tetrahedral SMILES parity (`ChiralTag` + `chiral_seq`) from 2D CTAB coordinates
 /// and Up/Down stereo wedges (`b.u` is the narrow end at the chiral center).
-fn perceive_sdf_wedges(mol: &mut MolGraph) {
+pub(crate) fn perceive_sdf_wedges(mol: &mut MolGraph) {
     let coords: Vec<[f64; 2]> = mol
         .atoms
         .iter()
@@ -404,9 +404,16 @@ fn perceive_sdf_wedges(mol: &mut MolGraph) {
         }
         let mut xy = [[0.0; 2]; 4];
         let mut zs = [0.0; 4];
+        let wedged_z_sum: f64 = wedged.iter().map(|&(_, zv)| zv).sum();
         for (i, &nid) in seq.iter().enumerate() {
             if nid == usize::MAX {
-                xy[i] = away_2d_dir(u, mol, &coords);
+                if wedged_z_sum.abs() > 0.1 {
+                    // IUPAC/MDL/CDXML rule for 3-bond + implicit H: H points opposite the wedged bond in Z
+                    xy[i] = coords[u];
+                    zs[i] = -wedged_z_sum.signum();
+                } else {
+                    xy[i] = away_2d_dir(u, mol, &coords);
+                }
             } else {
                 xy[i] = coords[nid];
                 if let Some(&(_, zv)) = wedged.iter().find(|&&(wn, _)| wn == nid) {
@@ -527,7 +534,7 @@ fn aromatic_nh_hydrogens(mol: &MolGraph, coords: &[[f64; 2]]) -> Vec<(usize, [f6
 
 /// Generate lightweight trigonal 2D coordinates in pure `mol-graph` when exporting SDF from
 /// coordinate-less SMILES so E/Z double-bond geometry and chiral wedges encode faithfully.
-fn ensure_export_2d_coords(mol: &MolGraph) -> Vec<[f64; 2]> {
+pub(crate) fn ensure_export_2d_coords(mol: &MolGraph) -> Vec<[f64; 2]> {
     if mol.atoms.iter().all(|a| a.coords_2d.is_some()) {
         return mol
             .atoms
@@ -776,7 +783,7 @@ fn ensure_export_2d_coords(mol: &MolGraph) -> Vec<[f64; 2]> {
 
 /// Compute per-bond oriented endpoints `(u_out, v_out, stereo_out)` carrying CTAB stereo wedges
 /// for every tetrahedral stereocenter in `mol`.
-fn sdf_bond_records(
+pub(crate) fn sdf_bond_records(
     mol: &MolGraph,
     coords: &[[f64; 2]],
 ) -> Vec<(usize, usize, BondOrder, BondStereo)> {
@@ -831,7 +838,9 @@ fn sdf_bond_records(
             let mut zs_up = [0.0; 4];
             for (i, &nid) in seq.iter().enumerate() {
                 if nid == usize::MAX {
-                    xy[i] = away_2d_dir(u, mol, coords);
+                    // IUPAC/MDL/CDXML rule: with one Up (+1) wedge on a 3-heavy center, implicit H is Down (-1) at center
+                    xy[i] = coords[u];
+                    zs_up[i] = -1.0;
                 } else {
                     xy[i] = coords[nid];
                     if nid == w {
@@ -861,72 +870,80 @@ fn sdf_bond_records(
     records
 }
 
+/// Write a single `MolGraph` as an MDL V2000 MOL block (ending with `M  END`, without `$$$$`).
+pub fn write_mol_v2000_block(mol: &MolGraph) -> String {
+    let mut out = String::new();
+    let coords = ensure_export_2d_coords(mol);
+    let bond_recs = sdf_bond_records(mol, &coords);
+    let extra_hs = aromatic_nh_hydrogens(mol, &coords);
+    let name = mol.name.as_deref().unwrap_or("ChemCraft");
+    let _ = writeln!(out, "{name}");
+    // CTAB spec: dimension code ("2D"/"3D") occupies columns 21-22 (0-indexed 20..22)
+    let _ = writeln!(out, "  ChemCraft 111926  2D");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000",
+        mol.atoms.len() + extra_hs.len(),
+        bond_recs.len() + extra_hs.len()
+    );
+    for (idx, a) in mol.atoms.iter().enumerate() {
+        let [x, y] = coords[idx];
+        let _ = writeln!(
+            out,
+            "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
+            x, y, 0.0, a.symbol
+        );
+    }
+    for &(_, [hx, hy]) in &extra_hs {
+        let _ = writeln!(
+            out,
+            "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
+            hx, hy, 0.0, "H"
+        );
+    }
+    for (bu, bv, order, stereo) in bond_recs {
+        let t = match order {
+            BondOrder::Single => 1,
+            BondOrder::Double => 2,
+            BondOrder::Triple => 3,
+            BondOrder::Aromatic => 4,
+            BondOrder::Dative => 9,
+        };
+        let s = match stereo {
+            BondStereo::Up => 1,
+            BondStereo::Down => 6,
+            BondStereo::Wavy => 4,
+            _ => 0,
+        };
+        let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", bu + 1, bv + 1, t, s);
+    }
+    for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
+        let h_id = mol.atoms.len() + h_i + 1;
+        let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", parent + 1, h_id, 1, 0);
+    }
+    let charged: Vec<(usize, i8)> = mol
+        .atoms
+        .iter()
+        .filter(|a| a.formal_charge != 0)
+        .map(|a| (a.id + 1, a.formal_charge))
+        .collect();
+    for chunk in charged.chunks(8) {
+        let _ = write!(out, "M  CHG{:>3}", chunk.len());
+        for (aid, chg) in chunk {
+            let _ = write!(out, "{aid:>4}{chg:>4}");
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out, "M  END");
+    out
+}
+
 /// Write a list of `MolGraph` structures as an SDF V2000 multi-record file.
 pub fn write_sdf_v2000(mols: &[&MolGraph]) -> String {
     let mut out = String::new();
     for mol in mols {
-        let coords = ensure_export_2d_coords(mol);
-        let bond_recs = sdf_bond_records(mol, &coords);
-        let extra_hs = aromatic_nh_hydrogens(mol, &coords);
-        let name = mol.name.as_deref().unwrap_or("ChemCraft");
-        let _ = writeln!(out, "{name}");
-        let _ = writeln!(out, "  ChemCraft-V2000");
-        let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000",
-            mol.atoms.len() + extra_hs.len(),
-            bond_recs.len() + extra_hs.len()
-        );
-        for (idx, a) in mol.atoms.iter().enumerate() {
-            let [x, y] = coords[idx];
-            let _ = writeln!(
-                out,
-                "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
-                x, y, 0.0, a.symbol
-            );
-        }
-        for &(_, [hx, hy]) in &extra_hs {
-            let _ = writeln!(
-                out,
-                "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
-                hx, hy, 0.0, "H"
-            );
-        }
-        for (bu, bv, order, stereo) in bond_recs {
-            let t = match order {
-                BondOrder::Single => 1,
-                BondOrder::Double => 2,
-                BondOrder::Triple => 3,
-                BondOrder::Aromatic => 4,
-                BondOrder::Dative => 9,
-            };
-            let s = match stereo {
-                BondStereo::Up => 1,
-                BondStereo::Down => 6,
-                BondStereo::Wavy => 4,
-                _ => 0,
-            };
-            let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", bu + 1, bv + 1, t, s);
-        }
-        for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
-            let h_id = mol.atoms.len() + h_i + 1;
-            let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", parent + 1, h_id, 1, 0);
-        }
-        let charged: Vec<(usize, i8)> = mol
-            .atoms
-            .iter()
-            .filter(|a| a.formal_charge != 0)
-            .map(|a| (a.id + 1, a.formal_charge))
-            .collect();
-        for chunk in charged.chunks(8) {
-            let _ = write!(out, "M  CHG{:>3}", chunk.len());
-            for (aid, chg) in chunk {
-                let _ = write!(out, "{aid:>4}{chg:>4}");
-            }
-            let _ = writeln!(out);
-        }
-        let _ = writeln!(out, "M  END");
+        out.push_str(&write_mol_v2000_block(mol));
         for (k, v) in &mol.properties {
             let _ = writeln!(out, "> <{k}>\n{v}\n");
         }

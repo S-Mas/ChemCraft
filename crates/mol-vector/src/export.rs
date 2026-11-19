@@ -74,6 +74,7 @@ pub fn export_sar_grid_svg(
         font_size: 11.5,
         dark_mode,
         show_stereo_labels: true,
+        ..SceneStyle::default()
     };
 
     for (idx, (title, mol)) in items.iter().enumerate() {
@@ -290,6 +291,7 @@ pub fn export_sar_grid_eps(
         font_size: 11.0,
         dark_mode,
         show_stereo_labels: true,
+        ..SceneStyle::default()
     };
 
     for (idx, (title, mol)) in items.iter().enumerate() {
@@ -509,6 +511,7 @@ pub fn export_sar_grid_pdf_bytes(
         font_size: 11.0,
         dark_mode: false,
         show_stereo_labels: true,
+        ..SceneStyle::default()
     };
 
     let mut stream = String::new();
@@ -849,6 +852,7 @@ pub fn export_sar_grid_png_bytes(
         font_size: 11.0,
         dark_mode,
         show_stereo_labels: true,
+        ..SceneStyle::default()
     };
 
     let border_col = Rgba(210, 215, 222, 255);

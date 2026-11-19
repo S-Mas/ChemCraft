@@ -314,9 +314,16 @@ fn generate_3d_vec(mol: &MolGraph) -> Vec<[f64; 3]> {
         }
     }
 
-    relax_3d_coords(mol, &mut pts, 95);
+    // For compact achiral bridged polycyclic cages (Adamantane, Cubane, etc.), push vertices
+    // radially outward from the cage centroid so no bridgehead traps inside-out.
+    inflate_bridged_cages(mol, &mut pts);
+
+    let unpinned = vec![false; n];
+    relax_3d_coords_pinned(mol, &mut pts, &unpinned, 120);
     enforce_chiral_signs(mol, &mut pts);
-    relax_3d_coords(mol, &mut pts, 25);
+    relax_3d_coords_pinned(mol, &mut pts, &unpinned, 90);
+    enforce_chiral_signs(mol, &mut pts);
+    relax_3d_coords_pinned(mol, &mut pts, &unpinned, 45);
 
     // Center centroid at origin
     let mut cx = 0.0;
@@ -738,7 +745,259 @@ fn expand_bfs_3d(mol: &MolGraph, comp: &[usize], pos: &mut [Option<[f64; 3]>]) {
     }
 }
 
-fn relax_3d_coords(mol: &MolGraph, pts: &mut [[f64; 3]], iters: usize) {
+fn inflate_bridged_cages(mol: &MolGraph, pts: &mut [[f64; 3]]) {
+    let n = mol.atoms.len();
+    if mol.rings.len() < 3 || n < 6 {
+        return;
+    }
+    // Group ring atoms into connected ring systems via ring bonds
+    let mut visited = vec![false; n];
+    for start in 0..n {
+        if visited[start] || !mol.atoms[start].in_ring {
+            continue;
+        }
+        let mut comp = Vec::new();
+        let mut q = VecDeque::new();
+        visited[start] = true;
+        q.push_back(start);
+        while let Some(u) = q.pop_front() {
+            comp.push(u);
+            for &(v, bid) in &mol.adj[u] {
+                if mol.bonds[bid].in_ring && !visited[v] {
+                    visited[v] = true;
+                    q.push_back(v);
+                }
+            }
+        }
+        let k = comp.len();
+        if !(6..=24).contains(&k) {
+            continue;
+        }
+        let mut in_comp = vec![false; n];
+        for &a in &comp {
+            in_comp[a] = true;
+        }
+        // Count internal ring edges and degree>=3 bridgeheads inside this ring system
+        let mut internal_edges = 0usize;
+        let mut bridgeheads = 0usize;
+        let mut sp3_count = 0usize;
+        let mut any_chiral = false;
+        for &a in &comp {
+            let deg_in = mol.adj[a].iter().filter(|&&(v, _)| in_comp[v]).count();
+            internal_edges += deg_in;
+            if deg_in >= 3 {
+                bridgeheads += 1;
+            }
+            if !mol.atoms[a].aromatic && !atom_is_sp2(mol, a) {
+                sp3_count += 1;
+            }
+            if matches!(
+                mol.atoms[a].chiral,
+                ChiralTag::Clockwise | ChiralTag::CounterClockwise
+            ) {
+                any_chiral = true;
+            }
+        }
+        internal_edges /= 2;
+        let cyclomatic = internal_edges + 1 - k;
+        // Require a genuine 3D sp3 polycyclic cage (e.g. Adamantane cyclomatic=3, Cubane cyclomatic=5)
+        if cyclomatic < 3 || bridgeheads < 2 || sp3_count * 10 < k * 7 || any_chiral {
+            continue;
+        }
+
+        // All-pairs shortest-path matrix inside `comp`
+        let mut idx_map = vec![usize::MAX; n];
+        for (i, &a) in comp.iter().enumerate() {
+            idx_map[a] = i;
+        }
+        let mut d2 = vec![vec![0.0_f64; k]; k];
+        // Estimate average ring size to scale d=2 nicely (4-ring cubane vs 6-ring adamantane)
+        let avg_ring_len = {
+            let matching: Vec<usize> = mol
+                .rings
+                .iter()
+                .filter(|r| r.iter().all(|&a| in_comp[a]))
+                .map(Vec::len)
+                .collect();
+            if matching.is_empty() {
+                6.0
+            } else {
+                matching.iter().sum::<usize>() as f64 / matching.len() as f64
+            }
+        };
+        let d2_step = if avg_ring_len < 4.8 { 2.38 } else { 2.95 };
+        for i in 0..k {
+            let mut dist = vec![usize::MAX; k];
+            dist[i] = 0;
+            let mut bfs = VecDeque::new();
+            bfs.push_back(i);
+            while let Some(u) = bfs.pop_front() {
+                for &(v_glob, _) in &mol.adj[comp[u]] {
+                    let v = idx_map[v_glob];
+                    if v < k && dist[v] == usize::MAX {
+                        dist[v] = dist[u] + 1;
+                        bfs.push_back(v);
+                    }
+                }
+            }
+            for j in 0..k {
+                let sp = dist[j];
+                d2[i][j] = match sp {
+                    0 => 0.0,
+                    1 => 1.54 * 1.54,
+                    _ => d2_step * (sp as f64),
+                };
+            }
+        }
+
+        // Classical MDS double-centering: B = -0.5 * (D^2 - row_mean - col_mean + grand_mean)
+        let mut row_mean = vec![0.0_f64; k];
+        let mut grand = 0.0_f64;
+        for i in 0..k {
+            let s: f64 = d2[i].iter().sum();
+            row_mean[i] = s / (k as f64);
+            grand += s;
+        }
+        grand /= (k * k) as f64;
+        let mut b = vec![vec![0.0_f64; k]; k];
+        for i in 0..k {
+            for j in 0..k {
+                b[i][j] = -0.5 * (d2[i][j] - row_mean[i] - row_mean[j] + grand);
+            }
+        }
+
+        // Exact symmetric Jacobi eigendecomposition (handles 3-fold degenerate Oh/Td cages cleanly)
+        let mut v_mat = vec![vec![0.0_f64; k]; k];
+        for (i, row) in v_mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        for _sweep in 0..24 {
+            let mut max_off = 0.0_f64;
+            for p in 0..k {
+                for q_idx in (p + 1)..k {
+                    let apq = b[p][q_idx];
+                    if apq.abs() > max_off {
+                        max_off = apq.abs();
+                    }
+                    if apq.abs() < 1e-12 {
+                        continue;
+                    }
+                    let app = b[p][p];
+                    let aqq = b[q_idx][q_idx];
+                    let tau = (aqq - app) / (2.0 * apq);
+                    let t = if tau >= 0.0 {
+                        1.0 / (tau + (1.0 + tau * tau).sqrt())
+                    } else {
+                        -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+                    };
+                    let c = 1.0 / (1.0 + t * t).sqrt();
+                    let s = t * c;
+                    b[p][p] = app - t * apq;
+                    b[q_idx][q_idx] = aqq + t * apq;
+                    b[p][q_idx] = 0.0;
+                    b[q_idx][p] = 0.0;
+                    for r in 0..k {
+                        if r != p && r != q_idx {
+                            let arp = b[r][p];
+                            let arq = b[r][q_idx];
+                            b[r][p] = c * arp - s * arq;
+                            b[p][r] = b[r][p];
+                            b[r][q_idx] = s * arp + c * arq;
+                            b[q_idx][r] = b[r][q_idx];
+                        }
+                        let vrp = v_mat[r][p];
+                        let vrq = v_mat[r][q_idx];
+                        v_mat[r][p] = c * vrp - s * vrq;
+                        v_mat[r][q_idx] = s * vrp + c * vrq;
+                    }
+                }
+            }
+            if max_off < 1e-10 {
+                break;
+            }
+        }
+
+        let mut eig_order: Vec<usize> = (0..k).collect();
+        eig_order.sort_by(|&a, &c| b[c][c].total_cmp(&b[a][a]));
+        let e0 = eig_order[0];
+        let e1 = eig_order[1];
+        let e2 = eig_order[2];
+        let s0 = b[e0][e0].max(0.0).sqrt();
+        let s1 = b[e1][e1].max(0.0).sqrt();
+        let s2 = b[e2][e2].max(0.0).sqrt();
+        if s0 < 1e-3 || s1 < 1e-3 || s2 < 1e-3 {
+            continue;
+        }
+
+        // Preserve original centroid
+        let mut cent = [0.0; 3];
+        for &a in &comp {
+            cent = add3(cent, pts[a]);
+        }
+        cent = scale3(cent, 1.0 / k as f64);
+
+        for (i, &a) in comp.iter().enumerate() {
+            pts[a] = add3(
+                cent,
+                [s0 * v_mat[i][e0], s1 * v_mat[i][e1], s2 * v_mat[i][e2]],
+            );
+        }
+
+        // Push any directly attached exocyclic substituents radially outward from the cage
+        for &a in &comp {
+            let out_dir = unit3(sub3(pts[a], cent), [1.0, 0.0, 0.0]);
+            for &(exo, bid) in &mol.adj[a] {
+                if in_comp[exo] {
+                    continue;
+                }
+                let bl = ideal_bond_length(mol, a, exo, mol.bonds[bid].order);
+                let new_exo = add3(pts[a], scale3(out_dir, bl));
+                let delta = sub3(new_exo, pts[exo]);
+                // Shift the connected substituent branch outside `comp`
+                let mut sub_vis = vec![false; n];
+                sub_vis[a] = true;
+                sub_vis[exo] = true;
+                let mut sq = VecDeque::new();
+                sq.push_back(exo);
+                while let Some(u) = sq.pop_front() {
+                    pts[u] = add3(pts[u], delta);
+                    for &(w, _) in &mol.adj[u] {
+                        if !sub_vis[w] && !in_comp[w] {
+                            sub_vis[w] = true;
+                            sq.push_back(w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum ChiralRestraint {
+    /// 3 heavy ligands `(i1, i2, i3)` around `ci`, with target sign `+1.0` or `-1.0` on `det(u1, u2, u3)`.
+    ThreeHeavy {
+        ci: usize,
+        i1: usize,
+        i2: usize,
+        i3: usize,
+        want_sign: f64,
+    },
+    /// 4 heavy ligands `(i0, i1, i2, i3)`, with target sign `+1.0` or `-1.0` on `det(p1-p0, p2-p0, p3-p0)`.
+    FourHeavy {
+        i0: usize,
+        i1: usize,
+        i2: usize,
+        i3: usize,
+        want_sign: f64,
+    },
+}
+
+pub(crate) fn relax_3d_coords_pinned(
+    mol: &MolGraph,
+    pts: &mut [[f64; 3]],
+    pinned: &[bool],
+    iters: usize,
+) {
     let n = mol.atoms.len();
     if n < 2 {
         return;
@@ -776,6 +1035,76 @@ fn relax_3d_coords(mol: &MolGraph, pts: &mut [[f64; 3]], iters: usize) {
         }
     }
 
+    // Collect tetrahedral chiral volume restraints directly from OpenSMILES `chiral_seq`
+    let mut chiral_restraints = Vec::new();
+    for (ci, atom) in mol.atoms.iter().enumerate() {
+        if !matches!(
+            atom.chiral,
+            ChiralTag::Clockwise | ChiralTag::CounterClockwise
+        ) || atom.chiral_seq.len() != 4
+        {
+            continue;
+        }
+        let base_sign = if atom.chiral == ChiralTag::Clockwise {
+            1.0
+        } else {
+            -1.0
+        };
+        let h_pos = atom.chiral_seq.iter().position(|&x| x == usize::MAX);
+        match h_pos {
+            Some(hp) => {
+                let heavy: Vec<usize> = atom
+                    .chiral_seq
+                    .iter()
+                    .copied()
+                    .filter(|&x| x != usize::MAX && x < n)
+                    .collect();
+                if heavy.len() == 3 {
+                    let parity = if hp.is_multiple_of(2) { 1.0 } else { -1.0 };
+                    chiral_restraints.push(ChiralRestraint::ThreeHeavy {
+                        ci,
+                        i1: heavy[0],
+                        i2: heavy[1],
+                        i3: heavy[2],
+                        want_sign: base_sign * parity,
+                    });
+                }
+            }
+            None => {
+                let s = &atom.chiral_seq;
+                if s.iter().all(|&x| x < n) {
+                    chiral_restraints.push(ChiralRestraint::FourHeavy {
+                        i0: s[0],
+                        i1: s[1],
+                        i2: s[2],
+                        i3: s[3],
+                        want_sign: base_sign,
+                    });
+                }
+            }
+        }
+    }
+
+    // Collect acyclic E/Z double-bond 1-4 restraints `(a, u, v, b, target_14)`
+    let mut ez_restraints = Vec::new();
+    for b in &mol.bonds {
+        if b.order == BondOrder::Double
+            && !b.in_ring
+            && matches!(b.cis_trans, BondCisTrans::E | BondCisTrans::Z)
+            && let (Some(a_hi), Some(b_hi)) = (
+                highest_cip_end_nbr(mol, b.u, b.v),
+                highest_cip_end_nbr(mol, b.v, b.u),
+            )
+        {
+            let target_14 = if b.cis_trans == BondCisTrans::Z {
+                2.82
+            } else {
+                3.82
+            };
+            ez_restraints.push((a_hi, b.u, b.v, b_hi, target_14));
+        }
+    }
+
     let mut disp = vec![[0.0_f64; 3]; n];
     for _ in 0..iters {
         disp.fill([0.0, 0.0, 0.0]);
@@ -797,7 +1126,7 @@ fn relax_3d_coords(mol: &MolGraph, pts: &mut [[f64; 3]], iters: usize) {
             let d = sub3(pts[b], pts[a]);
             let len = norm3(d);
             if len > 1e-6 {
-                let f = 0.15 * (len - target) / len;
+                let f = 0.16 * (len - target) / len;
                 let df = scale3(d, f);
                 disp[a] = add3(disp[a], df);
                 disp[b] = sub3(disp[b], df);
@@ -816,8 +1145,82 @@ fn relax_3d_coords(mol: &MolGraph, pts: &mut [[f64; 3]], iters: usize) {
             }
         }
 
-        // 4. Nonbonded VdW soft repulsion (avoid self-clashes)
-        if n <= 350 {
+        // 4. Tetrahedral signed chiral-volume restoring force (works on acyclic & ring bridgeheads!)
+        for cr in &chiral_restraints {
+            match *cr {
+                ChiralRestraint::ThreeHeavy {
+                    ci,
+                    i1,
+                    i2,
+                    i3,
+                    want_sign,
+                } => {
+                    let u1 = sub3(pts[i1], pts[ci]);
+                    let u2 = sub3(pts[i2], pts[ci]);
+                    let u3 = sub3(pts[i3], pts[ci]);
+                    let vol = dot3(cross3(u1, u2), u3);
+                    let target_v = 1.95;
+                    if want_sign * vol < target_v {
+                        let k = (0.18 * (target_v - want_sign * vol)).min(0.48) * want_sign;
+                        let g1 = cross3(u2, u3);
+                        let g2 = cross3(u3, u1);
+                        let g3 = cross3(u1, u2);
+                        let gc = scale3(add3(add3(g1, g2), g3), -1.0);
+                        disp[i1] = add3(disp[i1], scale3(g1, k));
+                        disp[i2] = add3(disp[i2], scale3(g2, k));
+                        disp[i3] = add3(disp[i3], scale3(g3, k));
+                        disp[ci] = add3(disp[ci], scale3(gc, k));
+                    }
+                }
+                ChiralRestraint::FourHeavy {
+                    i0,
+                    i1,
+                    i2,
+                    i3,
+                    want_sign,
+                } => {
+                    let u1 = sub3(pts[i1], pts[i0]);
+                    let u2 = sub3(pts[i2], pts[i0]);
+                    let u3 = sub3(pts[i3], pts[i0]);
+                    let vol = dot3(cross3(u1, u2), u3);
+                    let target_v = 5.2;
+                    if want_sign * vol < target_v {
+                        let k = (0.045 * (target_v - want_sign * vol)).min(0.35) * want_sign;
+                        let g1 = cross3(u2, u3);
+                        let g2 = cross3(u3, u1);
+                        let g3 = cross3(u1, u2);
+                        let g0 = scale3(add3(add3(g1, g2), g3), -1.0);
+                        disp[i1] = add3(disp[i1], scale3(g1, k));
+                        disp[i2] = add3(disp[i2], scale3(g2, k));
+                        disp[i3] = add3(disp[i3], scale3(g3, k));
+                        disp[i0] = add3(disp[i0], scale3(g0, k));
+                    }
+                }
+            }
+        }
+
+        // 5. Acyclic E/Z double-bond cis/trans 1-4 spring & coplanarity
+        for &(a, u, v, b, target_14) in &ez_restraints {
+            let d = sub3(pts[b], pts[a]);
+            let len = norm3(d);
+            if len > 1e-5 {
+                let f = 0.22 * (len - target_14) / len;
+                let df = scale3(d, f);
+                disp[a] = add3(disp[a], df);
+                disp[b] = sub3(disp[b], df);
+            }
+            // Pull `b` onto plane of `(a, u, v)`
+            let pn = cross3(sub3(pts[u], pts[a]), sub3(pts[v], pts[u]));
+            let pnl = norm3(pn);
+            if pnl > 1e-4 {
+                let un = scale3(pn, 1.0 / pnl);
+                let h = dot3(sub3(pts[b], pts[v]), un);
+                disp[b] = add3(disp[b], scale3(un, -0.22 * h));
+            }
+        }
+
+        // 6. Nonbonded VdW soft repulsion (avoid self-clashes)
+        if n <= 400 {
             for i in 0..n {
                 for j in (i + 1)..n {
                     if is_12_13[i][j] {
@@ -828,7 +1231,7 @@ fn relax_3d_coords(mol: &MolGraph, pts: &mut [[f64; 3]], iters: usize) {
                     let r_min = 2.45;
                     if d2 > 1e-6 && d2 < r_min * r_min {
                         let dist = d2.sqrt();
-                        let push = 0.20 * (r_min - dist) / dist;
+                        let push = 0.22 * (r_min - dist) / dist;
                         let df = scale3(d, push);
                         disp[i] = sub3(disp[i], df);
                         disp[j] = add3(disp[j], df);
@@ -838,6 +1241,9 @@ fn relax_3d_coords(mol: &MolGraph, pts: &mut [[f64; 3]], iters: usize) {
         }
 
         for i in 0..n {
+            if pinned.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let mag = norm3(disp[i]);
             let step = if mag > 0.28 {
                 scale3(disp[i], 0.28 / mag)
@@ -863,7 +1269,6 @@ fn enforce_chiral_signs(mol: &MolGraph, pts: &mut [[f64; 3]]) {
         if atom.chiral_seq.len() != 4 {
             continue;
         }
-        // Only handle leaf substituents we can swap cleanly without distorting ring connectivity
         let real_nbrs: Vec<usize> = atom
             .chiral_seq
             .iter()
@@ -891,12 +1296,11 @@ fn enforce_chiral_signs(mol: &MolGraph, pts: &mut [[f64; 3]]) {
         let v2 = p_vec(atom.chiral_seq[2]);
         let v3 = p_vec(atom.chiral_seq[3]);
         // Signed volume viewing from v0 down to center: ((v1-v0) x (v2-v0)) . (v3-v0)
-        // OpenSMILES `@@` = Clockwise looking down v0->center => negative det(v1-v0, v2-v0, v3-v0)
+        // Right-hand rule: looking from v0 toward center (along -v0), clockwise (v1->v2->v3) gives POSITIVE det!
         let det = dot3(cross3(sub3(v1, v0), sub3(v2, v0)), sub3(v3, v0));
         let want_cw = atom.chiral == ChiralTag::Clockwise;
-        let current_cw = det < 0.0;
+        let current_cw = det > 0.0;
         if current_cw != want_cw {
-            // Find two leaf neighbors (degree == 1) attached to `ci` and swap/reflect across symmetry plane
             let leaves: Vec<usize> = real_nbrs
                 .iter()
                 .copied()
@@ -922,6 +1326,34 @@ fn enforce_chiral_signs(mol: &MolGraph, pts: &mut [[f64; 3]]) {
                     let dl = sub3(pts[leaf], pc);
                     let proj = dot3(dl, n);
                     pts[leaf] = add3(pc, sub3(dl, scale3(n, 2.0 * proj)));
+                }
+            } else if real_nbrs.len() == 3 {
+                // Ring stereocenter with implicit H: invert central atom `ci` across plane of its 3 heavy neighbors!
+                let p0 = pts[real_nbrs[0]];
+                let p1 = pts[real_nbrs[1]];
+                let p2 = pts[real_nbrs[2]];
+                let n = unit3(cross3(sub3(p1, p0), sub3(p2, p0)), [0.0, 0.0, 1.0]);
+                let h = dot3(sub3(pc, p0), n);
+                let shift = if h.abs() < 0.25 {
+                    if h >= 0.0 { -0.75 } else { 0.75 }
+                } else {
+                    -2.2 * h
+                };
+                pts[ci] = add3(pc, scale3(n, shift));
+            } else if real_nbrs.len() == 4 {
+                // Quaternary ring stereocenter: reflect first exocyclic substituent (if any) across other 3
+                if let Some(&exo) = real_nbrs.iter().find(|&&nb| !mol.atoms[nb].in_ring) {
+                    let others: Vec<usize> =
+                        real_nbrs.iter().copied().filter(|&x| x != exo).collect();
+                    if others.len() >= 2 {
+                        let n = unit3(
+                            cross3(sub3(pts[others[0]], pc), sub3(pts[others[1]], pc)),
+                            [0.0, 0.0, 1.0],
+                        );
+                        let dl = sub3(pts[exo], pc);
+                        let proj = dot3(dl, n);
+                        pts[exo] = add3(pc, sub3(dl, scale3(n, 2.0 * proj)));
+                    }
                 }
             }
         }
@@ -1000,20 +1432,145 @@ pub fn write_pdb(mol: &MolGraph) -> String {
     out
 }
 
-/// Write `MolGraph` list as a 3D SDF V2000 block (preserving/generating 3D `[x, y, z]` coordinates).
+/// Compute explicit 3D hydrogens for aromatic `[nH]` atoms (pyrrole, indole, uracil, sildenafil,
+/// tetrazole) so external 3D consumers (DockCraft, ChimeraX, RDKit) preserve exact donor valences.
+fn aromatic_nh_hydrogens_3d(mol: &MolGraph, coords: &[[f64; 3]]) -> Vec<(usize, [f64; 3])> {
+    let mut out = Vec::new();
+    for (u, a) in mol.atoms.iter().enumerate() {
+        if a.symbol == "N" && a.aromatic && a.formal_charge == 0 && a.total_h() == 1 {
+            let pu = coords[u];
+            let mut sum = [0.0, 0.0, 0.0];
+            for &(nb, _) in &mol.adj[u] {
+                sum = add3(sum, unit3(sub3(coords[nb], pu), [1.0, 0.0, 0.0]));
+            }
+            let dir = unit3(scale3(sum, -1.0), [0.0, 1.0, 0.0]);
+            out.push((u, add3(pu, scale3(dir, 1.01))));
+        }
+    }
+    out
+}
+
+fn write_sdf_v3000_3d_record(
+    out: &mut String,
+    mol: &MolGraph,
+    coords: &[[f64; 3]],
+    extra_hs: &[(usize, [f64; 3])],
+) {
+    let name = mol.name.as_deref().unwrap_or("ChemCraft-3D");
+    let _ = writeln!(out, "{name}");
+    // CTAB spec: dimension code ("2D"/"3D") occupies columns 21-22 (0-indexed 20..22)
+    let _ = writeln!(out, "  ChemCraft 111926  3D");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  0  0  0     0  0            999 V3000");
+    let _ = writeln!(out, "M  V30 BEGIN CTAB");
+    let _ = writeln!(
+        out,
+        "M  V30 COUNTS {} {} 0 0 0",
+        mol.atoms.len() + extra_hs.len(),
+        mol.bonds.len() + extra_hs.len()
+    );
+    let _ = writeln!(out, "M  V30 BEGIN ATOM");
+    for (idx, a) in mol.atoms.iter().enumerate() {
+        let [x, y, z] = coords[idx];
+        if a.formal_charge != 0 {
+            let _ = writeln!(
+                out,
+                "M  V30 {} {} {:.4} {:.4} {:.4} 0 CHG={}",
+                a.id + 1,
+                a.symbol,
+                x,
+                y,
+                z,
+                a.formal_charge
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "M  V30 {} {} {:.4} {:.4} {:.4} 0",
+                a.id + 1,
+                a.symbol,
+                x,
+                y,
+                z
+            );
+        }
+    }
+    for (h_i, &(_, [hx, hy, hz])) in extra_hs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "M  V30 {} H {:.4} {:.4} {:.4} 0",
+            mol.atoms.len() + h_i + 1,
+            hx,
+            hy,
+            hz
+        );
+    }
+    let _ = writeln!(out, "M  V30 END ATOM");
+    let _ = writeln!(out, "M  V30 BEGIN BOND");
+    for (idx, b) in mol.bonds.iter().enumerate() {
+        let t = match b.order {
+            BondOrder::Single => 1,
+            BondOrder::Double => 2,
+            BondOrder::Triple => 3,
+            BondOrder::Aromatic => 4,
+            BondOrder::Dative => 9,
+        };
+        let cfg = match b.stereo {
+            BondStereo::Up => " CFG=1",
+            BondStereo::Down => " CFG=3",
+            BondStereo::Wavy => " CFG=2",
+            _ => "",
+        };
+        let _ = writeln!(
+            out,
+            "M  V30 {} {} {} {}{}",
+            idx + 1,
+            t,
+            b.u + 1,
+            b.v + 1,
+            cfg
+        );
+    }
+    for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "M  V30 {} 1 {} {}",
+            mol.bonds.len() + h_i + 1,
+            parent + 1,
+            mol.atoms.len() + h_i + 1
+        );
+    }
+    let _ = writeln!(out, "M  V30 END BOND");
+    let _ = writeln!(out, "M  V30 END CTAB");
+    let _ = writeln!(out, "M  END");
+    for (k, v) in &mol.properties {
+        let _ = writeln!(out, "> <{k}>\n{v}\n");
+    }
+    let _ = writeln!(out, "$$$$");
+}
+
+/// Write `MolGraph` list as a 3D SDF block (preserving/generating 3D `[x, y, z]` coordinates,
+/// explicit aromatic `[nH]` hydrogens, and automatically switching to CTAB V3000 when >999 atoms/bonds).
 pub fn write_sdf_v2000_3d(mols: &[&MolGraph]) -> String {
     let mut out = String::new();
     for mol in mols {
         let coords = compute_3d_coords(mol);
+        let extra_hs = aromatic_nh_hydrogens_3d(mol, &coords);
+        let total_atoms = mol.atoms.len() + extra_hs.len();
+        let total_bonds = mol.bonds.len() + extra_hs.len();
+        if total_atoms > 999 || total_bonds > 999 {
+            write_sdf_v3000_3d_record(&mut out, mol, &coords, &extra_hs);
+            continue;
+        }
         let name = mol.name.as_deref().unwrap_or("ChemCraft-3D");
         let _ = writeln!(out, "{name}");
-        let _ = writeln!(out, "  ChemCraft-3D        3D");
+        // CTAB spec: dimension code ("2D"/"3D") occupies columns 21-22 (0-indexed 20..22)
+        let _ = writeln!(out, "  ChemCraft 111926  3D");
         let _ = writeln!(out);
         let _ = writeln!(
             out,
             "{:>3}{:>3}  0  0  0  0  0  0  0  0999 V2000",
-            mol.atoms.len(),
-            mol.bonds.len()
+            total_atoms, total_bonds
         );
         for (idx, a) in mol.atoms.iter().enumerate() {
             let [x, y, z] = coords[idx];
@@ -1021,6 +1578,13 @@ pub fn write_sdf_v2000_3d(mols: &[&MolGraph]) -> String {
                 out,
                 "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
                 x, y, z, a.symbol
+            );
+        }
+        for &(_, [hx, hy, hz]) in &extra_hs {
+            let _ = writeln!(
+                out,
+                "{:>10.4}{:>10.4}{:>10.4} {:<3} 0  0  0  0  0  0  0  0  0  0  0  0",
+                hx, hy, hz, "H"
             );
         }
         for b in &mol.bonds {
@@ -1038,6 +1602,10 @@ pub fn write_sdf_v2000_3d(mols: &[&MolGraph]) -> String {
                 _ => 0,
             };
             let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", b.u + 1, b.v + 1, t, s);
+        }
+        for (h_i, &(parent, _)) in extra_hs.iter().enumerate() {
+            let h_id = mol.atoms.len() + h_i + 1;
+            let _ = writeln!(out, "{:>3}{:>3}{:>3}{:>3}  0  0  0", parent + 1, h_id, 1, 0);
         }
         let charged: Vec<(usize, i8)> = mol
             .atoms

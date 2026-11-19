@@ -309,12 +309,41 @@ const KEY_SCORING: &str = "DockCraft_scoring";
 ///
 /// `pose_dir` is the directory the sidecar lives in; pose paths are relative to it and are stored
 /// resolved so the row points at a file that exists.
+fn neutralize_smiles_for_join(smiles: &str) -> Option<String> {
+    let mut mol = mol_graph::parse_smiles(smiles).ok()?;
+    let mut changed = false;
+    for i in 0..mol.atoms.len() {
+        let a = &mol.atoms[i];
+        let should_neutralize = (a.formal_charge == -1 && a.symbol == "O" && mol.adj[i].len() == 1)
+            || (a.formal_charge == -1 && a.symbol == "N" && a.aromatic)
+            || (a.formal_charge == 1
+                && a.symbol == "N"
+                && !a.aromatic
+                && mol.adj[i].len() <= 3
+                && mol.adj[i]
+                    .iter()
+                    .all(|&(_, bid)| mol.bonds[bid].order == mol_graph::BondOrder::Single));
+        if should_neutralize {
+            mol.atoms[i].formal_charge = 0;
+            mol.atoms[i].from_bracket = false;
+            mol.atoms[i].explicit_h = 0;
+            changed = true;
+        }
+    }
+    if changed {
+        mol.perceive().ok()?;
+    }
+    Some(mol.canonical_smiles())
+}
+
 pub fn merge_dockcraft_results(
     table: &mut SarTable,
     results: &DockCraftResults,
     pose_dir: &Path,
 ) -> MergeOutcome {
     let mut outcome = MergeOutcome::default();
+    let mut neutral_table_cache: Option<Vec<Option<String>>> = None;
+
     for row in &results.rows {
         let idx = if row.canonical_smiles.is_empty() {
             // No structure to go on: the row id is all there is, so take it and hope the caller
@@ -324,13 +353,31 @@ pub fn merge_dockcraft_results(
                 .iter()
                 .position(|r| row.source_row_id.is_some_and(|id| r.id == id))
         } else {
-            let same_structure: Vec<usize> = table
+            let mut same_structure: Vec<usize> = table
                 .rows
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| r.canonical_smiles == row.canonical_smiles)
                 .map(|(i, _)| i)
                 .collect();
+            // Fallback when pH 7.4 ionization changed protonation state between SAR and DockCraft
+            if same_structure.is_empty()
+                && let Some(row_neutral) = neutralize_smiles_for_join(&row.canonical_smiles)
+            {
+                let cache = neutral_table_cache.get_or_insert_with(|| {
+                    table
+                        .rows
+                        .iter()
+                        .map(|r| neutralize_smiles_for_join(&r.canonical_smiles))
+                        .collect()
+                });
+                same_structure = cache
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| n.as_deref() == Some(row_neutral.as_str()))
+                    .map(|(i, _)| i)
+                    .collect();
+            }
             match same_structure.len() {
                 0 => None,
                 1 => same_structure.first().copied(),

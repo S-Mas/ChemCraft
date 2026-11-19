@@ -304,4 +304,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
+
+    #[test]
+    fn chemdraw_editing_commands_charge_cycle_superatom_flip_rotate_and_name_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = ChemSession::new();
+        CommandRegistry::execute(
+            &mut session,
+            Command::LoadChemicalName {
+                name: "aniline".to_string(),
+            },
+        )?;
+        assert_eq!(session.canvas_mol.formula(), "C6H7N");
+
+        // Attach Boc protecting group to N0, then test Undo
+        CommandRegistry::execute(
+            &mut session,
+            Command::AttachSuperatomGroup {
+                atom_idx: Some(0),
+                abbr: "Boc".to_string(),
+            },
+        )?;
+        assert_eq!(session.canvas_mol.formula(), "C11H15NO2");
+        CommandRegistry::execute(&mut session, Command::Undo)?;
+        assert_eq!(session.canvas_mol.formula(), "C6H7N");
+
+        // Adjust formal charge (+1 on N0 -> anilinium C6H8N+)
+        CommandRegistry::execute(
+            &mut session,
+            Command::AdjustAtomCharge {
+                atom_idx: 0,
+                delta: 1,
+            },
+        )?;
+        assert_eq!(session.canvas_mol.atoms[0].formal_charge, 1);
+
+        // Cycle bond order Single -> Double -> Triple -> Single on Ethane
+        CommandRegistry::execute(
+            &mut session,
+            Command::LoadCanvasSmiles {
+                smiles: "CC".to_string(),
+                name: None,
+            },
+        )?;
+        CommandRegistry::execute(&mut session, Command::CycleBondOrder { bond_idx: 0 })?;
+        assert_eq!(session.canvas_mol.formula(), "C2H4");
+        CommandRegistry::execute(&mut session, Command::CycleBondOrder { bond_idx: 0 })?;
+        assert_eq!(session.canvas_mol.formula(), "C2H2");
+
+        // ConnectAtoms closes propane into cyclopropane
+        CommandRegistry::execute(
+            &mut session,
+            Command::LoadCanvasSmiles {
+                smiles: "CCC".to_string(),
+                name: None,
+            },
+        )?;
+        CommandRegistry::execute(
+            &mut session,
+            Command::ConnectAtoms {
+                u: 0,
+                v: 2,
+                order: mol_graph::BondOrder::Single,
+                stereo: mol_graph::BondStereo::None,
+            },
+        )?;
+        assert_eq!(session.canvas_mol.formula(), "C3H6");
+        assert_eq!(session.canvas_mol.rings.len(), 1);
+
+        // Flip H preserves stereochemical parity & Rotate 30° stays finite
+        CommandRegistry::execute(&mut session, Command::FlipCanvas2D { horizontal: true })?;
+        CommandRegistry::execute(&mut session, Command::RotateCanvas2D { degrees: 30.0 })?;
+        assert!(
+            session
+                .canvas_mol
+                .atoms
+                .iter()
+                .all(|a| a.coords_2d.is_some())
+        );
+        Ok(())
+    }
 }

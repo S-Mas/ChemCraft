@@ -21,6 +21,9 @@ pub enum MolError {
     #[error("invalid CSV input: {0}")]
     InvalidCsv(String),
 
+    #[error("invalid chemical format: {0}")]
+    InvalidFormat(String),
+
     #[error("molecule exceeds atom safety limit ({count} > {limit})")]
     TooManyAtoms { count: usize, limit: usize },
 

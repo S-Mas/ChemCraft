@@ -1,6 +1,9 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crc32fast::Hasher;
 use flate2::Compression;
@@ -42,8 +45,9 @@ pub fn save_chemcraft_atomic(path: &Path, doc: &ChemCraftDocument) -> Result<(),
     if !parent.exists() {
         std::fs::create_dir_all(parent)?;
     }
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{}.{seq}",
         path.file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("project"),
@@ -56,22 +60,24 @@ pub fn save_chemcraft_atomic(path: &Path, doc: &ChemCraftDocument) -> Result<(),
             use std::os::unix::fs::OpenOptionsExt;
             OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&tmp_path)?
         };
         #[cfg(not(unix))]
         let mut f = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&tmp_path)?;
         f.write_all(&bytes)?;
         f.flush()?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

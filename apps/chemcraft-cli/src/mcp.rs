@@ -5,14 +5,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat, compute_admet_delta};
+use mol_admet_bridge::{
+    AdmetCraftProvider, AdmetProvider, AdmetReportFormat, compute_admet_delta, predict_nmr,
+};
 use mol_engine::{
     BuiltinLibraryPreset, LibraryFilterConfig, PathSandbox, ScreeningFunnel,
     filter_and_prepare_library, load_builtin_library, stream_load_library_from_file,
 };
 use mol_graph::{
-    MolGraph, SecondaryStructure, SmartsQuery, build_peptide, generate_3d_coords, mutate_molecule,
-    parse_smiles, write_pdb, write_sdf_v2000, write_sdf_v2000_3d,
+    MolGraph, SecondaryStructure, SmartsQuery, analyze_molecule, attach_superatom_group,
+    build_peptide, compute_stoichiometry, generate_3d_coords, mutate_molecule, parse_cdxml,
+    parse_reaction_smiles, parse_smiles, resolve_chemical_name, write_cdxml, write_pdb,
+    write_rxn_v2000, write_sdf_v2000, write_sdf_v2000_3d,
 };
 use mol_sar::{MorganFp, SarFilter, SarTable};
 use mol_vector::{
@@ -325,6 +329,17 @@ fn write_json_line<W: Write, T: Serialize>(
     Ok(())
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..max_len {
+        let ba = a.get(i).copied().unwrap_or(0);
+        let bb = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(ba ^ bb);
+    }
+    diff == 0
+}
+
 fn handle_request(
     id: Value,
     method: &str,
@@ -335,7 +350,7 @@ fn handle_request(
     if method == "initialize" {
         if let Some(ref req_tok) = auth.required_token {
             let provided = params.get("token").and_then(Value::as_str).unwrap_or("");
-            if provided != req_tok {
+            if !constant_time_eq(provided.as_bytes(), req_tok.as_bytes()) {
                 return JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
@@ -612,6 +627,72 @@ fn mcp_tool_catalog() -> Value {
                     "output_sdf": { "type": "string" }
                 }
             }
+        },
+        {
+            "name": "analyze_molecule",
+            "description": "ChemDraw Analysis Window: exact monoisotopic mass, average MW, charge-annotated Hill formula, elemental analysis (%C/%H/...), DBE, and ESI+/ESI- m/z adducts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "smiles": { "type": "string" } },
+                "required": ["smiles"]
+            }
+        },
+        {
+            "name": "predict_nmr",
+            "description": "Predict 1H and 13C NMR chemical shifts (ppm), multiplicities, and integrations for a SMILES structure.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "smiles": { "type": "string" } },
+                "required": ["smiles"]
+            }
+        },
+        {
+            "name": "name_to_structure",
+            "description": "Convert a common drug/solvent/reagent name or systematic IUPAC name into canonical SMILES and exact mass.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "cdxml_io",
+            "description": "Export SMILES to ChemDraw `.cdxml` inside --write-root, or parse an input `.cdxml` file inside --read-root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "output_cdxml": { "type": "string" },
+                    "input_cdxml": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "rxn_stoichiometry",
+            "description": "Parse Reaction SMILES, compute atom economy & theoretical/isolated yield, and optionally export MDL `.rxn` V2000 inside --write-root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reaction_smiles": { "type": "string" },
+                    "mmol": { "type": "number" },
+                    "actual_mg": { "type": "number" },
+                    "output_rxn": { "type": "string" }
+                },
+                "required": ["reaction_smiles"]
+            }
+        },
+        {
+            "name": "attach_superatom",
+            "description": "Attach a ChemDraw superatom/protecting group (Boc, Fmoc, Cbz, Ph, Bn, CF3, CO2Me, SO2Me, ...) onto a SMILES.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "smiles": { "type": "string" },
+                    "group": { "type": "string" },
+                    "atom_index": { "type": "integer" }
+                },
+                "required": ["smiles", "group"]
+            }
         }
     ])
 }
@@ -627,6 +708,12 @@ fn dispatch_tool(name: &str, args: &Value, sandbox: &PathSandbox) -> Result<Valu
         "export_3d" => tool_export_3d(args, sandbox),
         "export_chimerax" => tool_export_chimerax(args, sandbox),
         "screen_library" => tool_screen_library(args, sandbox),
+        "analyze_molecule" => tool_analyze_molecule(args),
+        "predict_nmr" => tool_predict_nmr(args),
+        "name_to_structure" => tool_name_to_structure(args),
+        "cdxml_io" => tool_cdxml_io(args, sandbox),
+        "rxn_stoichiometry" => tool_rxn_stoichiometry(args, sandbox),
+        "attach_superatom" => tool_attach_superatom(args),
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -1333,6 +1420,171 @@ fn tool_screen_library(args: &Value, sandbox: &PathSandbox) -> Result<Value, Str
             "elapsed_ms": res.elapsed_ms,
             "output_sdf": sdf_written,
             "hits": hit_summaries,
+        }),
+    ))
+}
+
+fn tool_analyze_molecule(args: &Value) -> Result<Value, String> {
+    let smiles = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'smiles'".to_string())?;
+    let mol = parse_smiles(smiles).map_err(|e| e.to_string())?;
+    let analysis = analyze_molecule(&mol);
+    Ok(tool_ok(
+        format!(
+            "{} | Exact Mass {:.4} | MW {:.2} | DBE {:.1} | EA: {}",
+            analysis.formula_with_charge,
+            analysis.exact_mass,
+            analysis.molecular_weight,
+            analysis.dbe,
+            analysis.elemental_analysis_string
+        ),
+        serde_json::to_value(&analysis).map_err(|e| e.to_string())?,
+    ))
+}
+
+fn tool_predict_nmr(args: &Value) -> Result<Value, String> {
+    let smiles = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'smiles'".to_string())?;
+    let mol = parse_smiles(smiles).map_err(|e| e.to_string())?;
+    let spec = predict_nmr(&mol);
+    Ok(tool_ok(
+        format!(
+            "Predicted {} 1H NMR groups & {} 13C NMR groups",
+            spec.h1_peaks.len(),
+            spec.c13_peaks.len()
+        ),
+        serde_json::to_value(&spec).map_err(|e| e.to_string())?,
+    ))
+}
+
+fn tool_name_to_structure(args: &Value) -> Result<Value, String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'name'".to_string())?;
+    let mol = resolve_chemical_name(name).map_err(|e| e.to_string())?;
+    let analysis = analyze_molecule(&mol);
+    let smi = mol.canonical_smiles();
+    Ok(tool_ok(
+        format!(
+            "Resolved '{name}' -> {smi} ({})",
+            analysis.formula_with_charge
+        ),
+        json!({
+            "name": name,
+            "canonical_smiles": smi,
+            "analysis": analysis,
+        }),
+    ))
+}
+
+fn tool_cdxml_io(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    if let Some(smi) = args.get("smiles").and_then(Value::as_str) {
+        let mut mol = parse_smiles(smi).map_err(|e| e.to_string())?;
+        generate_2d_coords(&mut mol);
+        let xml = write_cdxml(&mol);
+        let mut written = None;
+        if let Some(out_rel) = args.get("output_cdxml").and_then(Value::as_str) {
+            let (resolved, mut f) = match sandbox.open_write(Path::new(out_rel)) {
+                Ok(p) => p,
+                Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+            };
+            f.write_all(xml.as_bytes()).map_err(|e| e.to_string())?;
+            written = Some(resolved.display().to_string());
+        }
+        return Ok(tool_ok(
+            format!("Generated CDXML ({} bytes)", xml.len()),
+            json!({
+                "output_cdxml": written,
+                "bytes": xml.len(),
+            }),
+        ));
+    }
+    if let Some(in_rel) = args.get("input_cdxml").and_then(Value::as_str) {
+        let xml = match sandbox.read_to_string_limited(Path::new(in_rel), MAX_MCP_INPUT_FILE_BYTES)
+        {
+            Ok((_, s)) => s,
+            Err(e) => return Ok(tool_err(format!("read sandbox error: {e}"))),
+        };
+        let mol = parse_cdxml(&xml).map_err(|e| e.to_string())?;
+        let analysis = analyze_molecule(&mol);
+        let smi = mol.canonical_smiles();
+        return Ok(tool_ok(
+            format!("Parsed CDXML -> {smi} ({})", analysis.formula_with_charge),
+            json!({
+                "canonical_smiles": smi,
+                "analysis": analysis,
+                "warnings": mol.warnings,
+            }),
+        ));
+    }
+    Ok(tool_err(
+        "provide either 'smiles' (export) or 'input_cdxml' (import)".to_string(),
+    ))
+}
+
+fn tool_rxn_stoichiometry(args: &Value, sandbox: &PathSandbox) -> Result<Value, String> {
+    let rsmiles = args
+        .get("reaction_smiles")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'reaction_smiles'".to_string())?;
+    let mmol = args.get("mmol").and_then(Value::as_f64).unwrap_or(1.0);
+    let actual_mg = args.get("actual_mg").and_then(Value::as_f64);
+    let rxn = parse_reaction_smiles(rsmiles).map_err(|e| e.to_string())?;
+    let stoich = compute_stoichiometry(&rxn, mmol, actual_mg);
+    let mut written = None;
+    if let Some(out_rel) = args.get("output_rxn").and_then(Value::as_str) {
+        let rxn_text = write_rxn_v2000(&rxn);
+        let (resolved, mut f) = match sandbox.open_write(Path::new(out_rel)) {
+            Ok(p) => p,
+            Err(e) => return Ok(tool_err(format!("write sandbox error: {e}"))),
+        };
+        f.write_all(rxn_text.as_bytes())
+            .map_err(|e| e.to_string())?;
+        written = Some(resolved.display().to_string());
+    }
+    Ok(tool_ok(
+        format!(
+            "Reaction atom economy {:.1}%, theoretical yield {:.2} mg",
+            stoich.atom_economy_pct, stoich.theoretical_yield_mg
+        ),
+        json!({
+            "reaction_smiles": rxn.reaction_smiles(),
+            "output_rxn": written,
+            "stoichiometry": stoich,
+        }),
+    ))
+}
+
+fn tool_attach_superatom(args: &Value) -> Result<Value, String> {
+    let smiles = args
+        .get("smiles")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'smiles'".to_string())?;
+    let group = args
+        .get("group")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing 'group'".to_string())?;
+    let atom_idx = args
+        .get("atom_index")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
+    let mol = parse_smiles(smiles).map_err(|e| e.to_string())?;
+    let updated = attach_superatom_group(&mol, atom_idx, group).map_err(|e| e.to_string())?;
+    let analysis = analyze_molecule(&updated);
+    let smi = updated.canonical_smiles();
+    Ok(tool_ok(
+        format!(
+            "Attached {group} -> {smi} ({})",
+            analysis.formula_with_charge
+        ),
+        json!({
+            "canonical_smiles": smi,
+            "analysis": analysis,
         }),
     ))
 }

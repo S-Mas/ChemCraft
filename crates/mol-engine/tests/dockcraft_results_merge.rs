@@ -277,3 +277,34 @@ fn the_row_id_breaks_ties_between_duplicate_structures() -> Result<(), Box<dyn s
     );
     Ok(())
 }
+
+#[test]
+fn ph74_ionized_sidecar_matches_neutral_sar_row() -> Result<(), Box<dyn std::error::Error>> {
+    let mut table = SarTable::new();
+    let mut ibu = parse_smiles("CC(C)Cc1ccc(C(C)C(=O)O)cc1")?;
+    ibu.name = Some("Ibuprofen".to_string());
+    table.add_molecule(ibu, Some(5.40), Some("NSAID".to_string()));
+
+    // DockCraft returns the pH 7.4 deprotonated carboxylate canonical SMILES
+    let ionized_ibu = parse_smiles("CC(C)Cc1ccc(C(C)C(=O)[O-])cc1")?.canonical_smiles();
+    assert_ne!(ionized_ibu, table.rows[0].canonical_smiles);
+
+    let rows = format!(
+        r#"{{"canonical_smiles":"{ionized_ibu}","source_row_id":null,"name":"Ibuprofen_pH74",
+             "rank":1,"affinity_kcal":-7.42,"hyde_delta_g_kcal":-6.80,"estimated_ki_nm":3.6,
+             "ligand_efficiency":0.49,"mpo_score":0.82,"measured_pic50":5.40,"pose_sdf":"ibu_pose.sdf"}}"#
+    );
+    let results: DockCraftResults = serde_json::from_str(&sidecar_json(&rows))?;
+    let outcome = merge_dockcraft_results(&mut table, &results, Path::new("/tmp/dock"));
+
+    assert_eq!(outcome.merged, 1);
+    assert!(outcome.unmatched.is_empty());
+    assert_eq!(
+        table.rows[0]
+            .properties
+            .get("DockCraft_affinity_kcal")
+            .map(String::as_str),
+        Some("-7.420")
+    );
+    Ok(())
+}

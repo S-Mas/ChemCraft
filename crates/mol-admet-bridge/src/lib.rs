@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod descriptors;
+pub mod nmr;
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -19,6 +20,7 @@ pub use descriptors::{
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use mol_graph::parse_smiles;
+pub use nmr::{NmrPeak, NmrSpectrum, predict_nmr};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -513,6 +515,38 @@ mod tests {
         )?;
         assert!(delta.delta_tpsa > 15.0);
         assert!(after.physicochemical.tpsa > 70.0);
+
+        // Verify exact Ertl (2000) TPSA parity on Caffeine (61.82) & Nitrobenzene (43.14)
+        let caf = provider.evaluate_smiles("Cn1cnc2c1c(=O)n(C)c(=O)n2C", Some("Caffeine"))?;
+        assert!(
+            (caf.physicochemical.tpsa - 61.82).abs() < 0.05,
+            "caffeine tpsa={}",
+            caf.physicochemical.tpsa
+        );
+        let nitro = provider.evaluate_smiles("O=[N+]([O-])c1ccccc1", Some("Nitrobenzene"))?;
+        assert!(
+            (nitro.physicochemical.tpsa - 43.14).abs() < 0.05,
+            "nitro tpsa={}",
+            nitro.physicochemical.tpsa
+        );
+
+        // Verify 1H & 13C NMR prediction on Ethanol & Aspirin
+        let eth = parse_smiles("CCO").map_err(|e| BridgeError::Calc(e.to_string()))?;
+        let eth_nmr = predict_nmr(&eth);
+        assert_eq!(eth_nmr.c13_peaks.len(), 2);
+        assert_eq!(eth_nmr.h1_peaks.len(), 3);
+        assert!(
+            eth_nmr
+                .h1_peaks
+                .iter()
+                .any(|p| p.multiplicity == "q" && p.integration == 2)
+        );
+        assert!(
+            eth_nmr
+                .h1_peaks
+                .iter()
+                .any(|p| p.multiplicity == "t" && p.integration == 3)
+        );
         Ok(())
     }
 }

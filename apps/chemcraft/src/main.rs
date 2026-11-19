@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod chem_panels;
 mod library_ui;
 mod viewer3d;
 mod widgets;
 
 use std::path::PathBuf;
 
+use chem_panels::{
+    InspectorTab, ReactionPanelState, pick_open_file_native, render_analysis_tab, render_nmr_tab,
+    render_reaction_tab,
+};
 use eframe::egui;
 use egui::{Color32, Pos2, RichText, Sense, Stroke, Vec2};
 use library_ui::{LibraryAction, LibraryWindowState, render_library_window};
@@ -18,12 +23,13 @@ use mol_engine::{
     launch_dockcraft_for_mols, save_chemcraft_atomic,
 };
 use mol_graph::{
-    BondOrder, BondStereo, SecondaryStructure, canonical_amino_acids, generate_3d_coords,
-    parse_csv_records, parse_dwar, parse_sdf, write_pdb, write_sdf_v2000_3d,
+    BondOrder, BondStereo, SUPERATOM_GROUPS, SecondaryStructure, canonical_amino_acids,
+    generate_3d_coords, parse_csv_records, parse_dwar, parse_rxn_v2000, parse_sdf, write_cdxml,
+    write_pdb, write_sdf_v2000_3d,
 };
 use mol_vector::{
-    ReactionArrow, RingTemplate, SceneStyle, VectorScene, build_mol_scene, scene_to_eps,
-    scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
+    DepictionPreset, ReactionArrow, RingTemplate, STANDARD_BOND_LEN, SceneStyle, VectorScene,
+    build_mol_scene, scene_to_eps, scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
 use viewer3d::{Viewer3dState, render_3d_viewport};
 use widgets::{
@@ -43,6 +49,9 @@ enum DrawTool {
     BondOrder(BondOrder),
     BondStereo(BondStereo),
     Ring(RingTemplate),
+    ChargePlus,
+    ChargeMinus,
+    Superatom(&'static str),
     ReactionArrow,
     Eraser,
 }
@@ -59,6 +68,10 @@ struct ChemCraftApp {
     session: ChemSession,
     tool: DrawTool,
     view_mode: ViewMode,
+    depiction_preset: DepictionPreset,
+    show_terminal_methyls: bool,
+    inspector_tab: InspectorTab,
+    reaction_state: ReactionPanelState,
     viewer_3d: Viewer3dState,
     peptide_seq: String,
     peptide_ss: SecondaryStructure,
@@ -71,6 +84,7 @@ struct ChemCraftApp {
     admet_gui_available: bool,
     active_element: &'static str,
     smiles_bar: String,
+    name_bar: String,
     file_path_bar: String,
     export_dir: String,
     status_msg: String,
@@ -81,6 +95,7 @@ struct ChemCraftApp {
     palette_query: String,
     hover_atom: Option<usize>,
     drag_start_atom: Option<usize>,
+    bond_drag_from: Option<usize>,
     last_canvas_scene: Option<VectorScene>,
     arrow_start: Option<[f64; 2]>,
 }
@@ -108,6 +123,10 @@ impl ChemCraftApp {
             session,
             tool: DrawTool::BondOrder(BondOrder::Single),
             view_mode: ViewMode::Split2D3D,
+            depiction_preset: DepictionPreset::ModernColor,
+            show_terminal_methyls: false,
+            inspector_tab: InspectorTab::Admet,
+            reaction_state: ReactionPanelState::default(),
             viewer_3d: Viewer3dState::default(),
             peptide_seq: "Ac-Ala-Gly-Tyr-Ser-NH2".to_string(),
             peptide_ss: SecondaryStructure::AlphaHelix,
@@ -120,10 +139,11 @@ impl ChemCraftApp {
             admet_gui_available,
             active_element: "C",
             smiles_bar,
+            name_bar: String::new(),
             file_path_bar: String::new(),
             export_dir,
             status_msg:
-                "Ready — 2D Vector + 3D Conformer + Peptide Builder + ChimeraX + AdmetCraft"
+                "Ready — ChemDraw-Grade 2D/3D + CDXML/RXN + NMR/MS + Peptides + AdmetCraft + DockCraft"
                     .to_string(),
             dark_mode: false,
             sar_tab: SarTab::Table,
@@ -132,8 +152,36 @@ impl ChemCraftApp {
             palette_query: String::new(),
             hover_atom: None,
             drag_start_atom: None,
+            bond_drag_from: None,
             last_canvas_scene: None,
             arrow_start: None,
+        }
+    }
+
+    fn export_cdxml_file(&mut self) {
+        if self.session.canvas_mol.atoms.is_empty() {
+            self.status_msg = "Canvas is empty".to_string();
+            return;
+        }
+        let root = PathBuf::from(&self.export_dir);
+        let sb = match PathSandbox::new(None, Some(&root)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_msg = format!("Export sandbox error: {e}");
+                return;
+            }
+        };
+        let xml = write_cdxml(&self.session.canvas_mol);
+        match sb.open_write(std::path::Path::new("chemcraft_structure.cdxml")) {
+            Ok((resolved, mut f)) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(xml.as_bytes()) {
+                    self.status_msg = format!("Write error: {e}");
+                } else {
+                    self.status_msg = format!("Exported ChemDraw CDXML -> {}", resolved.display());
+                }
+            }
+            Err(e) => self.status_msg = format!("Sandbox write error: {e}"),
         }
     }
 
@@ -171,14 +219,11 @@ impl ChemCraftApp {
                 return;
             }
         };
+        let mut style = SceneStyle::from_preset(self.depiction_preset, 640.0, 460.0, false);
+        style.show_terminal_methyls = self.show_terminal_methyls;
         let scene = build_mol_scene(
             &self.session.canvas_mol,
-            &SceneStyle {
-                width: 640.0,
-                height: 460.0,
-                dark_mode: false,
-                ..SceneStyle::default()
-            },
+            &style,
             &self.session.reaction_arrows,
         );
         let filename = format!("chemcraft_structure.{fmt}");
@@ -267,6 +312,15 @@ impl ChemCraftApp {
         if include_sar_library && !self.session.sar_table.rows.is_empty() {
             for r in &self.session.sar_table.rows {
                 let mut m = r.mol.clone();
+                m.properties
+                    .insert("CHEMCRAFT_ROW_ID".to_string(), r.id.to_string());
+                m.properties.insert(
+                    "CHEMCRAFT_PARENT_SMILES".to_string(),
+                    r.canonical_smiles.clone(),
+                );
+                if let Some(p) = r.pic50 {
+                    m.properties.insert("pIC50".to_string(), format!("{p:.3}"));
+                }
                 mol_graph::ensure_3d_coords(&mut m);
                 owned.push(m);
             }
@@ -531,15 +585,14 @@ impl ChemCraftApp {
             egui::StrokeKind::Inside,
         );
 
-        let style = SceneStyle {
-            width: f64::from(rect.width()),
-            height: f64::from(rect.height()),
-            padding: 30.0,
-            stroke_width: 2.0,
-            font_size: 14.0,
-            dark_mode: self.dark_mode,
-            show_stereo_labels: true,
-        };
+        let mut style = SceneStyle::from_preset(
+            self.depiction_preset,
+            f64::from(rect.width()),
+            f64::from(rect.height()),
+            self.dark_mode,
+        );
+        style.padding = 30.0;
+        style.show_terminal_methyls = self.show_terminal_methyls;
         let mut scene = build_mol_scene(
             &self.session.canvas_mol,
             &style,
@@ -608,6 +661,9 @@ impl ChemCraftApp {
         if self.tool == DrawTool::SelectMove {
             if resp.drag_started() {
                 self.drag_start_atom = self.hover_atom;
+                if self.drag_start_atom.is_some() {
+                    self.session.push_undo_checkpoint();
+                }
             }
             if resp.dragged()
                 && let Some(aid) = self.drag_start_atom
@@ -623,6 +679,82 @@ impl ChemCraftApp {
             }
             if resp.drag_stopped() {
                 self.drag_start_atom = None;
+            }
+        } else if matches!(self.tool, DrawTool::BondOrder(_) | DrawTool::BondStereo(_)) {
+            // ChemDraw-style click-and-drag bond creation with 30° angle snapping & ring closure!
+            if resp.drag_started() {
+                self.bond_drag_from = self.hover_atom;
+            }
+            if let Some(from_id) = self.bond_drag_from
+                && let Some(start_sp) = scene.atom_screen_pos.get(from_id)
+                && let Some(ptr) = resp.interact_pointer_pos()
+            {
+                let start_pos = Pos2::new(
+                    rect.min.x + start_sp[0] as f32,
+                    rect.min.y + start_sp[1] as f32,
+                );
+                let target_atom = self.hover_atom.filter(|&a| a != from_id);
+                let preview_end = if let Some(tid) = target_atom
+                    && let Some(tsp) = scene.atom_screen_pos.get(tid)
+                {
+                    Pos2::new(rect.min.x + tsp[0] as f32, rect.min.y + tsp[1] as f32)
+                } else {
+                    let dx = f64::from(ptr.x - start_pos.x);
+                    let dy = f64::from(ptr.y - start_pos.y);
+                    let snap_step = std::f64::consts::PI / 6.0; // 30 degrees
+                    let ang = (dy.atan2(dx) / snap_step).round() * snap_step;
+                    let scr_len = (STANDARD_BOND_LEN * scene.world_scale).clamp(24.0, 62.0);
+                    Pos2::new(
+                        start_pos.x + (scr_len * ang.cos()) as f32,
+                        start_pos.y + (scr_len * ang.sin()) as f32,
+                    )
+                };
+                painter.line_segment(
+                    [start_pos, preview_end],
+                    Stroke::new(2.2_f32, Color32::from_rgb(34, 139, 230)),
+                );
+                painter.circle_filled(preview_end, 4.0, Color32::from_rgb(34, 139, 230));
+            }
+            if resp.drag_stopped()
+                && let Some(from_id) = self.bond_drag_from.take()
+                && let Some(ptr) = resp.interact_pointer_pos()
+            {
+                let (ord, st) = match self.tool {
+                    DrawTool::BondOrder(o) => (o, BondStereo::None),
+                    DrawTool::BondStereo(s) => (BondOrder::Single, s),
+                    _ => (BondOrder::Single, BondStereo::None),
+                };
+                if let Some(target_id) = self.hover_atom.filter(|&a| a != from_id) {
+                    self.run_cmd(Command::ConnectAtoms {
+                        u: from_id,
+                        v: target_id,
+                        order: ord,
+                        stereo: st,
+                    });
+                } else if let Some(start_sp) = scene.atom_screen_pos.get(from_id) {
+                    let start_pos = Pos2::new(
+                        rect.min.x + start_sp[0] as f32,
+                        rect.min.y + start_sp[1] as f32,
+                    );
+                    let dx = f64::from(ptr.x - start_pos.x);
+                    let dy = f64::from(ptr.y - start_pos.y);
+                    if dx.hypot(dy) > 10.0 {
+                        let snap_step = std::f64::consts::PI / 6.0;
+                        let ang = (dy.atan2(dx) / snap_step).round() * snap_step;
+                        let scr_len = (STANDARD_BOND_LEN * scene.world_scale).clamp(24.0, 62.0);
+                        let ex = start_sp[0] + scr_len * ang.cos();
+                        let ey = start_sp[1] + scr_len * ang.sin();
+                        let [wx, wy] = scene.screen_to_world(ex, ey);
+                        self.run_cmd(Command::AddAtomAndBond {
+                            from_atom: Some(from_id),
+                            symbol: self.active_element.to_string(),
+                            x: wx,
+                            y: wy,
+                            order: ord,
+                            stereo: st,
+                        });
+                    }
+                }
             }
         }
 
@@ -642,29 +774,35 @@ impl ChemCraftApp {
                     });
                 }
                 DrawTool::BondOrder(order) => {
-                    let new_pos = [wx, wy];
-                    self.run_cmd(Command::AddAtomAndBond {
-                        from_atom: self.hover_atom.or_else(|| {
-                            if self.session.canvas_mol.atoms.is_empty() {
-                                None
-                            } else {
-                                Some(self.session.canvas_mol.atoms.len() - 1)
-                            }
-                        }),
-                        symbol: self.active_element.to_string(),
-                        x: new_pos[0],
-                        y: new_pos[1],
-                        order,
-                        stereo: BondStereo::None,
-                    });
+                    // ChemDraw UX: clicking an existing bond cycles Single -> Double -> Triple!
+                    if self.hover_atom.is_none()
+                        && let Some(bid) = hover_bond
+                    {
+                        self.run_cmd(Command::CycleBondOrder { bond_idx: bid });
+                    } else {
+                        let new_pos = [wx, wy];
+                        self.run_cmd(Command::AddAtomAndBond {
+                            from_atom: self.hover_atom.or_else(|| {
+                                if self.session.canvas_mol.atoms.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.session.canvas_mol.atoms.len() - 1)
+                                }
+                            }),
+                            symbol: self.active_element.to_string(),
+                            x: new_pos[0],
+                            y: new_pos[1],
+                            order,
+                            stereo: BondStereo::None,
+                        });
+                    }
                 }
                 DrawTool::BondStereo(stereo) => {
-                    let mut mol = (*self.session.canvas_mol).clone();
                     if let Some(bid) = hover_bond {
-                        mol.bonds[bid].stereo = stereo;
-                        let _ = mol.perceive();
-                        self.session.canvas_mol = std::sync::Arc::new(mol);
-                        let _ = self.session.refresh_live_admet();
+                        self.run_cmd(Command::SetBondStereo {
+                            bond_idx: bid,
+                            stereo,
+                        });
                     } else if let Some(aid) = self.hover_atom {
                         self.run_cmd(Command::AddAtomAndBond {
                             from_atom: Some(aid),
@@ -676,18 +814,33 @@ impl ChemCraftApp {
                         });
                     }
                 }
-                DrawTool::Eraser => {
-                    let mut mol = (*self.session.canvas_mol).clone();
+                DrawTool::ChargePlus => {
                     if let Some(aid) = self.hover_atom {
-                        let _ = mol.remove_atom(aid);
-                        self.session.canvas_mol = std::sync::Arc::new(mol);
-                        let _ = self.session.refresh_live_admet();
-                        self.smiles_bar = self.session.canvas_mol.canonical_smiles();
+                        self.run_cmd(Command::AdjustAtomCharge {
+                            atom_idx: aid,
+                            delta: 1,
+                        });
+                    }
+                }
+                DrawTool::ChargeMinus => {
+                    if let Some(aid) = self.hover_atom {
+                        self.run_cmd(Command::AdjustAtomCharge {
+                            atom_idx: aid,
+                            delta: -1,
+                        });
+                    }
+                }
+                DrawTool::Superatom(abbr) => {
+                    self.run_cmd(Command::AttachSuperatomGroup {
+                        atom_idx: self.hover_atom,
+                        abbr: abbr.to_string(),
+                    });
+                }
+                DrawTool::Eraser => {
+                    if let Some(aid) = self.hover_atom {
+                        self.run_cmd(Command::EraseAtom { atom_idx: aid });
                     } else if let Some(bid) = hover_bond {
-                        let _ = mol.remove_bond(bid);
-                        self.session.canvas_mol = std::sync::Arc::new(mol);
-                        let _ = self.session.refresh_live_admet();
-                        self.smiles_bar = self.session.canvas_mol.canonical_smiles();
+                        self.run_cmd(Command::EraseBond { bond_idx: bid });
                     }
                 }
                 DrawTool::ReactionArrow => {
@@ -789,6 +942,25 @@ impl ChemCraftApp {
                 return;
             }
         };
+        if ext == "cdxml" {
+            self.run_cmd(Command::LoadCdxml { xml: text });
+            return;
+        }
+        if ext == "rxn" {
+            match parse_rxn_v2000(&text) {
+                Ok(rxn) => {
+                    self.reaction_state.rsmiles = rxn.reaction_smiles();
+                    self.inspector_tab = InspectorTab::Reaction;
+                    self.status_msg = format!(
+                        "Loaded MDL .rxn ({} reactants -> {} products)",
+                        rxn.reactants.len(),
+                        rxn.products.len()
+                    );
+                }
+                Err(e) => self.status_msg = format!("Parse .rxn error: {e}"),
+            }
+            return;
+        }
         let mut table = mol_sar::SarTable::new();
         let res = if ext == "dwar" {
             parse_dwar(&text).map(|recs| {
@@ -992,6 +1164,20 @@ impl eframe::App for ChemCraftApp {
                     self.session.sar_table.rows.len()
                 );
             }
+            LibraryAction::ImportLatestDockCraft => {
+                if self.session.sar_table.rows.is_empty()
+                    && let Some(ref res) = self.library_win.last_result
+                {
+                    let mut table = mol_sar::SarTable::new();
+                    for h in &res.hits {
+                        table.add_molecule(h.mol.clone(), None, Some(res.source_label.clone()));
+                    }
+                    self.session.sar_table = std::sync::Arc::new(table);
+                    self.session.recompute_sar_analytics();
+                }
+                self.sar_panel_open = true;
+                self.run_cmd(Command::ImportDockCraftResults { path: None });
+            }
             LibraryAction::Status(msg) => {
                 self.status_msg = msg;
             }
@@ -1005,6 +1191,31 @@ impl eframe::App for ChemCraftApp {
                 ui.separator();
                 if ui.button("Clean 2D").clicked() {
                     self.run_cmd(Command::CleanStructure2D);
+                }
+                if ui.button("Flip H").clicked() {
+                    self.run_cmd(Command::FlipCanvas2D { horizontal: true });
+                }
+                if ui.button("Flip V").clicked() {
+                    self.run_cmd(Command::FlipCanvas2D { horizontal: false });
+                }
+                if ui.button("Rot 30°").clicked() {
+                    self.run_cmd(Command::RotateCanvas2D { degrees: 30.0 });
+                }
+                let preset_lbl = match self.depiction_preset {
+                    DepictionPreset::ModernColor => "Style: Modern",
+                    DepictionPreset::Acs1996Bw => "Style: ACS 1996 B&W",
+                    DepictionPreset::Acs1996Color => "Style: ACS 1996 Color",
+                };
+                if ui
+                    .button(preset_lbl)
+                    .on_hover_text("Cycle ChemDraw ACS Document 1996 / Modern color styles")
+                    .clicked()
+                {
+                    self.depiction_preset = match self.depiction_preset {
+                        DepictionPreset::ModernColor => DepictionPreset::Acs1996Bw,
+                        DepictionPreset::Acs1996Bw => DepictionPreset::Acs1996Color,
+                        DepictionPreset::Acs1996Color => DepictionPreset::ModernColor,
+                    };
                 }
                 if ui.button("Peptide Builder").clicked() {
                     self.peptide_drawer_open = !self.peptide_drawer_open;
@@ -1033,6 +1244,13 @@ impl eframe::App for ChemCraftApp {
                 ui.separator();
                 if ui.button("Save .chemcraft").clicked() {
                     self.save_project();
+                }
+                if ui
+                    .button("CDXML")
+                    .on_hover_text("Export ChemDraw .cdxml (ACS 1996)")
+                    .clicked()
+                {
+                    self.export_cdxml_file();
                 }
                 if ui.button("SVG").clicked() {
                     self.export_canvas("svg");
@@ -1093,115 +1311,181 @@ impl eframe::App for ChemCraftApp {
             });
         });
 
-        // 2. Left Panel: Vector Drawing Tools & Ring Templates
+        // 2. Left Panel: Vector Drawing Tools, Superatoms & Ring Templates
         egui::SidePanel::left("tools_panel")
-            .default_width(185.0)
-            .show(ctx, |ui| {
-                ui.strong("Drawing Tools");
-                ui.separator();
-                let bond_tools = [
-                    ("Select / Move", DrawTool::SelectMove),
-                    ("Single (-)", DrawTool::BondOrder(BondOrder::Single)),
-                    ("Double (=)", DrawTool::BondOrder(BondOrder::Double)),
-                    ("Triple (#)", DrawTool::BondOrder(BondOrder::Triple)),
-                    ("Aromatic (:)", DrawTool::BondOrder(BondOrder::Aromatic)),
-                    ("Dative (->)", DrawTool::BondOrder(BondOrder::Dative)),
-                    ("Up Wedge", DrawTool::BondStereo(BondStereo::Up)),
-                    ("Down Hash", DrawTool::BondStereo(BondStereo::Down)),
-                    ("Wavy Stereo", DrawTool::BondStereo(BondStereo::Wavy)),
-                    ("Reaction Arrow", DrawTool::ReactionArrow),
-                    ("Eraser", DrawTool::Eraser),
-                ];
-                for (lbl, t) in bond_tools {
-                    if ui.selectable_label(self.tool == t, lbl).clicked() {
-                        self.tool = t;
-                    }
-                }
-
-                ui.add_space(6.0);
-                ui.strong("Ring Templates (Snap)");
-                ui.separator();
-                let rings = [
-                    RingTemplate::Benzene,
-                    RingTemplate::Cyclohexane,
-                    RingTemplate::Cyclopentane,
-                    RingTemplate::Pyridine,
-                    RingTemplate::Indole,
-                    RingTemplate::Naphthalene,
-                    RingTemplate::Tetrazole,
-                    RingTemplate::Cyclobutane,
-                    RingTemplate::Cyclopropane,
-                ];
-                for r in rings {
-                    if ui
-                        .selectable_label(self.tool == DrawTool::Ring(r), r.label())
-                        .clicked()
-                    {
-                        self.tool = DrawTool::Ring(r);
-                    }
-                }
-
-                ui.add_space(6.0);
-                ui.strong("Element Hotkeys");
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    for sym in ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I"] {
-                        if ui
-                            .selectable_label(self.active_element == sym, sym)
-                            .clicked()
-                        {
-                            self.active_element = sym;
-                        }
-                    }
-                });
-                ui.label(
-                    RichText::new("Hover atom + key changes element")
-                        .small()
-                        .weak(),
-                );
-
-                ui.add_space(6.0);
-                ui.strong("Quick Peptide (2D + 3D)");
-                ui.separator();
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.peptide_seq)
-                        .hint_text("Ala-Gly-Tyr-Ser / AGYS"),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Build Peptide").clicked() {
-                        let seq = self.peptide_seq.clone();
-                        let ss = self.peptide_ss;
-                        self.run_cmd(Command::BuildPeptide {
-                            sequence: seq,
-                            secondary_structure: ss,
-                        });
-                        self.viewer_3d.reset();
-                        if self.view_mode == ViewMode::View2D {
-                            self.view_mode = ViewMode::Split2D3D;
-                        }
-                    }
-                    if ui.button("20-AA Pad...").clicked() {
-                        self.peptide_drawer_open = true;
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.strong("Import (.sdf/.dwar/.csv/.chemcraft)");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.file_path_bar)
-                        .hint_text("/path/to/file.sdf"),
-                );
-                if ui.button("Import File").clicked() && !self.file_path_bar.trim().is_empty() {
-                    let p = self.file_path_bar.clone();
-                    self.import_file(&p);
-                }
-            });
-
-        // 3. Right Dockable Panel: Live ADMET Inspector (ChemCraft <-> AdmetCraft Bridge)
-        egui::SidePanel::right("admet_inspector")
-            .default_width(305.0)
+            .default_width(195.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.strong("Drawing Tools");
+                    ui.separator();
+                    let bond_tools = [
+                        ("Select / Move", DrawTool::SelectMove),
+                        (
+                            "Single (-) [Drag/Cycle]",
+                            DrawTool::BondOrder(BondOrder::Single),
+                        ),
+                        ("Double (=)", DrawTool::BondOrder(BondOrder::Double)),
+                        ("Triple (#)", DrawTool::BondOrder(BondOrder::Triple)),
+                        ("Aromatic (:)", DrawTool::BondOrder(BondOrder::Aromatic)),
+                        ("Dative (->)", DrawTool::BondOrder(BondOrder::Dative)),
+                        ("Up Wedge", DrawTool::BondStereo(BondStereo::Up)),
+                        ("Down Hash", DrawTool::BondStereo(BondStereo::Down)),
+                        ("Wavy Stereo", DrawTool::BondStereo(BondStereo::Wavy)),
+                        ("Formal Charge (+)", DrawTool::ChargePlus),
+                        ("Formal Charge (-)", DrawTool::ChargeMinus),
+                        ("Reaction Arrow", DrawTool::ReactionArrow),
+                        ("Eraser", DrawTool::Eraser),
+                    ];
+                    for (lbl, t) in bond_tools {
+                        if ui.selectable_label(self.tool == t, lbl).clicked() {
+                            self.tool = t;
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    ui.strong("Ring Templates (Snap)");
+                    ui.separator();
+                    let rings = [
+                        RingTemplate::Benzene,
+                        RingTemplate::Cyclohexane,
+                        RingTemplate::Cyclopentane,
+                        RingTemplate::Pyridine,
+                        RingTemplate::Indole,
+                        RingTemplate::Naphthalene,
+                        RingTemplate::Tetrazole,
+                        RingTemplate::Cyclobutane,
+                        RingTemplate::Cyclopropane,
+                    ];
+                    for r in rings {
+                        if ui
+                            .selectable_label(self.tool == DrawTool::Ring(r), r.label())
+                            .clicked()
+                        {
+                            self.tool = DrawTool::Ring(r);
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    ui.strong("Superatoms / Groups");
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        for grp in SUPERATOM_GROUPS.iter().take(24) {
+                            let active = self.tool == DrawTool::Superatom(grp.abbr);
+                            if ui
+                                .selectable_label(active, grp.abbr)
+                                .on_hover_text(format!("{} — click atom to attach", grp.label))
+                                .clicked()
+                            {
+                                self.tool = DrawTool::Superatom(grp.abbr);
+                            }
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.strong("Element Hotkeys");
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        for sym in ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I"] {
+                            if ui
+                                .selectable_label(self.active_element == sym, sym)
+                                .clicked()
+                            {
+                                self.active_element = sym;
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Hover atom + key changes element")
+                            .small()
+                            .weak(),
+                    );
+
+                    ui.add_space(6.0);
+                    ui.strong("Quick Peptide (2D + 3D)");
+                    ui.separator();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.peptide_seq)
+                            .hint_text("Ala-Gly-Tyr-Ser / AGYS"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Build Peptide").clicked() {
+                            let seq = self.peptide_seq.clone();
+                            let ss = self.peptide_ss;
+                            self.run_cmd(Command::BuildPeptide {
+                                sequence: seq,
+                                secondary_structure: ss,
+                            });
+                            self.viewer_3d.reset();
+                            if self.view_mode == ViewMode::View2D {
+                                self.view_mode = ViewMode::Split2D3D;
+                            }
+                        }
+                        if ui.button("20-AA Pad...").clicked() {
+                            self.peptide_drawer_open = true;
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.strong("Import (.cdxml/.rxn/.sdf/.dwar/.csv)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.file_path_bar)
+                            .hint_text("/path/to/file.cdxml"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Browse...").clicked()
+                            && let Some(picked) = pick_open_file_native()
+                        {
+                            self.file_path_bar = picked.clone();
+                            self.import_file(&picked);
+                        }
+                        if ui.button("Import").clicked() && !self.file_path_bar.trim().is_empty() {
+                            let p = self.file_path_bar.clone();
+                            self.import_file(&p);
+                        }
+                    });
+                });
+            });
+
+        // 3. Right Dockable Panel: Tabbed ChemDraw Inspector (ADMET | Analysis | NMR | Reaction)
+        egui::SidePanel::right("admet_inspector")
+            .default_width(315.0)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Admet, "ADMET");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Analysis,
+                        "Analysis",
+                    );
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Nmr, "1H/13C NMR");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Reaction,
+                        "Reaction",
+                    );
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    match self.inspector_tab {
+                        InspectorTab::Analysis => {
+                            render_analysis_tab(ui, &self.session.canvas_mol);
+                            return;
+                        }
+                        InspectorTab::Nmr => {
+                            render_nmr_tab(ui, &self.session.canvas_mol, self.dark_mode);
+                            return;
+                        }
+                        InspectorTab::Reaction => {
+                            render_reaction_tab(
+                                ui,
+                                &mut self.reaction_state,
+                                &self.session.canvas_mol,
+                                &self.export_dir,
+                            );
+                            return;
+                        }
+                        InspectorTab::Admet => {}
+                    }
                     ui.heading("Live ADMET Inspector");
                     ui.label(
                         RichText::new(
@@ -1325,12 +1609,12 @@ impl eframe::App for ChemCraftApp {
 
         // 4. Central Panel: Top 2D Drawing Canvas + Bottom SAR Explorer
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Top controls row for canvas
-            ui.horizontal(|ui| {
+            // Top controls row for canvas (SMILES + Name-to-Structure + Clipboard)
+            ui.horizontal_wrapped(|ui| {
                 ui.label("SMILES:");
                 let smi_edit = ui.add(
                     egui::TextEdit::singleline(&mut self.smiles_bar)
-                        .desired_width(340.0)
+                        .desired_width(245.0)
                         .font(egui::TextStyle::Monospace),
                 );
                 if (smi_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -1342,10 +1626,31 @@ impl eframe::App for ChemCraftApp {
                         name: None,
                     });
                 }
+                if ui.small_button("Copy").on_hover_text("Copy canonical SMILES").clicked() {
+                    ui.ctx().copy_text(self.session.canvas_mol.canonical_smiles());
+                    self.status_msg = "Copied canonical SMILES to clipboard".to_string();
+                }
+                ui.separator();
+                ui.label("Name:");
+                let name_edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.name_bar)
+                        .desired_width(155.0)
+                        .hint_text("aspirin, 4-chlorophenol..."),
+                );
+                if (name_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || ui.button("From Name").clicked()
+                {
+                    let nm = self.name_bar.clone();
+                    if !nm.trim().is_empty() {
+                        self.run_cmd(Command::LoadChemicalName { name: nm });
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut self.show_terminal_methyls, "Show CH3");
                 if ui.button("Add to SAR Table").clicked() {
                     self.run_cmd(Command::AddCanvasToSar { pic50: None });
                 }
-                if ui.button("Filter SAR by Fragment").clicked() {
+                if ui.button("Filter SAR").clicked() {
                     self.run_cmd(Command::FilterSarByCanvasSubstructure);
                 }
                 if ui.button("Clear Canvas").clicked() {
@@ -1744,5 +2049,30 @@ mod tests {
         assert!(app.session.can_undo());
         app.run_cmd(Command::Undo);
         assert!(app.session.can_redo());
+
+        // Topological 2D edits keep cached 3D coords populated and support Undo
+        let before_atoms = app.session.canvas_mol.atoms.len();
+        app.run_cmd(Command::AddAtomAndBond {
+            from_atom: Some(0),
+            symbol: "F".to_string(),
+            x: 2.0,
+            y: 1.0,
+            order: BondOrder::Single,
+            stereo: BondStereo::None,
+        });
+        assert_eq!(app.session.canvas_mol.atoms.len(), before_atoms + 1);
+        assert!(
+            app.session
+                .canvas_mol
+                .atoms
+                .iter()
+                .all(|a| a.coords_3d.is_some())
+        );
+        app.run_cmd(Command::EraseAtom {
+            atom_idx: before_atoms,
+        });
+        assert_eq!(app.session.canvas_mol.atoms.len(), before_atoms);
+        app.run_cmd(Command::Undo);
+        assert_eq!(app.session.canvas_mol.atoms.len(), before_atoms + 1);
     }
 }

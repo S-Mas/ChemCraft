@@ -5,7 +5,7 @@ mod mcp;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat};
+use mol_admet_bridge::{AdmetCraftProvider, AdmetProvider, AdmetReportFormat, predict_nmr};
 use mol_engine::{
     BuiltinLibraryPreset, DEFAULT_MAX_LIBRARY_RECORDS, LibraryFilterConfig, PathSandbox,
     ScreeningFunnel, decode_chemcraft_zip, default_chimerax_export_dir,
@@ -15,16 +15,18 @@ use mol_engine::{
     write_chimerax_bundle, write_dockcraft_bundle,
 };
 use mol_graph::{
-    MolGraph, SecondaryStructure, build_peptide, ensure_3d_coords, generate_3d_coords,
-    parse_smiles, write_pdb, write_sdf_v2000, write_sdf_v2000_3d,
+    MolGraph, SecondaryStructure, analyze_molecule, attach_superatom_group, build_peptide,
+    compute_stoichiometry, ensure_3d_coords, generate_3d_coords, parse_cdxml,
+    parse_reaction_smiles, parse_rxn_v2000, parse_smiles, resolve_chemical_name, write_cdxml,
+    write_pdb, write_rxn_v2000, write_sdf_v2000, write_sdf_v2000_3d,
 };
 use mol_sar::{
     SarFilter, SarTable, find_activity_cliffs, find_duplicate_compounds,
     find_matched_molecular_pairs,
 };
 use mol_vector::{
-    SceneStyle, build_mol_scene, generate_2d_coords, scene_to_eps, scene_to_pdf_bytes,
-    scene_to_png_bytes, scene_to_svg,
+    DepictionPreset, SceneStyle, build_mol_scene, generate_2d_coords, scene_to_eps,
+    scene_to_pdf_bytes, scene_to_png_bytes, scene_to_svg,
 };
 
 #[derive(Debug, Parser)]
@@ -78,7 +80,7 @@ enum Export3dFormat {
 
 #[derive(Debug, Subcommand)]
 enum SubCmd {
-    /// Render a SMILES string to vector SVG, EPS, PDF, or raster PNG.
+    /// Render a SMILES string to vector SVG, EPS, PDF, or raster PNG (with optional ACS Document 1996 preset).
     Render {
         smiles: String,
         #[arg(long)]
@@ -91,6 +93,10 @@ enum SubCmd {
         height: f64,
         #[arg(long)]
         dark: bool,
+        #[arg(long)]
+        acs1996: bool,
+        #[arg(long)]
+        monochrome: bool,
     },
     /// Filter a chemical library (.sdf, .dwar, .csv) by SMARTS substructure, Tanimoto, and Lipinski/PAINS.
     Filter {
@@ -219,6 +225,42 @@ enum SubCmd {
     },
     /// Inspect SMILES structure, key, coordinates, and AdmetCraft profile as JSON.
     Inspect { smiles: String },
+    /// ChemDraw Analysis Window: exact monoisotopic mass, average MW, elemental analysis (%C/%H/...), DBE, and ESI+/ESI- adducts.
+    Analyze { smiles: String },
+    /// Predict 1H and 13C NMR chemical shifts, multiplicities, and integrations as JSON.
+    Nmr { smiles: String },
+    /// Convert a common drug/solvent/reagent name or systematic IUPAC name into SMILES & analysis JSON.
+    Name { name: String },
+    /// Attach a ChemDraw superatom/protecting group (Boc, Fmoc, Cbz, Ph, Bn, CF3, CO2Me, SO2Me, ...) to a SMILES.
+    Group {
+        smiles: String,
+        #[arg(long)]
+        attach: String,
+        #[arg(long)]
+        atom: Option<usize>,
+    },
+    /// Export SMILES to ChemDraw `.cdxml` or import `.cdxml` to canonical SMILES & analysis JSON.
+    Cdxml {
+        #[arg(long)]
+        smiles: Option<String>,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Parse/export MDL `.rxn` V2000 reactions and calculate stoichiometry, atom economy, and yield.
+    Rxn {
+        #[arg(long)]
+        rsmiles: Option<String>,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = 1.0)]
+        mmol: f64,
+        #[arg(long)]
+        actual_mg: Option<f64>,
+    },
     /// Start the hardened MCP server (stdio or TCP with token + sandbox).
     Mcp {
         #[arg(long)]
@@ -262,15 +304,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             width,
             height,
             dark,
+            acs1996,
+            monochrome,
         } => {
             let mut mol = parse_smiles(&smiles)?;
             generate_2d_coords(&mut mol);
-            let style = SceneStyle {
-                width,
-                height,
-                dark_mode: dark,
-                ..SceneStyle::default()
+            let mut style = if acs1996 {
+                SceneStyle::from_preset(
+                    if monochrome {
+                        DepictionPreset::Acs1996Bw
+                    } else {
+                        DepictionPreset::Acs1996Color
+                    },
+                    width,
+                    height,
+                    dark,
+                )
+            } else {
+                SceneStyle {
+                    width,
+                    height,
+                    dark_mode: dark,
+                    monochrome,
+                    ..SceneStyle::default()
+                }
             };
+            style.monochrome = monochrome || (acs1996 && monochrome);
             let scene = build_mol_scene(&mol, &style, &[]);
             let bytes = match format {
                 RenderFormat::Svg => scene_to_svg(&scene).into_bytes(),
@@ -351,14 +410,127 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut mol = parse_smiles(&smiles)?;
             generate_2d_coords(&mut mol);
             let eval = AdmetCraftProvider::default().evaluate_smiles(&smiles, None)?;
+            let analysis = analyze_molecule(&mol);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "canonical_smiles": mol.canonical_smiles(),
                     "formula": mol.formula(),
+                    "formula_with_charge": analysis.formula_with_charge,
+                    "exact_mass": analysis.exact_mass,
                     "structural_key": mol.structural_key(),
                     "warnings": mol.warnings,
+                    "analysis": analysis,
                     "admet": eval,
+                }))?
+            );
+        }
+        SubCmd::Analyze { smiles } => {
+            let mol = parse_smiles(&smiles)?;
+            let analysis = analyze_molecule(&mol);
+            println!("{}", serde_json::to_string_pretty(&analysis)?);
+        }
+        SubCmd::Nmr { smiles } => {
+            let mol = parse_smiles(&smiles)?;
+            let spectrum = predict_nmr(&mol);
+            println!("{}", serde_json::to_string_pretty(&spectrum)?);
+        }
+        SubCmd::Name { name } => {
+            let mol = resolve_chemical_name(&name)?;
+            let analysis = analyze_molecule(&mol);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": mol.name,
+                    "canonical_smiles": mol.canonical_smiles(),
+                    "formula": analysis.formula_with_charge,
+                    "exact_mass": analysis.exact_mass,
+                    "molecular_weight": analysis.molecular_weight,
+                }))?
+            );
+        }
+        SubCmd::Group {
+            smiles,
+            attach,
+            atom,
+        } => {
+            let mol = parse_smiles(&smiles)?;
+            let updated = attach_superatom_group(&mol, atom, &attach)?;
+            let analysis = analyze_molecule(&updated);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "attached_group": attach,
+                    "canonical_smiles": updated.canonical_smiles(),
+                    "formula": analysis.formula_with_charge,
+                    "exact_mass": analysis.exact_mass,
+                    "molecular_weight": analysis.molecular_weight,
+                }))?
+            );
+        }
+        SubCmd::Cdxml { smiles, input, out } => {
+            if let Some(smi) = smiles {
+                let mut mol = parse_smiles(&smi)?;
+                generate_2d_coords(&mut mol);
+                let xml = write_cdxml(&mol);
+                if let Some(out_path) = out {
+                    std::fs::write(&out_path, xml.as_bytes())?;
+                    eprintln!("Exported CDXML -> {}", out_path.display());
+                } else {
+                    print!("{xml}");
+                }
+            } else if let Some(in_path) = input {
+                let xml = std::fs::read_to_string(&in_path)?;
+                let mol = parse_cdxml(&xml)?;
+                let analysis = analyze_molecule(&mol);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "canonical_smiles": mol.canonical_smiles(),
+                        "formula": analysis.formula_with_charge,
+                        "exact_mass": analysis.exact_mass,
+                        "atoms": mol.atoms.len(),
+                        "bonds": mol.bonds.len(),
+                        "warnings": mol.warnings,
+                    }))?
+                );
+            } else {
+                return Err(
+                    "provide --smiles (to export CDXML) or --input <file.cdxml> (to parse CDXML)"
+                        .into(),
+                );
+            }
+        }
+        SubCmd::Rxn {
+            rsmiles,
+            input,
+            out,
+            mmol,
+            actual_mg,
+        } => {
+            let rxn = if let Some(rs) = rsmiles {
+                parse_reaction_smiles(&rs)?
+            } else if let Some(in_path) = input {
+                let text = std::fs::read_to_string(&in_path)?;
+                parse_rxn_v2000(&text)?
+            } else {
+                return Err("provide --rsmiles or --input <file.rxn>".into());
+            };
+            if let Some(out_path) = out {
+                let rxn_text = write_rxn_v2000(&rxn);
+                std::fs::write(&out_path, rxn_text.as_bytes())?;
+                eprintln!("Exported RXN V2000 -> {}", out_path.display());
+            }
+            let stoich = compute_stoichiometry(&rxn, mmol, actual_mg);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": rxn.name,
+                    "reaction_smiles": rxn.reaction_smiles(),
+                    "reactants": rxn.reactants.len(),
+                    "agents": rxn.agents.len(),
+                    "products": rxn.products.len(),
+                    "stoichiometry": stoich,
                 }))?
             );
         }

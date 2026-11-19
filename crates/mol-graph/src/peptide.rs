@@ -4,7 +4,9 @@ use std::f64::consts::PI;
 
 use serde::{Deserialize, Serialize};
 
-use crate::coords3d::{covalent_radius, generate_3d_coords, place_nerf_atom};
+use crate::coords3d::{
+    covalent_radius, generate_3d_coords, place_nerf_atom, relax_3d_coords_pinned,
+};
 use crate::error::MolError;
 use crate::mol::{BondOrder, BondStereo, ChiralTag, MolAtom, MolGraph, PdbAtomMeta};
 
@@ -289,7 +291,7 @@ const AMINO_ACIDS: &[ResidueSpec] = &[
         close_to_backbone_n: None,
         // L-Ile CB is (3S): neighbors in seq: [CA(0), H(MAX), CG2(3), CG1(2)] -> CounterClockwise?
         // Using open-smiles orientation around CA(0): [0, MAX, 3, 2]
-        extra_chiral: Some((1, ChiralTag::CounterClockwise, [0, usize::MAX, 3, 2])),
+        extra_chiral: Some((1, ChiralTag::Clockwise, [0, usize::MAX, 3, 2])),
     },
     ResidueSpec {
         code1: 'P',
@@ -718,7 +720,7 @@ const AMINO_ACIDS: &[ResidueSpec] = &[
         ],
         ring_closures: &[],
         close_to_backbone_n: None,
-        extra_chiral: Some((1, ChiralTag::Clockwise, [0, usize::MAX, 2, 3])),
+        extra_chiral: Some((1, ChiralTag::CounterClockwise, [0, usize::MAX, 2, 3])),
     },
     ResidueSpec {
         code1: 'C',
@@ -1674,6 +1676,12 @@ pub fn build_peptide(sequence: &str, ss: SecondaryStructure) -> Result<MolGraph,
 
             let mut sa = MolAtom::new(0, sc_spec.symbol)?;
             sa.aromatic = sc_spec.aromatic;
+            if (spec.code3 == "TRP" && sc_spec.pdb_name == "NE1")
+                || (spec.code3 == "HIS" && sc_spec.pdb_name == "NE2")
+            {
+                sa.explicit_h = 1;
+                sa.from_bracket = true;
+            }
             sa.coords_2d = Some(pos_2d);
             sa.coords_3d = Some(pos_3d);
             sa.pdb_meta = Some(PdbAtomMeta {
@@ -1792,19 +1800,44 @@ pub fn build_peptide(sequence: &str, ss: SecondaryStructure) -> Result<MolGraph,
         mol.add_bond(last_c_id, tid, BondOrder::Single, BondStereo::None)?;
     }
 
-    // Center 2D and 3D centroids cleanly
-    center_2d_and_3d(&mut mol);
     // Run perception (SSSR, implicit H, CIP R/S) without clobbering 2D/3D coordinates!
     mol.perceive()?;
 
-    // Verify 3D finite sanity; fallback to conformer relaxation only if any coordinate failed
+    // Verify 3D finite sanity; otherwise relax sidechains with backbone pinned to eliminate steric clashes
     if mol
         .atoms
         .iter()
         .any(|a| a.coords_3d.is_none_or(|p| p.iter().any(|x| !x.is_finite())))
     {
         generate_3d_coords(&mut mol);
+    } else {
+        let mut pts: Vec<[f64; 3]> = mol
+            .atoms
+            .iter()
+            .map(|a| a.coords_3d.unwrap_or([0.0, 0.0, 0.0]))
+            .collect();
+        let pinned: Vec<bool> = mol
+            .atoms
+            .iter()
+            .map(|a| {
+                if let Some(meta) = &a.pdb_meta {
+                    matches!(
+                        meta.atom_name.as_str(),
+                        "N" | "CA" | "C" | "O" | "OXT" | "CH3"
+                    ) || matches!(meta.res_name.as_str(), "ACE" | "NH2")
+                } else {
+                    false
+                }
+            })
+            .collect();
+        relax_3d_coords_pinned(&mol, &mut pts, &pinned, 100);
+        for (a, p) in mol.atoms.iter_mut().zip(pts) {
+            a.coords_3d = Some(p);
+        }
     }
+
+    // Center 2D and 3D centroids cleanly
+    center_2d_and_3d(&mut mol);
 
     Ok(mol)
 }

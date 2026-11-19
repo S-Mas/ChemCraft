@@ -493,16 +493,44 @@ pub fn evaluate_mol_builtin(mol: &MolGraph, name_override: Option<&str>) -> Mole
     }
 }
 
+fn is_carbonyl_carbon(mol: &MolGraph, idx: usize) -> bool {
+    mol.atoms[idx].symbol == "C"
+        && mol.adj[idx].iter().any(|&(nb, bid)| {
+            mol.bonds[bid].order == BondOrder::Double
+                && matches!(mol.atoms[nb].symbol.as_str(), "O" | "S")
+        })
+}
+
 fn count_rotatable_bonds(mol: &MolGraph) -> usize {
     mol.bonds
         .iter()
         .filter(|b| {
-            b.order == BondOrder::Single
-                && !b.in_ring
-                && mol.atoms[b.u].atomic_number != 1
-                && mol.atoms[b.v].atomic_number != 1
-                && mol.adj[b.u].len() > 1
-                && mol.adj[b.v].len() > 1
+            if b.order != BondOrder::Single || b.in_ring {
+                return false;
+            }
+            let u = b.u;
+            let v = b.v;
+            if mol.atoms[u].atomic_number == 1 || mol.atoms[v].atomic_number == 1 {
+                return false;
+            }
+            if mol.adj[u].len() <= 1 || mol.adj[v].len() <= 1 {
+                return false;
+            }
+            // Exclude single bonds adjacent to triple bonds (linear sp axis, no conformational DOF)
+            let has_triple = |idx: usize| {
+                mol.adj[idx]
+                    .iter()
+                    .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Triple)
+            };
+            if has_triple(u) || has_triple(v) {
+                return false;
+            }
+            // Exclude partial-double amide C(=O)-N / thioamide C(=S)-N and ester C(=O)-O bonds (RDKit Strict)
+            let is_amide_or_ester = |c_idx: usize, x_idx: usize| {
+                is_carbonyl_carbon(mol, c_idx)
+                    && matches!(mol.atoms[x_idx].symbol.as_str(), "N" | "O")
+            };
+            !(is_amide_or_ester(u, v) || is_amide_or_ester(v, u))
         })
         .count()
 }
@@ -521,48 +549,118 @@ fn count_hbd(mol: &MolGraph) -> usize {
         .count()
 }
 
+/// Exact Ertl, Rohde & Selzer (J. Med. Chem. 2000, 43, 3714-3717) Topological Polar Surface Area
+/// covering all neutral and formally charged N and O topological environments.
 fn compute_tpsa(mol: &MolGraph) -> f64 {
     let mut tpsa = 0.0;
     for a in &mol.atoms {
-        let h = f64::from(a.total_h());
-        let deg = mol.adj[a.id].len();
-        let has_dbl = mol.adj[a.id]
-            .iter()
-            .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Double);
-        let has_trp = mol.adj[a.id]
-            .iter()
-            .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Triple);
+        let h = usize::from(a.total_h());
+        let q = a.formal_charge;
         let in_3_ring = a.ring_sizes.contains(&3);
+        let mut n_single = 0usize;
+        let mut n_double = 0usize;
+        let mut n_triple = 0usize;
+        let mut n_arom = 0usize;
+        for &(nb, bid) in &mol.adj[a.id] {
+            if mol.atoms[nb].atomic_number == 1 {
+                continue;
+            }
+            match mol.bonds[bid].order {
+                BondOrder::Single | BondOrder::Dative => n_single += 1,
+                BondOrder::Double => n_double += 1,
+                BondOrder::Triple => n_triple += 1,
+                BondOrder::Aromatic => n_arom += 1,
+            }
+        }
+        let heavy_deg = n_single + n_double + n_triple + n_arom;
         match a.symbol.as_str() {
             "N" => {
-                if a.aromatic {
-                    tpsa += if a.total_h() > 0 { 15.79 } else { 12.89 };
-                } else if has_trp {
-                    tpsa += 23.79;
-                } else if has_dbl {
-                    tpsa += if h >= 1.0 { 23.85 } else { 12.36 };
-                } else if in_3_ring {
-                    tpsa += if h >= 1.0 { 21.94 } else { 3.01 };
-                } else if deg == 1 {
-                    tpsa += 26.02;
-                } else if deg == 2 {
-                    tpsa += 12.03;
+                let contrib = if q == 0 {
+                    if a.aromatic || n_arom >= 2 {
+                        match (n_arom, n_single, n_double, h) {
+                            (3, 0, 0, 0) => 4.41,
+                            (_, 0, 0, 0) => 12.89,
+                            (_, 1, 0, 0) => 4.93,
+                            (_, 0, 1, 0) => 8.39,
+                            (_, 0, 0, 1) => 15.79,
+                            _ => (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0),
+                        }
+                    } else if n_triple == 1 {
+                        if n_single == 0 && h == 0 { 23.79 } else { 4.36 }
+                    } else if n_double == 2 {
+                        13.60
+                    } else if n_double == 1 {
+                        match (n_single, h) {
+                            (1, 0) => 12.36,
+                            (0, 1) => 23.85,
+                            (2, 0) => 11.68,
+                            _ => (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0),
+                        }
+                    } else {
+                        match (n_single, h, in_3_ring) {
+                            (3, 0, true) => 3.01,
+                            (3, 0, false) => 3.24,
+                            (2, 1, true) => 21.94,
+                            (2, 1, false) => 12.03,
+                            (1, 2, _) => 26.02,
+                            _ => (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0),
+                        }
+                    }
+                } else if q > 0 {
+                    if a.aromatic || n_arom >= 2 {
+                        if h >= 1 { 14.14 } else { 3.88 }
+                    } else if n_triple == 1 {
+                        if n_single == 1 && h == 0 {
+                            4.36
+                        } else if h >= 1 {
+                            23.85
+                        } else {
+                            13.60
+                        }
+                    } else if n_double == 1 {
+                        match (n_single, h) {
+                            (2, 0) => 3.01,
+                            (1, 1) => 13.97,
+                            (0, 2) => 25.59,
+                            _ => (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0),
+                        }
+                    } else if n_double == 0 {
+                        match (n_single, h) {
+                            (4, 0) => 0.0,
+                            (3, 1) => 4.44,
+                            (2, 2) => 16.61,
+                            (1, 3) => 27.64,
+                            _ => (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0),
+                        }
+                    } else {
+                        // Ertl linear fallback (gives exact 14.10 for azide =[N+]=)
+                        (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0)
+                    }
                 } else {
-                    tpsa += 3.24;
-                }
+                    // Formally negative N (gives exact 22.30 for azide =[N-])
+                    (30.5 - 8.2 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0)
+                };
+                tpsa += contrib;
             }
             "O" => {
-                if a.aromatic {
-                    tpsa += 13.14;
-                } else if has_dbl {
-                    tpsa += 17.07;
-                } else if in_3_ring {
-                    tpsa += 12.53;
-                } else if h >= 1.0 || a.formal_charge < 0 {
-                    tpsa += if a.formal_charge < 0 { 23.06 } else { 20.23 };
+                let contrib = if q == 0 {
+                    if a.aromatic || n_arom >= 2 {
+                        13.14
+                    } else if n_double == 1 {
+                        17.07
+                    } else if n_single == 2 && h == 0 {
+                        if in_3_ring { 12.53 } else { 9.23 }
+                    } else if n_single == 1 && h >= 1 {
+                        20.23
+                    } else {
+                        (28.5 - 8.6 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0)
+                    }
+                } else if q < 0 && n_single == 1 && h == 0 {
+                    23.06
                 } else {
-                    tpsa += 9.23;
-                }
+                    (28.5 - 8.6 * (heavy_deg as f64) + 1.5 * (h as f64)).max(0.0)
+                };
+                tpsa += contrib;
             }
             _ => {}
         }
@@ -570,77 +668,280 @@ fn compute_tpsa(mol: &MolGraph) -> f64 {
     tpsa
 }
 
-fn compute_mr(mol: &MolGraph) -> f64 {
-    mol.atoms
+/// Wildman & Crippen (J. Chem. Inf. Comput. Sci. 1999, 39, 868-873) atom-based LogP & MR
+/// contribution for atom `idx` PLUS its attached implicit/explicit hydrogens.
+fn crippen_atom_and_h_contribs(mol: &MolGraph, idx: usize) -> (f64, f64) {
+    let a = &mol.atoms[idx];
+    let h_cnt = f64::from(a.total_h());
+    let nbrs = &mol.adj[idx];
+    let is_hetero = |sym: &str| !matches!(sym, "C" | "H");
+    let has_dbl = nbrs
         .iter()
-        .map(|a| {
-            let base = match a.symbol.as_str() {
-                "C" => {
-                    if a.aromatic {
-                        3.55
+        .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Double);
+    let has_trp = nbrs
+        .iter()
+        .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Triple);
+    let heavy_nbrs: Vec<(usize, BondOrder)> = nbrs
+        .iter()
+        .copied()
+        .filter(|&(v, _)| mol.atoms[v].atomic_number != 1)
+        .map(|(v, bid)| (v, mol.bonds[bid].order))
+        .collect();
+    let hetero_nbr_cnt = heavy_nbrs
+        .iter()
+        .filter(|&&(v, _)| is_hetero(&mol.atoms[v].symbol))
+        .count();
+    let arom_nbr_cnt = heavy_nbrs
+        .iter()
+        .filter(|&&(v, _)| mol.atoms[v].aromatic)
+        .count();
+
+    let (atom_lp, atom_mr, h_lp, h_mr) = match a.symbol.as_str() {
+        "C" => {
+            let (lp, mr) = if a.aromatic {
+                // Aromatic carbon classes (Wildman-Crippen C13-C25)
+                let exo_nbr = heavy_nbrs
+                    .iter()
+                    .find(|&&(_, ord)| ord != BondOrder::Aromatic);
+                if let Some(&(ev, ord)) = exo_nbr {
+                    if ord == BondOrder::Double
+                        && matches!(mol.atoms[ev].symbol.as_str(), "O" | "S")
+                    {
+                        // Aromatic carbonyl c(=O) (caffeine, uracil, pyridone)
+                        (-0.8186, 4.0000)
                     } else {
-                        3.35
+                        match mol.atoms[ev].symbol.as_str() {
+                            "C" => {
+                                if mol.atoms[ev].aromatic {
+                                    (0.2713, 3.9040)
+                                } else {
+                                    (0.1360, 3.5090)
+                                }
+                            }
+                            "O" => (0.5437, 3.8530),
+                            "N" => (0.4619, 4.0670),
+                            "S" => (0.2450, 3.5640),
+                            "F" => (0.0000, 3.2570),
+                            "Cl" => (0.2450, 3.5640),
+                            "Br" => (0.1980, 3.1800),
+                            "I" => (0.0000, 3.1040),
+                            _ => (0.1581, 3.3500),
+                        }
+                    }
+                } else if heavy_nbrs.len() >= 3 {
+                    // Fused ring junction c(a)(a)a
+                    let adj_het = heavy_nbrs
+                        .iter()
+                        .any(|&(v, _)| is_hetero(&mol.atoms[v].symbol));
+                    if adj_het {
+                        (0.2955, 3.9040)
+                    } else {
+                        (0.2713, 3.9040)
+                    }
+                } else {
+                    // Unsubstituted cH
+                    (0.1581, 3.3500)
+                }
+            } else if has_trp {
+                // sp alkyne / nitrile C
+                (0.0017, 3.8880)
+            } else if has_dbl {
+                // sp2 carbonyl / imine / alkene C
+                let dbl_to_hetero = heavy_nbrs
+                    .iter()
+                    .any(|&(v, ord)| ord == BondOrder::Double && is_hetero(&mol.atoms[v].symbol));
+                if dbl_to_hetero {
+                    (-0.2783, 5.0070)
+                } else if hetero_nbr_cnt > 0 {
+                    (-0.0300, 3.6000)
+                } else {
+                    (0.1551, 3.5130)
+                }
+            } else {
+                // sp3 aliphatic C
+                let f_cnt = heavy_nbrs
+                    .iter()
+                    .filter(|&&(v, _)| mol.atoms[v].symbol == "F")
+                    .count();
+                if f_cnt >= 2 {
+                    (-0.0967, 2.5760)
+                } else if arom_nbr_cnt >= 1 {
+                    // Benzylic C (Ar-CH3 / Ar-CH2-X)
+                    if heavy_nbrs.len() == 1 {
+                        (0.0845, 2.5030)
+                    } else {
+                        (-0.0516, 2.4880)
+                    }
+                } else if hetero_nbr_cnt >= 2 {
+                    (-0.2051, 2.7530)
+                } else if hetero_nbr_cnt == 1 {
+                    let hv = heavy_nbrs
+                        .iter()
+                        .find(|&&(v, _)| is_hetero(&mol.atoms[v].symbol))
+                        .map(|&(v, _)| v);
+                    if hv.is_some_and(|v| mol.atoms[v].aromatic) {
+                        (-0.1444, 2.4120)
+                    } else {
+                        (-0.2035, 2.7530)
+                    }
+                } else if heavy_nbrs.len() >= 3 {
+                    // Tertiary / quaternary alkane CH / C
+                    (0.0000, 2.4330)
+                } else {
+                    // Primary / secondary alkane CH3 / CH2
+                    (0.1441, 2.5030)
+                }
+            };
+            (lp, mr, 0.1230, 1.0570)
+        }
+        "N" => {
+            let (lp, mr) = if a.aromatic {
+                (-0.3239, 2.2020)
+            } else if a.formal_charge > 0 {
+                let is_nitro = heavy_nbrs
+                    .iter()
+                    .filter(|&&(v, _)| mol.atoms[v].symbol == "O")
+                    .count()
+                    >= 2;
+                let is_azide = heavy_nbrs
+                    .iter()
+                    .filter(|&&(v, ord)| mol.atoms[v].symbol == "N" && ord == BondOrder::Double)
+                    .count()
+                    >= 2;
+                if is_nitro {
+                    (-0.3396, 0.2604)
+                } else if is_azide {
+                    (0.2887, 3.3590)
+                } else {
+                    (-0.3396, 1.8000)
+                }
+            } else if a.formal_charge < 0 {
+                (0.2887, 3.3590)
+            } else if has_trp {
+                // Nitrile #N
+                (0.0151, 1.7250)
+            } else if has_dbl {
+                // Imine / azo / azide terminal N
+                (0.1836, 2.4280)
+            } else {
+                let adj_arom = heavy_nbrs.iter().any(|&(v, _)| mol.atoms[v].aromatic);
+                let adj_carbonyl = heavy_nbrs
+                    .iter()
+                    .any(|&(v, _)| is_carbonyl_carbon(mol, v) || mol.atoms[v].symbol == "S");
+                if adj_arom {
+                    match heavy_nbrs.len() {
+                        1 => (-1.0270, 2.8270),
+                        2 => (-0.5188, 2.9500),
+                        _ => (-0.4458, 2.8190),
+                    }
+                } else if adj_carbonyl {
+                    match heavy_nbrs.len() {
+                        1 => (-1.0190, 2.2620),
+                        #[allow(clippy::approx_constant)]
+                        2 => (-0.5262, 2.7180),
+                        _ => (-0.3187, 2.8190),
+                    }
+                } else {
+                    match heavy_nbrs.len() {
+                        1 => (-1.0190, 2.2620),
+                        2 => (-0.7096, 2.1730),
+                        _ => (-0.3187, 2.8190),
                     }
                 }
-                "N" => 3.20,
-                "O" => 2.15,
-                "S" => 7.60,
-                "P" => 6.90,
-                "F" => 1.05,
-                "Cl" => 5.85,
-                "Br" => 8.80,
-                "I" => 13.95,
-                _ => 2.0,
             };
-            base + f64::from(a.total_h()) * 1.05
-        })
+            (lp, mr, 0.2142, 0.9627)
+        }
+        "O" => {
+            let (lp, mr) = if a.aromatic {
+                (0.1552, 1.0800)
+            } else if a.formal_charge < 0 {
+                let adj_n_plus = heavy_nbrs
+                    .iter()
+                    .any(|&(v, _)| mol.atoms[v].symbol == "N" && mol.atoms[v].formal_charge > 0);
+                if adj_n_plus {
+                    (0.0335, 3.3670)
+                } else {
+                    (-0.3339, 0.7774)
+                }
+            } else if has_dbl {
+                let adj_n_plus = heavy_nbrs
+                    .iter()
+                    .any(|&(v, _)| mol.atoms[v].symbol == "N" && mol.atoms[v].formal_charge > 0);
+                let adj_s = heavy_nbrs.iter().any(|&(v, _)| mol.atoms[v].symbol == "S");
+                let adj_p = heavy_nbrs.iter().any(|&(v, _)| mol.atoms[v].symbol == "P");
+                let adj_arom_c = heavy_nbrs
+                    .iter()
+                    .any(|&(v, _)| mol.atoms[v].symbol == "C" && mol.atoms[v].aromatic);
+                let adj_amide_or_acid = heavy_nbrs.iter().any(|&(v, _)| {
+                    mol.atoms[v].symbol == "C"
+                        && mol.adj[v].iter().any(|&(u, _)| {
+                            u != idx && matches!(mol.atoms[u].symbol.as_str(), "N" | "O")
+                        })
+                });
+                if adj_n_plus {
+                    (0.0335, 3.3670)
+                } else if adj_s {
+                    (-0.3339, 0.7774)
+                } else if adj_p {
+                    (-0.1188, 0.6865)
+                } else if adj_arom_c {
+                    (0.1788, 1.0000)
+                } else if adj_amide_or_acid {
+                    (0.1129, 0.7774)
+                } else {
+                    (-0.1526, 0.0000)
+                }
+            } else if a.total_h() > 0 {
+                // Alcohol / phenol / carboxylic OH / phosphate OH
+                (-0.2893, 0.8238)
+            } else {
+                // Ether / ester -O-
+                let adj_carbonyl_or_arom = heavy_nbrs
+                    .iter()
+                    .any(|&(v, _)| is_carbonyl_carbon(mol, v) || mol.atoms[v].aromatic);
+                if adj_carbonyl_or_arom {
+                    (-0.0684, 1.0850)
+                } else {
+                    (-0.4195, 1.1820)
+                }
+            };
+            (lp, mr, -0.2677, 1.3950)
+        }
+        "S" => {
+            let (lp, mr) = if a.aromatic {
+                (0.6237, 6.6910)
+            } else if heavy_nbrs.len() >= 3 || has_dbl {
+                // Sulfone / sulfonamide / sulfoxide
+                (-0.0024, 7.3650)
+            } else {
+                // Thiol / thioether
+                (0.6482, 7.5910)
+            };
+            (lp, mr, -0.2677, 1.3950)
+        }
+        "P" => (0.8612, 6.9200, 0.1230, 1.0570),
+        "F" => (0.4202, 1.1080, 0.1230, 1.0570),
+        "Cl" => (0.6895, 5.8530, 0.1230, 1.0570),
+        "Br" => (0.8456, 8.9270, 0.1230, 1.0570),
+        "I" => (0.8857, 14.0200, 0.1230, 1.0570),
+        "B" => (-0.3808, 4.0410, 0.1230, 1.0570),
+        "Si" => (0.3000, 7.0000, 0.1230, 1.0570),
+        "H" => (0.0, 0.0, 0.0, 0.0),
+        _ => (0.0, 2.0, 0.1230, 1.0570),
+    };
+    (atom_lp + h_cnt * h_lp, atom_mr + h_cnt * h_mr)
+}
+
+fn compute_mr(mol: &MolGraph) -> f64 {
+    (0..mol.atoms.len())
+        .map(|i| crippen_atom_and_h_contribs(mol, i).1)
         .sum()
 }
 
 fn compute_wlogp(mol: &MolGraph) -> f64 {
-    let mut sum = 0.0;
-    for a in &mol.atoms {
-        let h = f64::from(a.total_h());
-        let has_hetero_nbr = mol.adj[a.id].iter().any(|&(v, _)| {
-            matches!(
-                mol.atoms[v].symbol.as_str(),
-                "N" | "O" | "S" | "F" | "Cl" | "Br" | "I"
-            )
-        });
-        let contrib = match a.symbol.as_str() {
-            "C" => {
-                if a.aromatic {
-                    if has_hetero_nbr { 0.05 } else { 0.15 }
-                } else if has_hetero_nbr {
-                    -0.12
-                } else {
-                    0.14
-                }
-            }
-            "N" => {
-                if a.aromatic {
-                    -0.32
-                } else {
-                    -0.78
-                }
-            }
-            "O" => {
-                let is_carbonyl = mol.adj[a.id]
-                    .iter()
-                    .any(|&(_, bid)| mol.bonds[bid].order == BondOrder::Double);
-                if is_carbonyl { -0.27 } else { -0.36 }
-            }
-            "S" => 0.42,
-            "P" => 0.15,
-            "F" => 0.42,
-            "Cl" => 0.69,
-            "Br" => 0.85,
-            "I" => 1.08,
-            _ => 0.0,
-        };
-        sum += contrib + h * 0.12;
-    }
-    sum
+    (0..mol.atoms.len())
+        .map(|i| crippen_atom_and_h_contribs(mol, i).0)
+        .sum()
 }
 
 fn compute_xlogp3(mol: &MolGraph) -> f64 {
