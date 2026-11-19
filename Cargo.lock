@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "chemcraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "chemcraft-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "mol-admet-bridge",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "mol-admet-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "csv",
  "flate2",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "mol-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "mol-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "csv",
  "serde",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "mol-sar"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mol-admet-bridge",
  "mol-graph",
@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "mol-vector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "mol-graph",
